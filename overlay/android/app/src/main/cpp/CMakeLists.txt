@@ -82,7 +82,8 @@ file(MAKE_DIRECTORY "${LIBRW_SPIRV_DIR}")
 set(LIBRW_SPIRV_HEADERS "")
 foreach(SHADER rw_world:vert:vertex rw_world:frag:fragment
                rw_im2d:vert:vertex  rw_im2d:frag:fragment
-               rw_im3d:vert:vertex  rw_skin:vert:vertex)
+               rw_im3d:vert:vertex  rw_skin:vert:vertex
+               rw_postfx:vert:vertex rw_postfx:frag:fragment)
 	string(REPLACE ":" ";" PARTS "${SHADER}")
 	list(GET PARTS 0 SHADER_NAME)
 	list(GET PARTS 1 SHADER_EXT)
@@ -160,11 +161,16 @@ if(NOT MIAMIVR_BRINGUP)
 		file(GLOB _dir_sources "${REVC_ROOT}/src/${d}/*.cpp")
 		list(APPEND GAME_SOURCES ${_dir_sources})
 	endforeach()
+	# Keep this explicit because file(GLOB) does not cause an already configured
+	# Ninja graph to notice a newly added source file.
+	set(QUEST_PROFILER_SOURCE
+		"${REVC_ROOT}/src/skel/android/QuestProfiler.cpp")
+	list(REMOVE_ITEM GAME_SOURCES "${QUEST_PROFILER_SOURCE}")
+	list(APPEND GAME_SOURCES "${QUEST_PROFILER_SOURCE}")
 
-	# Audio: sampman_null is selected by defining neither AUDIO_OAL nor
-	# AUDIO_MSS. It is a real no-op backend, which is exactly what the first
-	# device bring-up wants -- it removes OpenAL Soft and mpg123, neither of
-	# which is built for arm64 yet, from the critical path.
+	# Quest audio uses a native AAudio SFX mixer and the Android platform
+	# decoder for long radio/cutscene streams.  The desktop OpenAL/Miles
+	# backends carry host-only libraries and are deliberately not linked.
 	list(REMOVE_ITEM GAME_SOURCES
 		"${REVC_ROOT}/src/audio/sampman_oal.cpp"
 		"${REVC_ROOT}/src/audio/sampman_miles.cpp")
@@ -183,13 +189,21 @@ if(NOT MIAMIVR_BRINGUP)
 	configure_file("${REVC_ROOT}/src/extras/GitSHA1.cpp.in"
 	               "${CMAKE_CURRENT_BINARY_DIR}/GitSHA1.cpp" @ONLY)
 	list(APPEND GAME_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/GitSHA1.cpp")
+	# Native Quest hands share the authored UltimateXR mesh loader with the
+	# desktop VR build. QuestWeaponVR is the Android input/interaction adapter;
+	# it deliberately does not own another OpenXR session or stereo renderer.
+	list(APPEND GAME_SOURCES
+		"${REVC_ROOT}/src/vr/VRHandModel.cpp"
+		"${REVC_ROOT}/src/vr/QuestDrivingVR.cpp"
+		"${REVC_ROOT}/src/vr/QuestWeaponVR.cpp")
 
 	list(APPEND MIAMIVR_SOURCES ${GAME_SOURCES})
 
 	foreach(d ${GAME_DIRS} "")
 		list(APPEND GAME_INCLUDES "${REVC_ROOT}/src/${d}")
 	endforeach()
-	list(APPEND GAME_INCLUDES "${REVC_ROOT}/src" "${REVC_ROOT}/src/audio/oal")
+	list(APPEND GAME_INCLUDES "${REVC_ROOT}/src" "${REVC_ROOT}/src/audio/oal"
+	                         "${REVC_ROOT}/src/vr")
 	# The skeleton reaches into the app layer for the storage roots.
 	list(APPEND GAME_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
@@ -209,7 +223,8 @@ target_compile_definitions(miamivr PRIVATE
 	VK_USE_PLATFORM_ANDROID_KHR)
 
 if(NOT MIAMIVR_BRINGUP)
-	target_compile_definitions(miamivr PRIVATE LIBRW RW_VULKAN)
+	target_compile_definitions(miamivr PRIVATE
+		LIBRW RW_VULKAN AUDIO_ANDROID GTA_VR_WEAPONS)
 	# 2003-era C++ read by a 2024 clang. These are style diagnostics, not
 	# defects, and at this volume they bury the errors that matter.
 	target_compile_options(miamivr PRIVATE
@@ -231,6 +246,7 @@ target_link_libraries(miamivr
 	OpenXR::openxr_loader
 	vulkan
 	android
+	aaudio
 	log)
 
 # NativeActivity resolves ANativeActivity_onCreate from the glue; without this

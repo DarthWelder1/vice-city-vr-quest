@@ -44,6 +44,12 @@ void main()
 	vec3 eye = scene.im2dParams.yzw;
 	vec3 world = eye + (plane.xyz - eye) * (depth/panel);
 	gl_Position = scene.viewProj[gl_ViewIndex] * vec4(world, 1.0);
+	// Radar-only depth masking must sit in front of the already-rendered
+	// cockpit/world. Preserve the tiny RenderWare screen-Z difference between
+	// the outside-circle mask and the textured tiles: strict LESS depends on
+	// that bias to reject the tiles only where the mask was written.
+	if(push.surfaceProps.z > 0.5)
+		gl_Position.z = max(inPosition.z, 0.00001) * gl_Position.w;
 	fragColour = inColour * push.materialColour;
 	fragTexCoord = inTexCoord;
 }

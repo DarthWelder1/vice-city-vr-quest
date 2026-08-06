@@ -22,6 +22,18 @@
 		android:allowBackup="false"
 		android:extractNativeLibs="true">
 
+		<!-- ADB runs as the Android shell UID and cannot directly read files
+		     created by a release app in scoped external storage.  This narrow
+		     provider exposes only save slots 1..8, and SaveProvider rejects every
+		     caller except this app, root and the ADB shell.  The desktop transfer
+		     scripts can therefore import/export saves without making the whole
+		     application debuggable or granting broad storage permissions. -->
+		<provider
+			android:name=".SaveProvider"
+			android:authorities="${applicationId}.saves"
+			android:exported="true"
+			android:grantUriPermissions="false" />
+
 		<!-- com.oculus.supportedDevices is deliberately absent. It gates store
 		     submissions, and an unrecognised token there can make Horizon OS
 		     refuse to launch a sideloaded build. -->

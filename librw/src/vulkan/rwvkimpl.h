@@ -7,6 +7,11 @@
 namespace rw {
 namespace vulkan {
 
+enum {
+	NUM_FRAME_CONTEXTS = 2,
+	MAX_FRAMEBUFFERS_PER_CONTEXT = 8,
+};
+
 // Native raster attached to every rw::Raster on this platform.
 struct VulkanRaster
 {
@@ -32,10 +37,11 @@ struct VulkanRaster
 	// natively and had to be decompressed on upload.
 	bool32 wasTranscoded;
 
-	// Cached descriptor set 1 for this texture, plus the sampler key it was
-	// built with so a filter or addressing change rebuilds it.
-	VkDescriptorSet descriptorSet;
-	uint32 samplerKey;
+	// Descriptor state is per frame slot. Updating a descriptor while an
+	// earlier submission still reads it is invalid Vulkan even when the image
+	// itself is immutable.
+	VkDescriptorSet descriptorSet[NUM_FRAME_CONTEXTS];
+	uint32 samplerKey[NUM_FRAME_CONTEXTS];
 };
 
 // Mirrors the state the fixed-function RenderWare pipeline expects. Vulkan has
@@ -61,6 +67,42 @@ struct RenderState
 	uint32 textureAddressV;
 };
 
+// Kept at 32 bytes so the CPU layout exactly matches the fragment shader's
+// vec4 + uvec4 push-constant block.
+struct PostFxPushConstants
+{
+	float32 blurColour[4];
+	uint32 mode[4];
+};
+
+// Everything the GPU may still be reading after a frame is submitted lives
+// in the frame context that owns that submission.  Reusing another context
+// lets the CPU record frame N+1 while the GPU executes frame N.
+struct FrameContext
+{
+	VkCommandBuffer commandBuffer;
+	VkFence fence;
+	bool32 submissionPending;
+
+	VkQueryPool timestampQueryPool;
+	bool32 timestampPending;
+
+	VkImage depthImage;
+	VkDeviceMemory depthMemory;
+	VkImageView depthView;
+
+	VkImage sceneColourImage;
+	VkDeviceMemory sceneColourMemory;
+	VkImageView sceneColourView;
+	VkFramebuffer sceneFramebuffer;
+	VkDescriptorSet postFxDescriptor;
+
+	VkImageView framebufferColourViews[MAX_FRAMEBUFFERS_PER_CONTEXT];
+	VkFramebuffer framebuffers[MAX_FRAMEBUFFERS_PER_CONTEXT];
+	uint32 numFramebuffers;
+	VkFramebuffer framebuffer;
+};
+
 struct Globals
 {
 	VkInstance instance;
@@ -74,16 +116,30 @@ struct Globals
 	VkPhysicalDeviceFeatures deviceFeatures;
 
 	VkCommandPool commandPool;
-	// Recording target for the frame currently between beginFrame and endFrame.
+	FrameContext frames[NUM_FRAME_CONTEXTS];
+	uint32 activeFrame;
+	uint32 nextFrame;
+	uint32 lastSubmittedFrame;
+	bool32 hasSubmittedFrame;
+	// Alias used by draw code while a frame is being recorded.
 	VkCommandBuffer frameCommands;
-	VkFence frameFence;
+	// Optional two-timestamp query for the native Quest profiler.  The backend
+	// reads a slot only after that slot's fence signals.
+	uint32 frameTimestampValidBits;
+	bool32 frameTimestampEnabled;
+	bool32 frameTimestampAvailable;
+	float32 frameGpuMilliseconds;
 
 	VkRenderPass renderPass;
-	VkFramebuffer framebuffer;
-	VkImage depthImage;
-	VkDeviceMemory depthMemory;
-	VkImageView depthView;
+	VkRenderPass postFxRenderPass;
 	VkFormat depthFormat;
+
+	VkDescriptorSetLayout postFxDescriptorLayout;
+	VkDescriptorPool postFxDescriptorPool;
+	VkSampler postFxSampler;
+	VkPipelineLayout postFxPipelineLayout;
+	VkPipeline postFxPipeline;
+	PostFxPushConstants postFxConstants;
 
 	uint32 width;
 	uint32 height;
@@ -113,9 +169,15 @@ struct Globals
 	// head yaw latched at entry riding on top.
 	bool32 firstPersonActive;
 	bool32 fpFollowHeading;
+	bool32 fpUseFullBasis;
 	float32 fpHeadWorld[3];
 	float32 fpAnchorYaw;
 	float32 fpLatchedHeadYaw;
+	// Play-space +X/+Y/+Z expressed in game world space. Used while a
+	// vehicle is allowed to carry pitch/roll into the headset camera.
+	float32 fpPlayX[3];
+	float32 fpPlayY[3];
+	float32 fpPlayZ[3];
 };
 
 extern Globals gvk;
@@ -261,6 +323,7 @@ VkDescriptorSet getBoneDescriptor(void);
 VkDeviceSize getBoneBlockAlignment(void);
 
 SceneData *getSceneData(void);
+void setStateFrame(uint32 frame);
 void uploadSceneData(void);
 
 // Bump allocator over a per-frame host-visible buffer. Reset in beginFrame,
@@ -271,14 +334,20 @@ bool32 allocateDynamic(VkDeviceSize size, VkDeviceSize alignment,
                        void **mappedOut);
 void resetDynamic(void);
 
+// Streaming frees GPU objects on the game thread.  With more than one frame
+// submitted those destroys are retired behind the frame fence that last used
+// them instead of invalidating commands already executing on the GPU.
+void retireBuffer(VkBuffer buffer, VkDeviceMemory memory);
+void retireImage(VkImageView view, VkImage image, VkDeviceMemory memory);
+
 // Shared helpers used by both the device and the raster implementation.
 bool32 findMemoryType(uint32 typeBits, VkMemoryPropertyFlags properties,
                       uint32 *indexOut);
 bool32 createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                     VkMemoryPropertyFlags properties, VkBuffer *bufferOut,
                     VkDeviceMemory *memoryOut);
-// Records and submits a one-shot command buffer, then waits for it. Used for
-// texture uploads outside the frame.
+// Records and submits a one-shot command buffer. Live-frame uploads inherit
+// the active frame fence; startup uploads retain a synchronous fallback.
 VkCommandBuffer beginOneShot(void);
 void endOneShot(VkCommandBuffer commandBuffer);
 void transitionImageLayout(VkCommandBuffer commandBuffer, VkImage image,

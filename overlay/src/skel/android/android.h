@@ -37,6 +37,13 @@ bool Initialise(const VulkanContext &context);
 // uses for its tracked controllers.
 struct PadInput
 {
+	struct Pose
+	{
+		float position[3];
+		float orientation[4];
+		bool valid;
+	};
+
 	float leftStickX, leftStickY;
 	float rightStickX, rightStickY;
 	float leftTrigger, rightTrigger;
@@ -44,9 +51,17 @@ struct PadInput
 	bool a, b, x, y;
 	bool menu;
 	bool leftStickClick, rightStickClick;
+	Pose gripPose[2];
+	Pose aimPose[2];
 };
 
 void SetPadInput(const PadInput &input);
+const PadInput &GetPadInput(void);
+
+// Renders the native Quest tracked hands after the world/effects pass. The
+// function is a no-op in cinema mode and until both OpenXR and the player
+// camera have produced a valid pose for the current frame.
+void RenderTrackedHands(void);
 
 // Predicted display time of the frame about to be stepped, in nanoseconds.
 // Drives the game clock: it is vsync-quantised where the wall clock jitters
@@ -67,6 +82,24 @@ void GetIm2DViewWindow(float *x, float *y);
 // then the RGBA pixel block for the compositor quad layer (nil = hidden).
 void VrDebugUpdate(const PadInput &input);
 const unsigned char *VrDebugPixels(int *width, int *height);
+bool VrMenuConsumesInput(void);
+bool VrViceCityColorEnabled(void);
+bool VrFxaaEnabled(void);
+bool VrGameplayHudEnabled(void);
+void VrGetGameplayHudSettings(int *widthPercent, int *scalePercent,
+                              int *offsetXCm, int *offsetYCm);
+bool VrUsesHeadRelativeMovement(void);
+bool VrUsesExperimentalHeadTurning(void);
+float VrHeadTurnScale(void);
+bool VrUsesSnapTurn(void);
+float VrSmoothTurnScale(void);
+int VrSnapTurnAngleDegrees(void);
+float VrScopeZoomFactor(void);
+
+// Frontend, loading and cinematic frames are flat content. They are rendered
+// once and submitted to both eyes on a world-locked cinema quad instead of
+// being interpreted as an immersive stereo world.
+bool VrShouldUseTheaterMode(void);
 
 // One iteration of the game's gGameState machine, including rsIDLE. Must be
 // called between vulkan::beginFrame and vulkan::endFrame.

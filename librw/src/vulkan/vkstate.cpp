@@ -62,6 +62,22 @@ struct PendingPipeline
 	RenderState state;
 };
 
+struct StateFrame
+{
+	VkDescriptorSet sceneDescriptor;
+	VkBuffer sceneBuffer;
+	VkDeviceMemory sceneMemory;
+	void *sceneMapped;
+
+	VkDescriptorSet boneDescriptor;
+	VkBuffer dynamicBuffer;
+	VkDeviceMemory dynamicMemory;
+	uint8 *dynamicMapped;
+	VkDeviceSize dynamicCapacity;
+	VkDeviceSize dynamicOffset;
+	bool32 dynamicOverflowReported;
+};
+
 struct State
 {
 	VkDescriptorSetLayout sceneLayout;
@@ -70,20 +86,19 @@ struct State
 	VkPipelineLayout pipelineLayout;
 	VkDescriptorPool descriptorPool;
 
-	// Aliases the dynamic buffer; the skin pipeline supplies the offset.
-	VkDescriptorSet boneDescriptor;
 	VkDeviceSize boneAlignment;
 
-	VkDescriptorSet sceneDescriptor;
-	VkBuffer sceneBuffer;
-	VkDeviceMemory sceneMemory;
-	void *sceneMapped;
 	SceneData scene;
+	StateFrame frames[NUM_FRAME_CONTEXTS];
+	uint32 activeFrame;
 
 	VkShaderModule modules[SHADER_COUNT][2];	// [variant][0=vert,1=frag]
 
 	std::vector<PipelineEntry> pipelines;
 	std::vector<PendingPipeline> pending;
+	uint64 lastPipelineKey;
+	VkPipeline lastPipeline;
+	bool32 lastPipelineValid;
 
 	// Sampler cache, indexed by the packed sampler key.
 	VkSampler samplers[64];
@@ -94,14 +109,6 @@ struct State
 	VkDeviceMemory whiteMemory;
 	VkImageView whiteView;
 	VkDescriptorSet whiteDescriptor;
-
-	// Per-frame bump allocator for immediate-mode geometry.
-	VkBuffer dynamicBuffer;
-	VkDeviceMemory dynamicMemory;
-	uint8 *dynamicMapped;
-	VkDeviceSize dynamicCapacity;
-	VkDeviceSize dynamicOffset;
-	bool32 dynamicOverflowReported;
 
 	bool32 initialised;
 };
@@ -239,6 +246,8 @@ makePipelineKey(uint32 shader, VkPrimitiveTopology topology)
 {
 	const bool32 blend = gstate.vertexAlphaEnabled;
 	const bool32 alphaTest = gstate.alphaTestFunction != ALPHAALWAYS;
+	const bool32 strictIm2D =
+		shader == SHADER_IM2D && getImmediate2DStrictDepth();
 	uint64 key = 0;
 	key |= (uint64)(shader & 0x7);
 	key |= (uint64)(topology & 0xF) << 3;
@@ -249,6 +258,7 @@ makePipelineKey(uint32 shader, VkPrimitiveTopology topology)
 	key |= (uint64)(gstate.zWriteEnabled ? 1 : 0) << 17;
 	key |= (uint64)(gstate.cullMode & 0x3) << 18;
 	key |= (uint64)(alphaTest ? 1 : 0) << 20;
+	key |= (uint64)(strictIm2D ? 1 : 0) << 21;
 	return key;
 }
 
@@ -446,44 +456,54 @@ stateInit(void)
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[0].descriptorCount = 4;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[1].descriptorCount = MAX_TEXTURE_DESCRIPTORS;
+	poolSizes[1].descriptorCount =
+		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 1;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-	poolSizes[2].descriptorCount = 1;
+	poolSizes[2].descriptorCount = NUM_FRAME_CONTEXTS;
 
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = MAX_TEXTURE_DESCRIPTORS + 8;
+	poolInfo.maxSets =
+		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 16;
 	poolInfo.poolSizeCount = 3;
 	poolInfo.pPoolSizes = poolSizes;
 	if(vkCreateDescriptorPool(gvk.device, &poolInfo, nil, &gs.descriptorPool) != VK_SUCCESS)
 		return 0;
 
-	if(!createBuffer(sizeof(SceneData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-	                 &gs.sceneBuffer, &gs.sceneMemory))
-		return 0;
-	if(vkMapMemory(gvk.device, gs.sceneMemory, 0, sizeof(SceneData), 0,
-	               &gs.sceneMapped) != VK_SUCCESS)
-		return 0;
+	for(uint32 frame = 0; frame < NUM_FRAME_CONTEXTS; frame++){
+		StateFrame &sf = gs.frames[frame];
+		if(!createBuffer(sizeof(SceneData),
+		                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                 &sf.sceneBuffer, &sf.sceneMemory))
+			return 0;
+		if(vkMapMemory(gvk.device, sf.sceneMemory, 0,
+		               sizeof(SceneData), 0,
+		               &sf.sceneMapped) != VK_SUCCESS)
+			return 0;
 
-	VkDescriptorSetAllocateInfo sceneSetInfo = {};
-	sceneSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	sceneSetInfo.descriptorPool = gs.descriptorPool;
-	sceneSetInfo.descriptorSetCount = 1;
-	sceneSetInfo.pSetLayouts = &gs.sceneLayout;
-	if(vkAllocateDescriptorSets(gvk.device, &sceneSetInfo, &gs.sceneDescriptor) != VK_SUCCESS)
-		return 0;
+		VkDescriptorSetAllocateInfo sceneSetInfo = {};
+		sceneSetInfo.sType =
+			VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		sceneSetInfo.descriptorPool = gs.descriptorPool;
+		sceneSetInfo.descriptorSetCount = 1;
+		sceneSetInfo.pSetLayouts = &gs.sceneLayout;
+		if(vkAllocateDescriptorSets(gvk.device, &sceneSetInfo,
+		                            &sf.sceneDescriptor) != VK_SUCCESS)
+			return 0;
 
-	VkDescriptorBufferInfo sceneBufferInfo = { gs.sceneBuffer, 0, sizeof(SceneData) };
-	VkWriteDescriptorSet sceneWrite = {};
-	sceneWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	sceneWrite.dstSet = gs.sceneDescriptor;
-	sceneWrite.dstBinding = 0;
-	sceneWrite.descriptorCount = 1;
-	sceneWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-	sceneWrite.pBufferInfo = &sceneBufferInfo;
-	vkUpdateDescriptorSets(gvk.device, 1, &sceneWrite, 0, nil);
+		VkDescriptorBufferInfo sceneBufferInfo =
+			{ sf.sceneBuffer, 0, sizeof(SceneData) };
+		VkWriteDescriptorSet sceneWrite = {};
+		sceneWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		sceneWrite.dstSet = sf.sceneDescriptor;
+		sceneWrite.dstBinding = 0;
+		sceneWrite.descriptorCount = 1;
+		sceneWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		sceneWrite.pBufferInfo = &sceneBufferInfo;
+		vkUpdateDescriptorSets(gvk.device, 1, &sceneWrite, 0, nil);
+	}
 
 	gs.modules[SHADER_WORLD][0] = createModule(kWorldVertSpv, sizeof(kWorldVertSpv));
 	gs.modules[SHADER_WORLD][1] = createModule(kWorldFragSpv, sizeof(kWorldFragSpv));
@@ -497,42 +517,48 @@ stateInit(void)
 	// shader applies unchanged here too.
 	gs.modules[SHADER_SKIN][1] = gs.modules[SHADER_WORLD][1];
 
-	// The bone blocks are suballocated from this buffer, so it has to be usable
-	// as a uniform buffer as well.
-	if(!createBuffer(DYNAMIC_CAPACITY,
-	                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-	                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-	                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-	                 &gs.dynamicBuffer, &gs.dynamicMemory))
-		return 0;
-	if(vkMapMemory(gvk.device, gs.dynamicMemory, 0, DYNAMIC_CAPACITY, 0,
-	               (void**)&gs.dynamicMapped) != VK_SUCCESS)
-		return 0;
-	gs.dynamicCapacity = DYNAMIC_CAPACITY;
-	gs.dynamicOffset = 0;
+	// Vertex/index/immediate data and bone blocks are private to each frame
+	// context, so the CPU never rewrites bytes an earlier submit still reads.
+	for(uint32 frame = 0; frame < NUM_FRAME_CONTEXTS; frame++){
+		StateFrame &sf = gs.frames[frame];
+		if(!createBuffer(DYNAMIC_CAPACITY,
+		                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+		                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+		                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                 &sf.dynamicBuffer, &sf.dynamicMemory))
+			return 0;
+		if(vkMapMemory(gvk.device, sf.dynamicMemory, 0,
+		               DYNAMIC_CAPACITY, 0,
+		               (void**)&sf.dynamicMapped) != VK_SUCCESS)
+			return 0;
+		sf.dynamicCapacity = DYNAMIC_CAPACITY;
 
-	// One dynamic-uniform set covering a single bone block; each skinned draw
-	// moves it with an offset rather than allocating a set of its own.
-	VkDescriptorSetAllocateInfo boneSetInfo = {};
-	boneSetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-	boneSetInfo.descriptorPool = gs.descriptorPool;
-	boneSetInfo.descriptorSetCount = 1;
-	boneSetInfo.pSetLayouts = &gs.boneLayout;
-	if(vkAllocateDescriptorSets(gvk.device, &boneSetInfo, &gs.boneDescriptor) != VK_SUCCESS)
-		return 0;
+		VkDescriptorSetAllocateInfo boneSetInfo = {};
+		boneSetInfo.sType =
+			VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		boneSetInfo.descriptorPool = gs.descriptorPool;
+		boneSetInfo.descriptorSetCount = 1;
+		boneSetInfo.pSetLayouts = &gs.boneLayout;
+		if(vkAllocateDescriptorSets(gvk.device, &boneSetInfo,
+		                            &sf.boneDescriptor) != VK_SUCCESS)
+			return 0;
 
-	VkDescriptorBufferInfo boneBufferInfo =
-		{ gs.dynamicBuffer, 0, RW_MAX_BONES*16*sizeof(float32) };
-	VkWriteDescriptorSet boneWrite = {};
-	boneWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	boneWrite.dstSet = gs.boneDescriptor;
-	boneWrite.dstBinding = 0;
-	boneWrite.descriptorCount = 1;
-	boneWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-	boneWrite.pBufferInfo = &boneBufferInfo;
-	vkUpdateDescriptorSets(gvk.device, 1, &boneWrite, 0, nil);
+		VkDescriptorBufferInfo boneBufferInfo = {
+			sf.dynamicBuffer, 0,
+			RW_MAX_BONES*16*sizeof(float32)
+		};
+		VkWriteDescriptorSet boneWrite = {};
+		boneWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		boneWrite.dstSet = sf.boneDescriptor;
+		boneWrite.dstBinding = 0;
+		boneWrite.descriptorCount = 1;
+		boneWrite.descriptorType =
+			VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+		boneWrite.pBufferInfo = &boneBufferInfo;
+		vkUpdateDescriptorSets(gvk.device, 1, &boneWrite, 0, nil);
+	}
 
 	gs.boneAlignment = gvk.deviceProperties.limits.minUniformBufferOffsetAlignment;
 	if(gs.boneAlignment == 0)
@@ -582,6 +608,26 @@ stateInit(void)
 				getPipeline(shader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 			}
 		}
+
+		// Two extra Im2D pipelines reproduce the radar's depth mask. Warm them
+		// before the first frame so opening the HUD never causes a dropped draw.
+		setImmediate2DStrictDepth(1);
+		gstate.vertexAlphaEnabled = 1;
+		gstate.srcBlend = BLENDZERO;
+		gstate.dstBlend = BLENDONE;
+		gstate.zTestEnabled = 0;
+		gstate.zWriteEnabled = 1;
+		gstate.cullMode = CULLNONE;
+		gstate.alphaTestFunction = ALPHAALWAYS;
+		getPipeline(SHADER_IM2D, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+
+		gstate.vertexAlphaEnabled = 0;
+		gstate.srcBlend = BLENDSRCALPHA;
+		gstate.dstBlend = BLENDINVSRCALPHA;
+		gstate.zTestEnabled = 1;
+		gstate.zWriteEnabled = 0;
+		getPipeline(SHADER_IM2D, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+		setImmediate2DStrictDepth(0);
 
 		gstate = saved;
 		VKLOG("pipeline warm-up finished");
@@ -638,13 +684,22 @@ stateShutdown(void)
 	if(gs.whiteImage) vkDestroyImage(gvk.device, gs.whiteImage, nil);
 	if(gs.whiteMemory) vkFreeMemory(gvk.device, gs.whiteMemory, nil);
 
-	if(gs.dynamicMapped) vkUnmapMemory(gvk.device, gs.dynamicMemory);
-	if(gs.dynamicBuffer) vkDestroyBuffer(gvk.device, gs.dynamicBuffer, nil);
-	if(gs.dynamicMemory) vkFreeMemory(gvk.device, gs.dynamicMemory, nil);
+	for(uint32 frame = 0; frame < NUM_FRAME_CONTEXTS; frame++){
+		StateFrame &sf = gs.frames[frame];
+		if(sf.dynamicMapped)
+			vkUnmapMemory(gvk.device, sf.dynamicMemory);
+		if(sf.dynamicBuffer)
+			vkDestroyBuffer(gvk.device, sf.dynamicBuffer, nil);
+		if(sf.dynamicMemory)
+			vkFreeMemory(gvk.device, sf.dynamicMemory, nil);
 
-	if(gs.sceneMapped) vkUnmapMemory(gvk.device, gs.sceneMemory);
-	if(gs.sceneBuffer) vkDestroyBuffer(gvk.device, gs.sceneBuffer, nil);
-	if(gs.sceneMemory) vkFreeMemory(gvk.device, gs.sceneMemory, nil);
+		if(sf.sceneMapped)
+			vkUnmapMemory(gvk.device, sf.sceneMemory);
+		if(sf.sceneBuffer)
+			vkDestroyBuffer(gvk.device, sf.sceneBuffer, nil);
+		if(sf.sceneMemory)
+			vkFreeMemory(gvk.device, sf.sceneMemory, nil);
+	}
 
 	if(gs.descriptorPool) vkDestroyDescriptorPool(gvk.device, gs.descriptorPool, nil);
 	if(gs.pipelineLayout) vkDestroyPipelineLayout(gvk.device, gs.pipelineLayout, nil);
@@ -664,13 +719,13 @@ getPipelineLayout(void)
 VkDescriptorSet
 getSceneDescriptor(void)
 {
-	return gs.sceneDescriptor;
+	return gs.frames[gs.activeFrame].sceneDescriptor;
 }
 
 VkDescriptorSet
 getBoneDescriptor(void)
 {
-	return gs.boneDescriptor;
+	return gs.frames[gs.activeFrame].boneDescriptor;
 }
 
 VkDeviceSize
@@ -686,10 +741,17 @@ getSceneData(void)
 }
 
 void
+setStateFrame(uint32 frame)
+{
+	gs.activeFrame = frame % NUM_FRAME_CONTEXTS;
+}
+
+void
 uploadSceneData(void)
 {
-	if(gs.sceneMapped != nil)
-		memcpy(gs.sceneMapped, &gs.scene, sizeof(SceneData));
+	StateFrame &sf = gs.frames[gs.activeFrame];
+	if(sf.sceneMapped != nil)
+		memcpy(sf.sceneMapped, &gs.scene, sizeof(SceneData));
 }
 
 VkPipeline
@@ -699,9 +761,16 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 		return VK_NULL_HANDLE;
 
 	const uint64 key = makePipelineKey(shader, topology);
+	if(gs.lastPipelineValid && gs.lastPipelineKey == key)
+		return gs.lastPipeline;
+
 	for(size_t i = 0; i < gs.pipelines.size(); i++)
-		if(gs.pipelines[i].key == key)
+		if(gs.pipelines[i].key == key){
+			gs.lastPipelineKey = key;
+			gs.lastPipeline = gs.pipelines[i].pipeline;
+			gs.lastPipelineValid = 1;
 			return gs.pipelines[i].pipeline;
+		}
 
 	// Never compile inside a render pass.
 	//
@@ -849,12 +918,26 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
 	if(shader == SHADER_IM2D){
-		// Never write depth from 2D: HUD elements would occlude the world.
-		// The test itself follows the game's own render state, as it does on
-		// the desktop backends -- Render2dStuff turns it off for the HUD, and
-		// world sprites (coronas, particles) leave it on so they sort against
-		// the scene at the true depth the vertex carries.
-		depthStencil.depthWriteEnable = VK_FALSE;
+		if(getImmediate2DStrictDepth()){
+			// The radar first writes its invisible outside-circle mask, then
+			// draws equal-depth tiles with strict LESS so only the unmasked
+			// circle survives.
+			if(gstate.zWriteEnabled){
+				// Vulkan suppresses depth writes whenever depth testing is
+				// disabled. RenderWare requests test-off/write-on for the
+				// invisible mask, so express that as an ALWAYS test.
+				depthStencil.depthTestEnable = VK_TRUE;
+				depthStencil.depthWriteEnable = VK_TRUE;
+				depthStencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+			}else if(gstate.zTestEnabled){
+				depthStencil.depthTestEnable = VK_TRUE;
+				depthStencil.depthWriteEnable = VK_FALSE;
+				depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+			}
+		}else{
+			// Regular HUD/fonts never write into the world depth buffer.
+			depthStencil.depthWriteEnable = VK_FALSE;
+		}
 	}
 
 	VkPipelineColorBlendAttachmentState blendAttachment = {};
@@ -912,6 +995,9 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	}
 	VK_CHECKPOINT("vk/pipelineReady");
 	gs.pipelines.push_back(entry);
+	gs.lastPipelineKey = key;
+	gs.lastPipeline = entry.pipeline;
+	gs.lastPipelineValid = 1;
 	return entry.pipeline;
 }
 
@@ -953,21 +1039,23 @@ getTextureDescriptor(Raster *raster)
 	const uint32 key = makeSamplerKey(gstate.textureFilter,
 	                                  gstate.textureAddressU,
 	                                  gstate.textureAddressV);
-	if(native->descriptorSet != VK_NULL_HANDLE && native->samplerKey == key)
-		return native->descriptorSet;
+	const uint32 frame = gs.activeFrame;
+	if(native->descriptorSet[frame] != VK_NULL_HANDLE &&
+	   native->samplerKey[frame] == key)
+		return native->descriptorSet[frame];
 
-	if(native->descriptorSet == VK_NULL_HANDLE){
+	if(native->descriptorSet[frame] == VK_NULL_HANDLE){
 		VkDescriptorSetAllocateInfo setInfo = {};
 		setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 		setInfo.descriptorPool = gs.descriptorPool;
 		setInfo.descriptorSetCount = 1;
 		setInfo.pSetLayouts = &gs.textureLayout;
 		if(vkAllocateDescriptorSets(gvk.device, &setInfo,
-		                            &native->descriptorSet) != VK_SUCCESS){
+		                            &native->descriptorSet[frame]) != VK_SUCCESS){
 			// The pool is sized for the whole streamed texture set; running out
 			// means the budget was wrong, so say so instead of drawing white.
 			VKERR("descriptor pool exhausted (%u sets)", MAX_TEXTURE_DESCRIPTORS);
-			native->descriptorSet = VK_NULL_HANDLE;
+			native->descriptorSet[frame] = VK_NULL_HANDLE;
 			return gs.whiteDescriptor;
 		}
 	}
@@ -981,15 +1069,15 @@ getTextureDescriptor(Raster *raster)
 
 	VkWriteDescriptorSet write = {};
 	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	write.dstSet = native->descriptorSet;
+	write.dstSet = native->descriptorSet[frame];
 	write.dstBinding = 0;
 	write.descriptorCount = 1;
 	write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	write.pImageInfo = &imageDescriptor;
 	vkUpdateDescriptorSets(gvk.device, 1, &write, 0, nil);
 
-	native->samplerKey = key;
-	return native->descriptorSet;
+	native->samplerKey[frame] = key;
+	return native->descriptorSet[frame];
 }
 
 bool32
@@ -1001,29 +1089,31 @@ allocateDynamic(VkDeviceSize size, VkDeviceSize alignment, VkBuffer *bufferOut,
 	if(alignment == 0)
 		alignment = 4;
 
-	VkDeviceSize offset = (gs.dynamicOffset + alignment - 1) & ~(alignment - 1);
-	if(offset + size > gs.dynamicCapacity){
-		if(!gs.dynamicOverflowReported){
+	StateFrame &sf = gs.frames[gs.activeFrame];
+	VkDeviceSize offset = (sf.dynamicOffset + alignment - 1) & ~(alignment - 1);
+	if(offset + size > sf.dynamicCapacity){
+		if(!sf.dynamicOverflowReported){
 			VKERR("dynamic buffer exhausted at %llu bytes; immediate-mode "
 			      "geometry will be dropped this frame",
-			      (unsigned long long)gs.dynamicCapacity);
-			gs.dynamicOverflowReported = 1;
+			      (unsigned long long)sf.dynamicCapacity);
+			sf.dynamicOverflowReported = 1;
 		}
 		return 0;
 	}
 
-	*bufferOut = gs.dynamicBuffer;
+	*bufferOut = sf.dynamicBuffer;
 	*offsetOut = offset;
-	*mappedOut = gs.dynamicMapped + offset;
-	gs.dynamicOffset = offset + size;
+	*mappedOut = sf.dynamicMapped + offset;
+	sf.dynamicOffset = offset + size;
 	return 1;
 }
 
 void
 resetDynamic(void)
 {
-	gs.dynamicOffset = 0;
-	gs.dynamicOverflowReported = 0;
+	StateFrame &sf = gs.frames[gs.activeFrame];
+	sf.dynamicOffset = 0;
+	sf.dynamicOverflowReported = 0;
 }
 
 }

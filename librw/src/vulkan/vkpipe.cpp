@@ -26,10 +26,8 @@ namespace vulkan {
 void
 destroyStaticBuffer(VkBuffer &buffer, VkDeviceMemory &memory)
 {
-	if(buffer != VK_NULL_HANDLE)
-		vkDestroyBuffer(gvk.device, buffer, nil);
-	if(memory != VK_NULL_HANDLE)
-		vkFreeMemory(gvk.device, memory, nil);
+	if(buffer != VK_NULL_HANDLE || memory != VK_NULL_HANDLE)
+		retireBuffer(buffer, memory);
 	buffer = VK_NULL_HANDLE;
 	memory = VK_NULL_HANDLE;
 }
@@ -66,11 +64,29 @@ uploadStaticBuffer(const void *data, VkDeviceSize size, VkBufferUsageFlags usage
 		VkBufferCopy copy = {};
 		copy.size = size;
 		vkCmdCopyBuffer(commandBuffer, staging, *bufferOut, 1, &copy);
+
+		VkBufferMemoryBarrier ready = {};
+		ready.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+		ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		ready.dstAccessMask =
+			VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+			VK_ACCESS_INDEX_READ_BIT;
+		ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		ready.buffer = *bufferOut;
+		ready.offset = 0;
+		ready.size = size;
+		vkCmdPipelineBarrier(commandBuffer,
+		                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+		                     0, 0, nil, 1, &ready, 0, nil);
 		endOneShot(commandBuffer);
 	}
 
-	vkDestroyBuffer(gvk.device, staging, nil);
-	vkFreeMemory(gvk.device, stagingMemory, nil);
+	// A streamed model may be drawn later in this same frame. Submission order
+	// makes the copy visible first; defer the upload source until the frame
+	// fence proves that both operations have completed.
+	retireBuffer(staging, stagingMemory);
 	return 1;
 }
 
@@ -384,10 +400,6 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	vkCmdBindVertexBuffers(commandBuffer, 0, 1, &header->vbo, &vertexOffset);
 	vkCmdBindIndexBuffer(commandBuffer, header->ibo, 0, VK_INDEX_TYPE_UINT16);
 
-	VkDescriptorSet sceneSet = getSceneDescriptor();
-	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                        getPipelineLayout(), 0, 1, &sceneSet, 0, nil);
-
 	if(boneOffset != nil){
 		VkDescriptorSet boneSet = getBoneDescriptor();
 		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -405,27 +417,13 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		Material *material = inst->material;
 		Raster *raster = material && material->texture ?
 			material->texture->raster : nil;
+		const bool textureAlpha = rasterHasAlpha(raster);
 
 		const bool wantsBlend =
-			inst->vertexAlpha || (material && material->color.alpha != 0xFF);
+			inst->vertexAlpha || (material && material->color.alpha != 0xFF) ||
+			textureAlpha;
 		if(wantsBlend != (blendPass == 1))
 			continue;
-
-		// Diagnostic: the ground renders translucent. Report what pushes
-		// world meshes into the blend pass -- vertex alpha from prelight or
-		// material alpha -- with the entity position for identification.
-		if(wantsBlend && shader == SHADER_WORLD){
-			static int32 blendProbe = 0;
-			if((blendProbe++ % 400) == 0){
-				Matrix *probeLtm = atomic->getFrame()->getLTM();
-				printf("[probe] blend mesh: va %d matA %d flags 0x%x "
-				       "pos %.0f %.0f %.0f\n",
-				       inst->vertexAlpha,
-				       material ? material->color.alpha : -1,
-				       atomic->geometry->flags,
-				       probeLtm->pos.x, probeLtm->pos.y, probeLtm->pos.z);
-			}
-		}
 
 		if(material && material->texture){
 			SetRenderState(TEXTUREFILTER, material->texture->getFilter());
@@ -434,7 +432,8 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		}
 		SetRenderState(VERTEXALPHA,
 			inst->vertexAlpha ||
-			(material && material->color.alpha != 0xFF) ? 1 : 0);
+			(material && material->color.alpha != 0xFF) ||
+			textureAlpha ? 1 : 0);
 
 		VkPipeline pipeline = getPipeline(shader,
 		                                  (VkPrimitiveTopology)header->primType);

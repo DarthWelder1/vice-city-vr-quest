@@ -1,6 +1,6 @@
 #pragma once
 
-#ifdef GTA_VR_OCULUS
+#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
 
 class CMatrix;
 class CVector;
@@ -138,6 +138,75 @@ bool ConsumePhysicalMeleeStrike(int hand, int *slot, int *weaponType,
 	CVector *sweepStart, CVector *sweepEnd, float *speed = nil,
 	CVector *rootStart = nil, CVector *rootEnd = nil);
 void ResolvePhysicalMeleeStrike(int hand, bool contact);
+
+#ifdef GTA_VR_WEAPONS
+// Small runtime configuration bridge used by the native Quest in-headset
+// menu. Values are persisted in the same vr_settings.ini schema as desktop.
+enum eQuestVehicleCalibrationItem
+{
+	QUEST_VEHICLE_CAL_HAND = 0,
+	QUEST_VEHICLE_CAL_OFFSET_X,
+	QUEST_VEHICLE_CAL_OFFSET_Y,
+	QUEST_VEHICLE_CAL_OFFSET_Z,
+	QUEST_VEHICLE_CAL_ROT_X,
+	QUEST_VEHICLE_CAL_ROT_Y,
+	QUEST_VEHICLE_CAL_ROT_Z,
+	QUEST_VEHICLE_CAL_WHEELIE_HEIGHT,
+	QUEST_VEHICLE_CAL_STAND_HEIGHT,
+	QUEST_VEHICLE_CAL_ITEM_COUNT
+};
+
+// Called after the Android layer has supplied the current tracked poses.
+// The returned bit mask identifies hands captured by a physical vehicle grip.
+uint32 UpdateQuestDrivingInput(CControllerState *state, bool blocked);
+void ResetQuestDrivingInteraction();
+// Reprojects the already sampled OpenXR poses after the game has advanced
+// physics and refreshed its first-person anchor. This updates render matrices
+// only; input edges, hand velocity and interaction state remain single-update.
+void RefreshQuestTrackedHandWorldPosesForRender();
+bool GetQuestRawTrackedHandMatrix(int hand, CMatrix *matrix,
+	float *grip = nil, float *trigger = nil);
+bool GetQuestRawTrackedHandAimMatrix(int hand, CMatrix *matrix);
+bool IsQuestDrivingHandUnavailable(int hand);
+void RestrictQuestVehicleWeaponsToSidearms();
+
+int GetQuestDrivingType();
+const char *GetQuestDrivingTypeName();
+void CycleQuestDrivingType(int direction);
+int GetQuestDrivingYOffsetCm();
+void AdjustQuestDrivingYOffsetCm(int direction);
+bool HasQuestVehicleSeatCalibrationTarget();
+int GetQuestVehicleSeatDistanceCm();
+void AdjustQuestVehicleSeatDistanceCm(int direction);
+int GetQuestMotionSteeringHand();
+void ToggleQuestMotionSteeringHand();
+bool AreQuestVehicleHandleHighlightsEnabled();
+void ToggleQuestVehicleHandleHighlights();
+bool IsQuestBikeHorizonLocked();
+void ToggleQuestBikeHorizonLock();
+const char *GetQuestActiveVehicleName();
+bool IsQuestVehicleCalibrationAvailable();
+bool IsQuestVehicleCalibrationBike();
+int GetQuestVehicleCalibrationItemCount();
+int GetQuestVehicleCalibrationValue(int hand, int item);
+void AdjustQuestVehicleCalibrationValue(int hand, int item, int direction);
+void SetQuestVehicleCalibrationPreview(bool visible);
+void ApplyQuestVehicleViewOffset(CMatrix *eyeCamera);
+void ApplyQuestBikeHorizonLock(CMatrix *baseCamera);
+
+int GetQuestWeaponSettingCount();
+const char *GetQuestWeaponSettingName(int setting);
+bool GetQuestWeaponSetting(int setting);
+void ToggleQuestWeaponSetting(int setting);
+int GetQuestCalibrationWeaponType(int hand);
+int GetQuestCalibrationValue(int hand, int weaponType, int item);
+void AdjustQuestCalibrationValue(int hand, int weaponType, int item,
+	int direction);
+int GetQuestHolsterPointCount();
+const char *GetQuestHolsterPointName(int point);
+int GetQuestHolsterPointSlot(int point);
+void CycleQuestHolsterPointSlot(int point, int direction);
+#endif
 
 void PerfBeginFrame();
 void PerfAbortFrame();

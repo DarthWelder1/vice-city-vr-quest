@@ -1,5 +1,6 @@
 #include <time.h>
 #include <locale.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -28,8 +29,12 @@
 #include "PlayerPed.h"
 #include "CutsceneMgr.h"
 #include "Vehicle.h"
+#include "World.h"
 #include "Draw.h"
 #include "vulkan/rwvk.h"
+#ifdef GTA_VR_WEAPONS
+#include "OculusVR.h"
+#endif
 
 #include <android/log.h>
 #define ALOG(...) __android_log_print(ANDROID_LOG_INFO, "MiamiVR", __VA_ARGS__)
@@ -256,6 +261,12 @@ SetPadInput(const PadInput &input)
 	gPadInput = input;
 }
 
+const PadInput &
+GetPadInput(void)
+{
+	return gPadInput;
+}
+
 void
 SetFrameTimeNs(long long ns)
 {
@@ -321,14 +332,35 @@ VrRestoreFov(void)
 }
 
 // First person state, consumed by CRenderer to hide the player's own body.
-// Set every frame below, next to the pad capture, which runs before any
-// rendering.
+// The body is replaced by tracked hands on foot and during physical vehicle
+// driving, but DEFAULT driving retains Vice City's animated in-car Tommy.
+// Set every frame below, next to the pad capture, which runs before rendering.
 bool gVrFirstPersonActive;
 CEntity *gVrPlayerEntity;
 static bool gVrInVehicle;
-// Diagnostic switch: with the body visible, a misbehaving seated ped (and
-// the head-bone camera dutifully following it) can be seen directly.
-bool gVrHidePlayerBody = false;
+bool gVrHidePlayerBody = true;
+
+bool
+androidgame::VrShouldUseTheaterMode(void)
+{
+	// This is the Android equivalent of the desktop build's showGameplay
+	// predicate. IsRunning covers formal cutscenes, while WideScreenOn covers
+	// scripted cinematics such as the opening drive to the Ocean View hotel.
+	// The original scripts also use playingIntro while they remove/rebuild the
+	// world between opening scenes.  That interval has no valid immersive
+	// camera or world to display, so it belongs to the same static theater
+	// path instead of exposing the clear-colour sky for one or more frames.
+	return gGameState != GS_PLAYING_GAME ||
+		FrontEndMenuManager.m_bGameNotLoaded ||
+		FrontEndMenuManager.m_bMenuActive ||
+		FrontEndMenuManager.m_bWantToRestart ||
+		FrontEndMenuManager.m_bWantToLoad ||
+		CGame::playingIntro ||
+		FindPlayerPed() == nil ||
+		CCutsceneMgr::IsCutsceneProcessing() ||
+		CCutsceneMgr::IsRunning() ||
+		TheCamera.m_WideScreenOn;
+}
 
 // Decides whether this frame plays from inside the character's head and, if
 // so, anchors the view there. Menus, cutscenes and widescreen sequences keep
@@ -342,12 +374,16 @@ bool gVrHidePlayerBody = false;
 void
 VrUpdateFirstPersonAnchor(bool postPhysics)
 {
-	(void)postPhysics;
 	CPlayerPed *player = FindPlayerPed();
+	const bool remoteMode =
+		CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode();
 	const bool wantFirstPerson =
 		gGameState == GS_PLAYING_GAME &&
 		player != nil &&
+		!remoteMode &&
 		!FrontEndMenuManager.m_bMenuActive &&
+		!CGame::playingIntro &&
+		!CCutsceneMgr::IsCutsceneProcessing() &&
 		!CCutsceneMgr::IsRunning() &&
 		!TheCamera.m_WideScreenOn;
 
@@ -355,6 +391,17 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	gVrPlayerEntity = (CEntity*)player;
 	gVrInVehicle = wantFirstPerson && player->InVehicle() &&
 		player->m_pMyVehicle != nil;
+	// Match the desktop policy: DEFAULT driving uses the original animated
+	// vehicle occupant, while on-foot VR and IMMERSIVE/MOTION driving replace
+	// Tommy with tracked hands.  CRenderer and CPed both consume this flag, so
+	// decide it once here instead of letting their early Vulkan exits hide the
+	// DEFAULT occupant unconditionally.
+#ifdef GTA_VR_WEAPONS
+	gVrHidePlayerBody = !gVrInVehicle ||
+		OculusVR::IsImmersiveDrivingActive();
+#else
+	gVrHidePlayerBody = true;
+#endif
 
 	// Verbatim port of the desktop VR base camera (RenderVrStereoFrame in
 	// main.cpp): the anchor is the player's HEAD BONE -- animated, seated in
@@ -366,10 +413,37 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	   !player->DyingOrDead() && player->m_pFrames[PED_HEAD] != nil){
 		CVector forward = player->GetForward();
 		forward.Normalise();
+		CVector horizontalForward = forward;
+		horizontalForward.z = 0.0f;
+		if(horizontalForward.MagnitudeSqr() > 0.0001f){
+			horizontalForward.Normalise();
+
+			// PlayerControlZelda derives on-foot movement from
+			// TheCamera.Orientation.  Quest writes the tracked view straight
+			// into the RenderWare camera, so the old chase-camera heading
+			// otherwise survives here and turns "forward" by 90 degrees.
+			// Keep the renderer anchor below in its standard atan2(y, x)
+			// convention; the game camera uses atan2(x, y).
+			if(!gVrInVehicle)
+				TheCamera.Orientation =
+					Atan2(horizontalForward.x, horizontalForward.y);
+		}
 
 		CVector head(0.0f, 0.0f, 0.0f);
 		player->m_pedIK.GetComponentPosition(head, PED_HEAD);
 		head += forward * 0.12f;
+#ifdef GTA_VR_WEAPONS
+		if(gVrInVehicle){
+			// The desktop vehicle view applies both the global vertical seat
+			// adjustment and the per-model fore/aft calibration before the
+			// OpenXR eye pose. Quest anchors directly on the animated head
+			// bone, so fold the same offsets into that anchor here.
+			CMatrix vehicleView = player->GetMatrix();
+			vehicleView.GetPosition() = head;
+			OculusVR::ApplyQuestVehicleViewOffset(&vehicleView);
+			head = vehicleView.GetPosition();
+		}
+#endif
 
 		// Diagnostic: where the anchor actually lands relative to the ped.
 		{
@@ -382,8 +456,56 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			}
 		}
 
-		rw::vulkan::setFirstPersonAnchor(&head.x,
-			Atan2(forward.y, forward.x), 1, 1);
+		bool fullVehicleBasis = false;
+#ifdef GTA_VR_WEAPONS
+		CVehicle *viewVehicle =
+			gVrInVehicle ? player->m_pMyVehicle : nil;
+		if(viewVehicle){
+			CVector vehicleForward = viewVehicle->GetForward();
+			// Unlocked vehicles inherit the complete authored vehicle basis.
+			// Bike horizon lock preserves the bike's forward vector (including
+			// pitch over hills/wheelies) and replaces only its rolled up vector
+			// with world-up. Feeding both through the same basis API also keeps
+			// controller/hand conversion consistent with the rendered eyes.
+			CVector vehicleUp =
+				viewVehicle->IsBike() &&
+			 OculusVR::IsQuestBikeHorizonLocked() ?
+				CVector(0.0f, 0.0f, 1.0f) :
+				viewVehicle->GetUp();
+			if(vehicleForward.MagnitudeSqr() > 0.0001f &&
+			   vehicleUp.MagnitudeSqr() > 0.0001f){
+				vehicleForward.Normalise();
+				vehicleUp.Normalise();
+				CVector vehicleRight =
+					CrossProduct(vehicleForward, vehicleUp);
+				if(vehicleRight.MagnitudeSqr() > 0.0001f){
+					vehicleRight.Normalise();
+					vehicleUp = CrossProduct(
+						vehicleRight, vehicleForward);
+					vehicleUp.Normalise();
+					rw::vulkan::setFirstPersonAnchorBasis(
+						&head.x, &vehicleRight.x,
+						&vehicleUp.x, &vehicleForward.x,
+						Atan2(vehicleForward.y,
+						      vehicleForward.x), 1);
+					fullVehicleBasis = true;
+				}
+			}
+		}
+#endif
+		if(!fullVehicleBasis)
+			rw::vulkan::setFirstPersonAnchor(&head.x,
+				Atan2(forward.y, forward.x), 1, 1);
+
+#ifdef GTA_VR_WEAPONS
+		// CapturePad converts controller poses before physics so interactions
+		// are evaluated once per game step. The anchor above is the post-
+		// physics player/vehicle position used for this rendered frame. Rebase
+		// only the visual hand matrices now, otherwise they trail a running
+		// player or moving vehicle by one simulation step.
+		if(postPhysics)
+			OculusVR::RefreshQuestTrackedHandWorldPosesForRender();
+#endif
 
 		// Write the actual view into the RenderWare camera frame, as the
 		// desktop BeginEye does. Everything that projects against the game
@@ -429,6 +551,51 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 
 // XINPUT is off on this platform, so CPad routes through CapturePad. This is
 // the same seam the desktop build uses to inject tracked-controller state.
+static bool gQuestSnapTurnStickLatched;
+
+static void
+ApplyQuestSnapTurn(float stickX)
+{
+	if(!androidgame::VrUsesSnapTurn() || FindPlayerVehicle() ||
+	   CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode() ||
+	   gGameState != GS_PLAYING_GAME ||
+	   FrontEndMenuManager.m_bGameNotLoaded ||
+	   CGame::playingIntro ||
+	   CCutsceneMgr::IsRunning() ||
+	   CCutsceneMgr::IsCutsceneProcessing() ||
+	   TheCamera.m_WideScreenOn){
+		gQuestSnapTurnStickLatched = fabsf(stickX) >= 0.35f;
+		return;
+	}
+	if(fabsf(stickX) <= 0.35f){
+		gQuestSnapTurnStickLatched = false;
+		return;
+	}
+	if(gQuestSnapTurnStickLatched || fabsf(stickX) < 0.70f)
+		return;
+
+	gQuestSnapTurnStickLatched = true;
+	const float delta = -copysignf(
+		DEGTORAD((float)androidgame::VrSnapTurnAngleDegrees()), stickX);
+	CCam &cam = TheCamera.Cams[TheCamera.ActiveCam];
+	cam.Beta += delta;
+	cam.m_fTrueBeta += delta;
+	cam.m_fTargetBeta += delta;
+	while(cam.Beta >= PI) cam.Beta -= TWOPI;
+	while(cam.Beta < -PI) cam.Beta += TWOPI;
+	while(cam.m_fTrueBeta >= PI) cam.m_fTrueBeta -= TWOPI;
+	while(cam.m_fTrueBeta < -PI) cam.m_fTrueBeta += TWOPI;
+	while(cam.m_fTargetBeta >= PI) cam.m_fTargetBeta -= TWOPI;
+	while(cam.m_fTargetBeta < -PI) cam.m_fTargetBeta += TWOPI;
+
+	CPlayerPed *player = FindPlayerPed();
+	if(player){
+		player->m_fRotationCur += delta;
+		player->m_fRotationDest += delta;
+		player->SetHeading(player->m_fRotationCur);
+	}
+}
+
 void
 CapturePad(RwInt32 padID)
 {
@@ -441,6 +608,8 @@ CapturePad(RwInt32 padID)
 	state.Clear();
 
 	const androidgame::PadInput &in = gPadInput;
+	if(androidgame::VrMenuConsumesInput())
+		return;
 
 	// Thumbstick Y is up-positive on OpenXR and down-positive in the game.
 	//
@@ -451,10 +620,77 @@ CapturePad(RwInt32 padID)
 	// walls. The 0.3 deadzone and the leave-alone-when-inside behaviour match
 	// the desktop skeletons in glfw.cpp and win.cpp.
 	const float stickDeadzone = 0.3f;
+	float rightStickX = clamp(in.rightStickX, -1.0f, 1.0f);
+	const bool remoteMode =
+		CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode();
+	ApplyQuestSnapTurn(rightStickX);
+#ifdef GTA_VR_WEAPONS
+	const bool trackedScopeActive = OculusVR::IsTrackedScopeActive();
+#else
+	const bool trackedScopeActive = false;
+#endif
+	const bool onFootGameplay =
+		gGameState == GS_PLAYING_GAME &&
+		!FrontEndMenuManager.m_bGameNotLoaded &&
+		!FrontEndMenuManager.m_bMenuActive &&
+		!CGame::playingIntro &&
+		!FindPlayerVehicle() &&
+		!remoteMode &&
+		!CCutsceneMgr::IsRunning() &&
+		!CCutsceneMgr::IsCutsceneProcessing() &&
+		!trackedScopeActive &&
+		!TheCamera.m_WideScreenOn;
+	float localHeadYaw = 0.0f;
+	const bool localHeadYawValid =
+		onFootGameplay &&
+		rw::vulkan::getFirstPersonLocalHeadYaw(&localHeadYaw);
+	if(onFootGameplay){
+		if(androidgame::VrUsesSnapTurn())
+			rightStickX = 0.0f;
+		else
+			rightStickX = clamp(
+				rightStickX*androidgame::VrSmoothTurnScale(),
+				-1.0f, 1.0f);
+		if(localHeadYawValid &&
+		   androidgame::VrUsesExperimentalHeadTurning()){
+			const float moveMagnitudeSqr =
+				in.leftStickX*in.leftStickX+
+				in.leftStickY*in.leftStickY;
+			if(moveMagnitudeSqr >= 0.20f*0.20f){
+				const float deadZone = DEGTORAD(10.0f);
+				const float fullSpeedAngle = DEGTORAD(55.0f);
+				const float absoluteYaw = fabsf(localHeadYaw);
+				if(absoluteYaw > deadZone){
+					float axis = clamp(
+						(absoluteYaw-deadZone)/
+						(fullSpeedAngle-deadZone),
+						0.0f, 1.0f);
+					axis = axis*axis*(3.0f-2.0f*axis);
+					axis = copysignf(axis, -localHeadYaw);
+					rightStickX = clamp(
+						rightStickX+
+						axis*androidgame::VrHeadTurnScale(),
+						-1.0f, 1.0f);
+				}
+			}
+		}
+	}
+	float moveStickX = clamp(in.leftStickX, -1.0f, 1.0f);
+	float moveStickY = clamp(in.leftStickY, -1.0f, 1.0f);
+	if(localHeadYawValid && androidgame::VrUsesHeadRelativeMovement()){
+		// Rotate only by local HMD yaw. Pitch/roll never alter locomotion and
+		// the latched facing makes recentering a true new forward direction.
+		const float cosine = cosf(localHeadYaw);
+		const float sine = sinf(localHeadYaw);
+		const float headX = moveStickX*cosine-moveStickY*sine;
+		const float headY = moveStickY*cosine+moveStickX*sine;
+		moveStickX = headX;
+		moveStickY = headY;
+	}
 	const float sticks[4] = {
-		clamp(in.leftStickX,   -1.0f, 1.0f),
-		clamp(-in.leftStickY,  -1.0f, 1.0f),
-		clamp(in.rightStickX,  -1.0f, 1.0f),
+		moveStickX,
+		-moveStickY,
+		rightStickX,
 		clamp(-in.rightStickY, -1.0f, 1.0f)
 	};
 	int16 *const axes[4] = {
@@ -465,10 +701,14 @@ CapturePad(RwInt32 padID)
 		if(Abs(sticks[i]) > stickDeadzone)
 			*axes[i] = (int16)(sticks[i] * 128.0f);
 
-	// No stick remapping: the desktop VR build feeds the pad exactly like the
-	// flat game, and this port mirrors it.
+	// Left movement and vertical camera input remain the classic pad mapping.
+	// Horizontal turn is the same configurable smooth/snap path as desktop.
 
-	state.Cross    = in.a ? 255 : 0;
+	const int padMode = CPad::GetPad(0)->GetMode();
+	// Remote-control missions keep A for the stock vehicle-fire action (the
+	// demolition helicopter drops its bomb through that path). The accelerator
+	// remains on R2 below, so A must not also leak into Cross in remote mode.
+	state.Cross    = !remoteMode && in.a ? 255 : 0;
 	state.Circle   = in.b ? 255 : 0;
 	state.Square   = in.x ? 255 : 0;
 	state.Triangle = in.y ? 255 : 0;
@@ -488,6 +728,12 @@ CapturePad(RwInt32 padID)
 		(int16)(clamp(in.leftGrip,  0.0f, 1.0f)*255.0f);
 	state.RightShoulder1 =
 		(int16)(clamp(in.rightGrip, 0.0f, 1.0f)*255.0f);
+	if(remoteMode && in.a){
+		if(padMode == 3)
+			state.RightShoulder1 = 255;
+		else
+			state.Circle = 255;
+	}
 	state.LeftShock  = in.leftStickClick  ? 255 : 0;
 	state.RightShock = in.rightStickClick ? 255 : 0;
 
@@ -650,6 +896,20 @@ Step(void)
 		CTimer::Stop();
 
 		if(FrontEndMenuManager.m_bWantToLoad){
+			// The desktop frontend constructs a normal game world before it
+			// enters the restart/load path.  The Android frame loop used to
+			// service m_bWantToRestart first, while we were still in
+			// GS_INIT_PLAYING_GAME, so ShutDownForRestart tried to clear pools
+			// which had never been created (first the replay vehicle pool, then
+			// the temporary-object pool).  Prime the same baseline world here
+			// and only then run the ordinary restart/load sequence.
+			if(gGameState != GS_PLAYING_GAME){
+				ALOG("initialising baseline world before frontend save load (state=%u)",
+				     gGameState);
+				InitialiseGame();
+				FrontEndMenuManager.m_bGameNotLoaded = false;
+				gGameState = GS_PLAYING_GAME;
+			}
 			CGame::ShutDownForRestart();
 			CGame::InitialiseWhenRestarting();
 			DMAudio.ChangeMusicMode(MUSICMODE_GAME);

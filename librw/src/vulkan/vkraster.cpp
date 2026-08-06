@@ -125,12 +125,8 @@ destroyNativeRaster(void *object, int32 offset, int32)
 			vkDestroyBuffer(gvk.device, native->stagingBuffer, nil);
 		if(native->stagingMemory)
 			vkFreeMemory(gvk.device, native->stagingMemory, nil);
-		if(native->view)
-			vkDestroyImageView(gvk.device, native->view, nil);
-		if(native->image)
-			vkDestroyImage(gvk.device, native->image, nil);
-		if(native->memory)
-			vkFreeMemory(gvk.device, native->memory, nil);
+		if(native->view || native->image || native->memory)
+			retireImage(native->view, native->image, native->memory);
 	}
 	memset(native, 0, sizeof(VulkanRaster));
 	native->lockedLevel = -1;
@@ -282,6 +278,36 @@ rasterCreate(Raster *raster)
 	return raster;
 }
 
+// DXT1 may carry one-bit transparency even when the TXD native-texture
+// header does not advertise alpha. In that mode colour index 3 is
+// transparent whenever colour0 <= colour1. Foliage in Vice City uses this
+// extensively, so trusting only the header would incorrectly classify its
+// material as opaque and draw the black padding around palm leaves.
+static bool32
+dxt1BlocksHaveTransparency(const uint8 *blocks, uint32 size)
+{
+	for(uint32 offset = 0; offset + 8 <= size; offset += 8){
+		const uint16 colour0 =
+			(uint16)blocks[offset + 0] |
+			((uint16)blocks[offset + 1] << 8);
+		const uint16 colour1 =
+			(uint16)blocks[offset + 2] |
+			((uint16)blocks[offset + 3] << 8);
+		if(colour0 > colour1)
+			continue;
+
+		const uint32 indices =
+			(uint32)blocks[offset + 4] |
+			((uint32)blocks[offset + 5] << 8) |
+			((uint32)blocks[offset + 6] << 16) |
+			((uint32)blocks[offset + 7] << 24);
+		for(uint32 pixel = 0; pixel < 16; pixel++)
+			if(((indices >> (pixel * 2)) & 3u) == 3u)
+				return 1;
+	}
+	return 0;
+}
+
 // Creates a texture directly from DXT blocks, no CPU decode. Adreno 740
 // reports full BC support, so stream data reaches the GPU the same way the
 // desktop D3D12 build uploads it. Decoding on the CPU instead cost
@@ -316,7 +342,17 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	VulkanRaster *native = GETVULKANRASTER(raster);
 	native->format = format;
 	native->numLevels = 1;
-	native->hasAlpha = hasAlpha;
+	const bool32 blockAlpha =
+		dxt == 1 && dxt1BlocksHaveTransparency(blocks, size);
+	native->hasAlpha = hasAlpha || blockAlpha;
+	if(blockAlpha && !hasAlpha){
+		static uint32 detectedWithoutHeader = 0;
+		if(detectedWithoutHeader < 8){
+			VKLOG("DXT1 transparency found in blocks despite clear TXD alpha flag (%dx%d)",
+			      width, height);
+			detectedWithoutHeader++;
+		}
+	}
 
 	VkImageCreateInfo imageInfo = {};
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -403,8 +439,9 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		endOneShot(commandBuffer);
 		native->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	}
-	vkDestroyBuffer(gvk.device, staging, nil);
-	vkFreeMemory(gvk.device, stagingMemory, nil);
+	// endOneShot is asynchronous during a live frame. The active frame fence
+	// retires this staging allocation after both the copy and its consumers.
+	retireBuffer(staging, stagingMemory);
 
 	return raster;
 }
@@ -509,8 +546,8 @@ rasterUnlock(Raster *raster, int32 level)
 	}
 
 	vkUnmapMemory(gvk.device, native->stagingMemory);
-	vkDestroyBuffer(gvk.device, native->stagingBuffer, nil);
-	vkFreeMemory(gvk.device, native->stagingMemory, nil);
+	// Keep the upload source alive until the active frame fence signals.
+	retireBuffer(native->stagingBuffer, native->stagingMemory);
 	native->stagingBuffer = VK_NULL_HANDLE;
 	native->stagingMemory = VK_NULL_HANDLE;
 	native->stagingMapped = nil;
@@ -560,6 +597,9 @@ rasterFromImage(Raster *raster, Image *image)
 {
 	if((raster->type & 0xF) != Raster::TEXTURE)
 		return 0;
+
+	VulkanRaster *native = GETVULKANRASTER(raster);
+	native->hasAlpha = native->hasAlpha || image->hasAlpha();
 
 	uint8 *dst = rasterLock(raster, 0, Raster::LOCKWRITE | Raster::LOCKNOFETCH);
 	if(dst == nil)
@@ -639,6 +679,18 @@ void
 setRasterHasAlpha(Raster *raster, bool32 hasAlpha)
 {
 	GETVULKANRASTER(raster)->hasAlpha = hasAlpha;
+}
+
+bool32
+rasterHasAlpha(Raster *raster)
+{
+	if(raster == nil)
+		return 0;
+	if(raster->parent != nil)
+		raster = raster->parent;
+	if(raster->platform != PLATFORM_VULKAN)
+		return 0;
+	return GETVULKANRASTER(raster)->hasAlpha;
 }
 
 bool32

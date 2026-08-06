@@ -8,6 +8,11 @@ namespace rw { namespace d3d12 {
 void setImmediate2DStrictDepth(bool32 enabled);
 } }
 #endif
+#ifdef RW_VULKAN
+namespace rw { namespace vulkan {
+void setImmediate2DStrictDepth(bool32 enabled);
+} }
+#endif
 
 namespace GameRender
 {
@@ -63,6 +68,10 @@ public:
 		rw::d3d12::setImmediate2DStrictDepth(
 			command.role == IMMEDIATE2D_DRAW_RADAR);
 #endif
+#ifdef RW_VULKAN
+		rw::vulkan::setImmediate2DStrictDepth(
+			command.role == IMMEDIATE2D_DRAW_RADAR);
+#endif
 		return RwIm2DRenderPrimitive(command.primitiveType, command.vertices,
 			command.vertexCount) != FALSE;
 	}
@@ -71,6 +80,10 @@ public:
 	{
 #ifdef RW_D3D12
 		rw::d3d12::setImmediate2DStrictDepth(
+			command.role == IMMEDIATE2D_DRAW_RADAR);
+#endif
+#ifdef RW_VULKAN
+		rw::vulkan::setImmediate2DStrictDepth(
 			command.role == IMMEDIATE2D_DRAW_RADAR);
 #endif
 		return RwIm2DRenderIndexedPrimitive(command.primitiveType, command.vertices,

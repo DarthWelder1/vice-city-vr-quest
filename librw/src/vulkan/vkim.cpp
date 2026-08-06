@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "../rwbase.h"
 #include "../rwerror.h"
@@ -32,6 +33,8 @@ struct Im3DState
 	int32 numVertices;
 	float32 model[16];
 } gim3d;
+
+static bool32 gImmediate2DStrictDepth;
 
 // Triangle fans never reach the device.
 //
@@ -99,10 +102,6 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 		return 0;
 	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-	VkDescriptorSet sceneSet = getSceneDescriptor();
-	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                        getPipelineLayout(), 0, 1, &sceneSet, 0, nil);
-
 	Raster *raster = (Raster*)GetRenderStatePtr(TEXTURERASTER);
 	VkDescriptorSet textureSet = getTextureDescriptor(raster);
 	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -122,7 +121,11 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 	push.materialColour[2] = push.materialColour[3] = 1.0f;
 	push.surfaceProps[0] = 1.0f;
 	push.surfaceProps[1] = 0.0f;	// immediate geometry is never lit
-	push.surfaceProps[2] = 0.0f;
+	// The strict radar pass is pinned to the near depth plane. This keeps the
+	// map visible through a vehicle cockpit while preserving the original
+	// equal-depth circular mask.
+	push.surfaceProps[2] =
+		shader == SHADER_IM2D && gImmediate2DStrictDepth ? 1.0f : 0.0f;
 	push.surfaceProps[3] = gstate.alphaTestRef / 255.0f;
 	vkCmdPushConstants(commandBuffer, getPipelineLayout(),
 	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -205,14 +208,54 @@ resolveIndices(PrimitiveType primType, const uint16 *indices, int32 numIndices,
 // Draw accounting. Distinguishes "the game never asked" from "it asked and we
 // dropped it", which look identical from outside: both leave the GPU idle.
 static uint32 gIm2DCalls, gIm2DDropped, gIm2DDrawn;
+static float32 gIm2DSafeAreaScaleX = 1.0f;
+static float32 gIm2DSafeAreaScaleY = 1.0f;
+static float32 gIm2DSafeAreaOffsetX;
+static float32 gIm2DSafeAreaOffsetY;
+
+bool32
+uploadIm2DVertices(const Im2DVertex *source, int32 count,
+                   VkBuffer *bufferOut, VkDeviceSize *offsetOut)
+{
+	const VkDeviceSize size = (VkDeviceSize)count*sizeof(Im2DVertex);
+	void *mapped = nil;
+	if(!allocateDynamic(size, 16, bufferOut, offsetOut, &mapped))
+		return 0;
+
+	if(fabsf(gIm2DSafeAreaScaleX-1.0f) < 0.0001f &&
+	   fabsf(gIm2DSafeAreaScaleY-1.0f) < 0.0001f &&
+	   fabsf(gIm2DSafeAreaOffsetX) < 0.0001f &&
+	   fabsf(gIm2DSafeAreaOffsetY) < 0.0001f){
+		memcpy(mapped, source, (size_t)size);
+		return 1;
+	}
+
+	Im2DVertex *destination = (Im2DVertex*)mapped;
+	const float32 centreX = (float32)gvk.width*0.5f;
+	const float32 centreY = (float32)gvk.height*0.5f;
+	for(int32 i = 0; i < count; i++){
+		destination[i] = source[i];
+		destination[i].x =
+			centreX+(source[i].x-centreX)*gIm2DSafeAreaScaleX+
+			gIm2DSafeAreaOffsetX;
+		destination[i].y =
+			centreY+(source[i].y-centreY)*gIm2DSafeAreaScaleY+
+			gIm2DSafeAreaOffsetY;
+	}
+	return 1;
+}
 
 void
 logImStats(void)
 {
-	static uint32 lastCalls = 0xFFFFFFFF;
-	if(gIm2DCalls == lastCalls)
+	// This used to print every frame because calls always increases. Android
+	// logcat then did formatted I/O at headset refresh rate for a diagnostic
+	// whose useful event is a dropped draw. Report the initial state and only
+	// report again when that event count changes.
+	static uint32 lastDropped = 0xFFFFFFFF;
+	if(gIm2DDropped == lastDropped)
 		return;
-	lastCalls = gIm2DCalls;
+	lastDropped = gIm2DDropped;
 	__android_log_print(ANDROID_LOG_INFO, "librw-vk",
 	                    "im2d: %u calls, %u drawn, %u dropped",
 	                    gIm2DCalls, gIm2DDrawn, gIm2DDropped);
@@ -228,14 +271,12 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 		return;
 	}
 
-	VK_CHECKPOINT("im2d/uploadVertices");
 	VkBuffer vertexBuffer = VK_NULL_HANDLE;
 	VkDeviceSize vertexOffset = 0;
-	if(!uploadVertices(vertices, (VkDeviceSize)numVertices*sizeof(Im2DVertex),
-	                   &vertexBuffer, &vertexOffset))
+	if(!uploadIm2DVertices((const Im2DVertex*)vertices, numVertices,
+	                      &vertexBuffer, &vertexOffset))
 		return;
 
-	VK_CHECKPOINT("im2d/resolveIndices");
 	VkBuffer indexBuffer = VK_NULL_HANDLE;
 	VkDeviceSize indexOffset = 0;
 	int32 indexCount = 0;
@@ -246,7 +287,6 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 	VkCommandBuffer commandBuffer = gvk.frameCommands;
 	float32 model[16];
 	makeIm2DTransform(model);
-	VK_CHECKPOINT("im2d/setupState");
 	if(!setupCommonState(commandBuffer, SHADER_IM2D,
 	                     topologyFromPrimitiveType(primType), model)){
 		gIm2DDropped++;
@@ -254,20 +294,15 @@ drawIm2D(PrimitiveType primType, void *vertices, int32 numVertices,
 	}
 	gIm2DDrawn++;
 
-	VK_CHECKPOINT("im2d/bindVertex");
 	vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexOffset);
 
 	if(indexCount > 0){
-		VK_CHECKPOINT("im2d/bindIndex");
 		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, indexOffset,
 		                     VK_INDEX_TYPE_UINT16);
-		VK_CHECKPOINT("im2d/drawIndexed");
 		vkCmdDrawIndexed(commandBuffer, (uint32)indexCount, 1, 0, 0, 0);
 	}else{
-		VK_CHECKPOINT("im2d/draw");
 		vkCmdDraw(commandBuffer, (uint32)numVertices, 1, 0, 0);
 	}
-	VK_CHECKPOINT("im2d/done");
 }
 
 void
@@ -307,6 +342,36 @@ drawIm3D(PrimitiveType primType, void *indices, int32 numIndices)
 }
 
 } // namespace
+
+void
+setIm2DSafeAreaScale(float32 scale)
+{
+	setIm2DSafeAreaTransform(scale, scale, 0.0f, 0.0f);
+}
+
+void
+setIm2DSafeAreaTransform(float32 scaleX, float32 scaleY,
+                         float32 offsetX, float32 offsetY)
+{
+	gIm2DSafeAreaScaleX = scaleX < 0.1f ? 0.1f :
+		(scaleX > 2.0f ? 2.0f : scaleX);
+	gIm2DSafeAreaScaleY = scaleY < 0.1f ? 0.1f :
+		(scaleY > 2.0f ? 2.0f : scaleY);
+	gIm2DSafeAreaOffsetX = offsetX;
+	gIm2DSafeAreaOffsetY = offsetY;
+}
+
+void
+setImmediate2DStrictDepth(bool32 enabled)
+{
+	gImmediate2DStrictDepth = enabled;
+}
+
+bool32
+getImmediate2DStrictDepth(void)
+{
+	return gImmediate2DStrictDepth;
+}
 
 void
 reportImStats(void)

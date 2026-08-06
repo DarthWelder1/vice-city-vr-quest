@@ -1,0 +1,6 @@
+# Copy this file to release-signing.properties and replace every placeholder.
+# Paths are resolved relative to the android directory.
+storeFile=../_quest_signing/vice-city-vr-quest-release.jks
+storePassword=REPLACE_WITH_A_STRONG_PASSWORD
+keyAlias=vice-city-vr-quest
+keyPassword=REPLACE_WITH_A_STRONG_PASSWORD

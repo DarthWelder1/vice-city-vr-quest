@@ -47,6 +47,13 @@ bool getContext(GraphicsContext *out);
 
 // Snapshot of the tracked controllers, refreshed once per frame while the
 // session holds focus. Axes are -1..1, triggers and grips 0..1.
+struct TrackedPose
+{
+	float position[3];
+	float orientation[4];
+	bool valid;
+};
+
 struct ControllerInput
 {
 	float leftStickX, leftStickY;
@@ -56,6 +63,8 @@ struct ControllerInput
 	bool a, b, x, y;
 	bool menu;
 	bool leftStickClick, rightStickClick;
+	TrackedPose gripPose[2];
+	TrackedPose aimPose[2];
 };
 
 void getInput(ControllerInput *out);
@@ -87,6 +96,11 @@ typedef void (*FrameRenderer)(VkImage image, VkImageView view,
                               const float headQuat[4], float eyeFovDeg);
 void setFrameRenderer(FrameRenderer renderer);
 
+// Selects how the frame just rendered is submitted. Immersive gameplay uses
+// the stereo projection layer; frontend and cinematic frames use array layer
+// zero as one shared image on a world-locked cinema quad.
+void setTheaterMode(bool enabled);
+
 // Predicted display time of the frame currently being rendered, in
 // nanoseconds. Zero before the first frame. Vsync-quantised, which makes it
 // the right clock to drive game time from: wall-clock deltas jitter with
@@ -94,8 +108,23 @@ void setFrameRenderer(FrameRenderer renderer);
 // difference reads as the world stuttering.
 long long getPredictedDisplayTimeNs(void);
 
-// RGBA pixels for the head-locked debug overlay quad, or nullptr to hide it.
-// The block must be debug-panel sized (512x128), matching the desktop layer.
-void setDebugOverlay(const unsigned char *rgba);
+// RGBA pixels for the head-locked UI overlay quad, or nullptr to hide it.
+// Compact diagnostics/settings use 512x128; full menus use 1024x768.
+void setDebugOverlay(const unsigned char *rgba, int width, int height);
+
+// Meta runtime app timings. When XR_META_performance_metrics is exposed these
+// are the runtime's own CPU/GPU frame times, sampled after xrEndFrame. The
+// Vulkan backend also keeps an independent timestamp pair for validation and
+// as a fallback on runtimes without the extension.
+struct PerformanceMetrics
+{
+	float appCpuFrameMs;
+	float appGpuFrameMs;
+	float displayRefreshRateHz;
+	bool appCpuFrameValid;
+	bool appGpuFrameValid;
+};
+void setPerformanceMetricsEnabled(bool enabled);
+bool getPerformanceMetrics(PerformanceMetrics *out);
 
 } // namespace xrvk

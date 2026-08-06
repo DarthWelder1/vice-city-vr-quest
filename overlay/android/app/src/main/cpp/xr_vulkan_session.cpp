@@ -42,6 +42,8 @@ static const uint32_t kBringupFragSpv[] =
 namespace xrvk {
 namespace {
 
+static constexpr float kTargetDisplayRefreshRateHz = 72.0f;
+
 // ---------------------------------------------------------------------------
 // Minimal column-major 4x4 maths. Column-major is what GLSL consumes directly,
 // so the uniform block needs no transpose on upload.
@@ -249,17 +251,20 @@ struct State
 	XrSpace localSpace = XR_NULL_HANDLE;
 	XrSpace viewSpace = XR_NULL_HANDLE;
 
-	// Head-locked debug overlay quad, fed by the game's port of the desktop
-	// debug panel.
+	// Head-locked UI overlay quad. The swapchain is allocated for the largest
+	// menu; a smaller imageRect carries the compact diagnostic/settings strip.
 	XrSwapchain debugSwapchain = XR_NULL_HANDLE;
 	std::vector<VkImage> debugImages;
 	int debugWidth = 0, debugHeight = 0;
+	int debugContentWidth = 0, debugContentHeight = 0;
 	VkBuffer debugStaging = VK_NULL_HANDLE;
 	VkDeviceMemory debugStagingMemory = VK_NULL_HANDLE;
 	void *debugStagingMapped = nullptr;
 	VkCommandBuffer debugCommand = VK_NULL_HANDLE;
 	VkFence debugFence = VK_NULL_HANDLE;
+	bool debugSubmissionPending = false;
 	bool debugVisible = false;
+	XrTime lastCompactDebugUploadTime = 0;
 	XrSwapchain swapchain = XR_NULL_HANDLE;
 	int64_t swapchainFormat = 0;
 	uint32_t renderWidth = 0;
@@ -293,13 +298,46 @@ struct State
 	XrTime predictedDisplayTime = 0;
 	long long lastPredictedDisplayTimeNs = 0;
 	bool hasRefreshRateExt = false;
+	PFN_xrEnumerateDisplayRefreshRatesFB enumerateRefreshRates = nullptr;
+	PFN_xrGetDisplayRefreshRateFB getRefreshRate = nullptr;
+	PFN_xrRequestDisplayRefreshRateFB requestRefreshRate = nullptr;
+	bool refreshRateRequestAttempted = false;
+	int refreshRateRetryCount = 0;
+	XrTime nextRefreshRateRetryTime = 0;
+	float currentRefreshRateHz = kTargetDisplayRefreshRateHz;
 	float elapsed = 0.0f;
 
 	FrameRenderer frameRenderer = nullptr;
+	bool theaterMode = true;
+	bool theaterAnchorValid = false;
+	XrSpace theaterSpace = XR_NULL_HANDLE;
+	XrPosef theaterPose = {};
+
+	// XR_META_performance_metrics is the authoritative Quest-side app timing
+	// source. Vulkan timestamps remain useful because they isolate this
+	// backend's command buffer and validate the runtime GPU number.
+	bool hasPerformanceMetricsExt = false;
+	bool performanceMetricsEnabled = false;
+	PFN_xrEnumeratePerformanceMetricsCounterPathsMETA
+		enumeratePerformanceCounterPaths = nullptr;
+	PFN_xrSetPerformanceMetricsStateMETA
+		setPerformanceMetricsState = nullptr;
+	PFN_xrQueryPerformanceMetricsCounterMETA
+		queryPerformanceCounter = nullptr;
+	XrPath appCpuFrameTimePath = XR_NULL_PATH;
+	XrPath appGpuFrameTimePath = XR_NULL_PATH;
+	float appCpuFrameTimeMs = 0.0f;
+	float appGpuFrameTimeMs = 0.0f;
+	bool appCpuFrameTimeValid = false;
+	bool appGpuFrameTimeValid = false;
 
 	// Input
 	XrActionSet actionSet = XR_NULL_HANDLE;
 	XrPath handPath[2] = { XR_NULL_PATH, XR_NULL_PATH };
+	XrAction gripPoseAction = XR_NULL_HANDLE;
+	XrAction aimPoseAction = XR_NULL_HANDLE;
+	XrSpace gripSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+	XrSpace aimSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 	XrAction thumbstickAction = XR_NULL_HANDLE;
 	XrAction triggerAction = XR_NULL_HANDLE;
 	XrAction squeezeAction = XR_NULL_HANDLE;
@@ -443,13 +481,15 @@ createInstance(android_app *app)
 	enabled.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
 	if(has(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME))
 		enabled.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
-	// Pin the display to 72 Hz. Left alone, the runtime promotes fast apps to
-	// 90, where this one hovers at 80-88 and misses a vsync every couple of
-	// seconds; each miss doubles that frame's world motion, felt as the world
-	// lurching. A held 72 beats a missed 90.
+	// Standalone Quest applications choose their own display frequency. The
+	// Quest Link setting on the PC does not apply to this native process.
 	g.hasRefreshRateExt = has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
 	if(g.hasRefreshRateExt)
 		enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+	g.hasPerformanceMetricsExt =
+		has(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
+	if(g.hasPerformanceMetricsExt)
+		enabled.push_back(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
 
 	XrInstanceCreateInfoAndroidKHR androidInfo = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 	androidInfo.applicationVM = app->activity->vm;
@@ -466,6 +506,75 @@ createInstance(android_app *app)
 	info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
 
 	XR_CHECK(xrCreateInstance(&info, &g.instance), "xrCreateInstance");
+
+	if(g.hasRefreshRateExt){
+		const XrResult enumerateResult = xrGetInstanceProcAddr(
+			g.instance, "xrEnumerateDisplayRefreshRatesFB",
+			(PFN_xrVoidFunction *)&g.enumerateRefreshRates);
+		const XrResult getResult = xrGetInstanceProcAddr(
+			g.instance, "xrGetDisplayRefreshRateFB",
+			(PFN_xrVoidFunction *)&g.getRefreshRate);
+		const XrResult requestResult = xrGetInstanceProcAddr(
+			g.instance, "xrRequestDisplayRefreshRateFB",
+			(PFN_xrVoidFunction *)&g.requestRefreshRate);
+		if(XR_FAILED(enumerateResult) || XR_FAILED(getResult) ||
+		   XR_FAILED(requestResult) || g.enumerateRefreshRates == nullptr ||
+		   g.getRefreshRate == nullptr || g.requestRefreshRate == nullptr){
+			LOGE("XR_FB_display_refresh_rate functions unavailable: %d/%d/%d",
+			     (int)enumerateResult, (int)getResult, (int)requestResult);
+			g.hasRefreshRateExt = false;
+		}
+	}
+	if(g.hasPerformanceMetricsExt){
+		const XrResult enumerateResult = xrGetInstanceProcAddr(
+			g.instance,
+			"xrEnumeratePerformanceMetricsCounterPathsMETA",
+			(PFN_xrVoidFunction *)&g.enumeratePerformanceCounterPaths);
+		const XrResult setResult = xrGetInstanceProcAddr(
+			g.instance, "xrSetPerformanceMetricsStateMETA",
+			(PFN_xrVoidFunction *)&g.setPerformanceMetricsState);
+		const XrResult queryResult = xrGetInstanceProcAddr(
+			g.instance, "xrQueryPerformanceMetricsCounterMETA",
+			(PFN_xrVoidFunction *)&g.queryPerformanceCounter);
+		if(XR_FAILED(enumerateResult) || XR_FAILED(setResult) ||
+		   XR_FAILED(queryResult) ||
+		   g.enumeratePerformanceCounterPaths == nullptr ||
+		   g.setPerformanceMetricsState == nullptr ||
+		   g.queryPerformanceCounter == nullptr){
+			LOGE("XR_META_performance_metrics functions unavailable: "
+			     "%d/%d/%d", (int)enumerateResult, (int)setResult,
+			     (int)queryResult);
+			g.hasPerformanceMetricsExt = false;
+		}else{
+			uint32_t count = 0;
+			if(XR_SUCCEEDED(g.enumeratePerformanceCounterPaths(
+				g.instance, 0, &count, nullptr)) && count > 0){
+				std::vector<XrPath> paths(count);
+				if(XR_SUCCEEDED(g.enumeratePerformanceCounterPaths(
+					g.instance, count, &count, paths.data()))){
+					XrPath cpuCandidate = XR_NULL_PATH;
+					XrPath gpuCandidate = XR_NULL_PATH;
+					xrStringToPath(g.instance,
+						"/perfmetrics_meta/app/cpu_frametime",
+						&cpuCandidate);
+					xrStringToPath(g.instance,
+						"/perfmetrics_meta/app/gpu_frametime",
+						&gpuCandidate);
+					for(XrPath path : paths){
+						if(path == cpuCandidate)
+							g.appCpuFrameTimePath = path;
+						if(path == gpuCandidate)
+							g.appGpuFrameTimePath = path;
+					}
+				}
+			}
+			LOGI("XR_META performance metrics: CPU=%s GPU=%s",
+			     g.appCpuFrameTimePath != XR_NULL_PATH ?
+			     	"available" : "missing",
+			     g.appGpuFrameTimePath != XR_NULL_PATH ?
+			     	"available" : "missing");
+		}
+	}
 
 	XrInstanceProperties properties = { XR_TYPE_INSTANCE_PROPERTIES };
 	if(XR_SUCCEEDED(xrGetInstanceProperties(g.instance, &properties)))
@@ -685,6 +794,10 @@ createActions(void)
 
 	g.thumbstickAction = makeAction("thumbstick", "Thumbstick",
 	                                XR_ACTION_TYPE_VECTOR2F_INPUT, true);
+	g.gripPoseAction = makeAction("grippose", "Grip Pose",
+	                              XR_ACTION_TYPE_POSE_INPUT, true);
+	g.aimPoseAction = makeAction("aimpose", "Aim Pose",
+	                             XR_ACTION_TYPE_POSE_INPUT, true);
 	g.triggerAction = makeAction("trigger", "Trigger",
 	                             XR_ACTION_TYPE_FLOAT_INPUT, true);
 	g.squeezeAction = makeAction("squeeze", "Grip",
@@ -699,6 +812,10 @@ createActions(void)
 
 	struct Binding { XrAction action; const char *path; };
 	const Binding bindings[] = {
+		{ g.gripPoseAction,   "/user/hand/left/input/grip/pose" },
+		{ g.gripPoseAction,   "/user/hand/right/input/grip/pose" },
+		{ g.aimPoseAction,    "/user/hand/left/input/aim/pose" },
+		{ g.aimPoseAction,    "/user/hand/right/input/aim/pose" },
 		{ g.thumbstickAction, "/user/hand/left/input/thumbstick" },
 		{ g.thumbstickAction, "/user/hand/right/input/thumbstick" },
 		{ g.triggerAction,    "/user/hand/left/input/trigger/value" },
@@ -741,6 +858,22 @@ createActions(void)
 	attachInfo.actionSets = &g.actionSet;
 	XR_CHECK(xrAttachSessionActionSets(g.session, &attachInfo),
 	         "xrAttachSessionActionSets");
+
+	for(int hand = 0; hand < 2; hand++){
+		XrActionSpaceCreateInfo spaceInfo = {
+			XR_TYPE_ACTION_SPACE_CREATE_INFO };
+		spaceInfo.subactionPath = g.handPath[hand];
+		spaceInfo.poseInActionSpace.orientation.w = 1.0f;
+
+		spaceInfo.action = g.gripPoseAction;
+		XR_CHECK(xrCreateActionSpace(g.session, &spaceInfo,
+		                            &g.gripSpace[hand]),
+		         "xrCreateActionSpace(grip)");
+		spaceInfo.action = g.aimPoseAction;
+		XR_CHECK(xrCreateActionSpace(g.session, &spaceInfo,
+		                            &g.aimSpace[hand]),
+		         "xrCreateActionSpace(aim)");
+	}
 
 	LOGI("input: %zu bindings attached", suggested.size());
 	return true;
@@ -811,6 +944,65 @@ syncInput(void)
 	g.input.x = readBool(g.xAction, -1);
 	g.input.y = readBool(g.yAction, -1);
 	g.input.menu = readBool(g.menuAction, -1);
+}
+
+void
+locateTrackedPose(XrSpace actionSpace, XrSpace baseSpace, XrTime time,
+                  TrackedPose *out)
+{
+	out->valid = false;
+	if(actionSpace == XR_NULL_HANDLE || baseSpace == XR_NULL_HANDLE)
+		return;
+
+	XrSpaceLocation location = { XR_TYPE_SPACE_LOCATION };
+	if(XR_FAILED(xrLocateSpace(actionSpace, baseSpace, time, &location)))
+		return;
+	const XrSpaceLocationFlags required =
+		XR_SPACE_LOCATION_POSITION_VALID_BIT |
+		XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+	if((location.locationFlags & required) != required)
+		return;
+
+	out->position[0] = location.pose.position.x;
+	out->position[1] = location.pose.position.y;
+	out->position[2] = location.pose.position.z;
+	out->orientation[0] = location.pose.orientation.x;
+	out->orientation[1] = location.pose.orientation.y;
+	out->orientation[2] = location.pose.orientation.z;
+	out->orientation[3] = location.pose.orientation.w;
+	out->valid = true;
+}
+
+bool
+isPoseActionActive(XrAction action, int hand)
+{
+	if(action == XR_NULL_HANDLE || g.session == XR_NULL_HANDLE)
+		return false;
+
+	XrActionStateGetInfo getInfo = { XR_TYPE_ACTION_STATE_GET_INFO };
+	getInfo.action = action;
+	getInfo.subactionPath = g.handPath[hand];
+	XrActionStatePose state = { XR_TYPE_ACTION_STATE_POSE };
+	return XR_SUCCEEDED(xrGetActionStatePose(g.session, &getInfo, &state)) &&
+	       state.isActive == XR_TRUE;
+}
+
+void
+locateControllerPoses(XrSpace baseSpace, XrTime time)
+{
+	for(int hand = 0; hand < 2; hand++){
+		if(isPoseActionActive(g.gripPoseAction, hand))
+			locateTrackedPose(g.gripSpace[hand], baseSpace, time,
+			                 &g.input.gripPose[hand]);
+		else
+			g.input.gripPose[hand].valid = false;
+
+		if(isPoseActionActive(g.aimPoseAction, hand))
+			locateTrackedPose(g.aimSpace[hand], baseSpace, time,
+			                 &g.input.aimPose[hand]);
+		else
+			g.input.aimPose[hand].valid = false;
+	}
 }
 
 bool
@@ -894,10 +1086,12 @@ createSwapchain(void)
 		g.images[i].image = xrImages[i].image;
 	LOGI("swapchain: %u images, format %lld", imageCount, (long long)g.swapchainFormat);
 
-	// Debug overlay quad swapchain, same dimensions as the desktop panel.
+	// UI overlay swapchain. It accommodates both the compact 512x128 debug
+	// strip and the desktop-sized 1024x768 menu without recreating an OpenXR
+	// swapchain while the menu is being opened.
 	{
-		g.debugWidth = 512;
-		g.debugHeight = 128;
+		g.debugWidth = 1024;
+		g.debugHeight = 768;
 		XrSwapchainCreateInfo dinfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
 		dinfo.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
 		                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -1345,8 +1539,21 @@ renderLayer(const XrView views[2])
 	SwapchainImage &image = g.images[imageIndex];
 
 	Mat4 viewProj[2];
+	XrFovf renderFov[2] = { views[0].fov, views[1].fov };
+	const float scopeZoom = androidgame::VrScopeZoomFactor();
 	for(int eye = 0; eye < 2; eye++){
-		const Mat4 projection = projectionFromFov(views[eye].fov, 0.05f, 1000.0f);
+		if(scopeZoom > 1.0f){
+			renderFov[eye].angleLeft =
+				atanf(tanf(renderFov[eye].angleLeft)/scopeZoom);
+			renderFov[eye].angleRight =
+				atanf(tanf(renderFov[eye].angleRight)/scopeZoom);
+			renderFov[eye].angleUp =
+				atanf(tanf(renderFov[eye].angleUp)/scopeZoom);
+			renderFov[eye].angleDown =
+				atanf(tanf(renderFov[eye].angleDown)/scopeZoom);
+		}
+		const Mat4 projection = projectionFromFov(
+			renderFov[eye], 0.05f, 1000.0f);
 		const Mat4 viewMatrix = viewFromPose(views[eye].pose);
 		viewProj[eye] = multiply(projection, viewMatrix);
 	}
@@ -1393,7 +1600,7 @@ renderLayer(const XrView views[2])
 		// desktop BeginEye handing the game an eye fov: coronas and other
 		// screen-space effects size themselves from it.
 		const float eyeFovDeg =
-			(views[0].fov.angleRight - views[0].fov.angleLeft) * 57.29578f;
+			(renderFov[0].angleRight-renderFov[0].angleLeft)*57.29578f;
 		g.frameRenderer(image.image, image.view, matrices, im2dWorld.m,
 		                im2dDistance, headPos, headYaw, headQuat, eyeFovDeg);
 
@@ -1451,6 +1658,57 @@ renderLayer(const XrView views[2])
 	return true;
 }
 
+bool
+requestPreferredDisplayRefreshRate(void)
+{
+	if(!g.hasRefreshRateExt || g.enumerateRefreshRates == nullptr ||
+	   g.getRefreshRate == nullptr || g.requestRefreshRate == nullptr)
+		return false;
+
+	uint32_t count = 0;
+	XrResult result =
+		g.enumerateRefreshRates(g.session, 0, &count, nullptr);
+	if(XR_FAILED(result) || count == 0){
+		LOGE("display refresh enumeration failed: %d, count %u",
+		     (int)result, count);
+		return false;
+	}
+
+	std::vector<float> rates(count);
+	result = g.enumerateRefreshRates(g.session, count, &count, rates.data());
+	if(XR_FAILED(result)){
+		LOGE("display refresh list failed: %d", (int)result);
+		return false;
+	}
+
+	float target = rates[0];
+	float targetDistance = fabsf(target - kTargetDisplayRefreshRateHz);
+	for(uint32_t i = 0; i < count; i++){
+		LOGI("display refresh offered[%u] = %.1f Hz", i, rates[i]);
+		const float distance =
+			fabsf(rates[i] - kTargetDisplayRefreshRateHz);
+		if(distance < targetDistance){
+			target = rates[i];
+			targetDistance = distance;
+		}
+	}
+
+	float before = 0.0f;
+	const XrResult beforeResult = g.getRefreshRate(g.session, &before);
+	result = g.requestRefreshRate(g.session, target);
+	float after = 0.0f;
+	const XrResult afterResult = g.getRefreshRate(g.session, &after);
+	if(XR_SUCCEEDED(afterResult) && after > 0.0f)
+		g.currentRefreshRateHz = after;
+	else if(XR_SUCCEEDED(beforeResult) && before > 0.0f)
+		g.currentRefreshRateHz = before;
+	LOGI("display refresh request: current %.1f (%d), target %.1f, "
+	     "result %d, immediate %.1f (%d)",
+	     before, (int)beforeResult, target, (int)result,
+	     after, (int)afterResult);
+	return XR_SUCCEEDED(result);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1504,6 +1762,46 @@ getContext(GraphicsContext *out)
 	return true;
 }
 
+void
+setPerformanceMetricsEnabled(bool enabled)
+{
+	if(!g.hasPerformanceMetricsExt || g.session == XR_NULL_HANDLE ||
+	   g.setPerformanceMetricsState == nullptr)
+		return;
+	if(g.performanceMetricsEnabled == enabled)
+		return;
+
+	XrPerformanceMetricsStateMETA state = {
+		XR_TYPE_PERFORMANCE_METRICS_STATE_META };
+	state.enabled = enabled ? XR_TRUE : XR_FALSE;
+	const XrResult result =
+		g.setPerformanceMetricsState(g.session, &state);
+	if(XR_SUCCEEDED(result)){
+		g.performanceMetricsEnabled = enabled;
+		g.appCpuFrameTimeValid = false;
+		g.appGpuFrameTimeValid = false;
+		LOGI("XR_META performance metrics %s",
+		     enabled ? "enabled" : "disabled");
+	}else
+		LOGE("xrSetPerformanceMetricsStateMETA(%d) failed: %d",
+		     enabled ? 1 : 0, (int)result);
+}
+
+bool
+getPerformanceMetrics(PerformanceMetrics *out)
+{
+	if(out == nullptr)
+		return false;
+	out->appCpuFrameMs = g.appCpuFrameTimeMs;
+	out->appGpuFrameMs = g.appGpuFrameTimeMs;
+	out->displayRefreshRateHz = g.currentRefreshRateHz;
+	out->appCpuFrameValid = g.performanceMetricsEnabled &&
+		g.appCpuFrameTimeValid;
+	out->appGpuFrameValid = g.performanceMetricsEnabled &&
+		g.appGpuFrameTimeValid;
+	return g.hasPerformanceMetricsExt;
+}
+
 long long
 getPredictedDisplayTimeNs(void)
 {
@@ -1511,22 +1809,41 @@ getPredictedDisplayTimeNs(void)
 }
 
 void
-setDebugOverlay(const unsigned char *rgba)
+setDebugOverlay(const unsigned char *rgba, int width, int height)
 {
-	g.debugVisible = rgba != nullptr;
+	const bool validSize =
+		width > 0 && height > 0 &&
+		width <= g.debugWidth && height <= g.debugHeight;
+	const bool wasVisible = g.debugVisible;
+	const bool sameContentSize =
+		width == g.debugContentWidth && height == g.debugContentHeight;
+	g.debugVisible = rgba != nullptr && validSize;
 	if(rgba == nullptr || g.debugSwapchain == XR_NULL_HANDLE ||
-	   g.commandPool == VK_NULL_HANDLE)
+	   g.commandPool == VK_NULL_HANDLE || !validSize)
 		return;
-
-	const VkDeviceSize size =
+	// The compact profiler changes slowly and its old implementation uploaded
+	// 256 KiB through a separate queue submit + CPU fence wait every frame.
+	// That measurement perturbed the workload it was meant to observe. Keep
+	// full 1024x768 menus frame-responsive, but refresh compact diagnostics at
+	// 2 Hz. Visibility and size transitions always upload immediately. The
+	// Uploads are submitted asynchronously below. A slower refresh still keeps
+	// the diagnostic probe out of nearly every timing window.
+	const bool compact = width <= 512 && height <= 128;
+	const XrTime now = g.predictedDisplayTime;
+	const XrTime compactInterval = (XrTime)500000000;
+	if(compact && wasVisible && sameContentSize &&
+	   g.lastCompactDebugUploadTime != 0 && now != 0 &&
+	   now-g.lastCompactDebugUploadTime < compactInterval)
+		return;
+	const VkDeviceSize capacity =
 		(VkDeviceSize)g.debugWidth * g.debugHeight * 4;
 	if(g.debugStaging == VK_NULL_HANDLE){
-		if(!createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		if(!createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 		                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		                 &g.debugStaging, &g.debugStagingMemory))
 			return;
-		if(vkMapMemory(g.device, g.debugStagingMemory, 0, size, 0,
+		if(vkMapMemory(g.device, g.debugStagingMemory, 0, capacity, 0,
 		               &g.debugStagingMapped) != VK_SUCCESS)
 			return;
 
@@ -1542,7 +1859,29 @@ setDebugOverlay(const unsigned char *rgba)
 	}
 	if(g.debugStagingMapped == nullptr || g.debugCommand == VK_NULL_HANDLE)
 		return;
-	memcpy(g.debugStagingMapped, rgba, (size_t)size);
+
+	// Never stop the game thread for the profiler/settings quad. The previous
+	// upload normally completes long before the next compact refresh; a large
+	// menu may need to skip one update on a busy frame, which is preferable to
+	// missing an immersive display frame.
+	if(g.debugSubmissionPending){
+		const VkResult status = vkGetFenceStatus(g.device, g.debugFence);
+		if(status == VK_NOT_READY)
+			return;
+		if(status != VK_SUCCESS){
+			LOGE("debug overlay fence status failed: %d", (int)status);
+			return;
+		}
+		g.debugSubmissionPending = false;
+	}
+
+	if(compact)
+		g.lastCompactDebugUploadTime = now;
+	g.debugContentWidth = width;
+	g.debugContentHeight = height;
+	const VkDeviceSize contentSize =
+		(VkDeviceSize)g.debugContentWidth * g.debugContentHeight * 4;
+	memcpy(g.debugStagingMapped, rgba, (size_t)contentSize);
 
 	uint32_t imageIndex = 0;
 	XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1580,8 +1919,8 @@ setDebugOverlay(const unsigned char *rgba)
 	VkBufferImageCopy region = {};
 	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	region.imageSubresource.layerCount = 1;
-	region.imageExtent.width = (uint32_t)g.debugWidth;
-	region.imageExtent.height = (uint32_t)g.debugHeight;
+	region.imageExtent.width = (uint32_t)g.debugContentWidth;
+	region.imageExtent.height = (uint32_t)g.debugContentHeight;
 	region.imageExtent.depth = 1;
 	vkCmdCopyBufferToImage(g.debugCommand, g.debugStaging,
 	                       g.debugImages[imageIndex],
@@ -1601,8 +1940,11 @@ setDebugOverlay(const unsigned char *rgba)
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &g.debugCommand;
 	vkResetFences(g.device, 1, &g.debugFence);
-	vkQueueSubmit(g.queue, 1, &submit, g.debugFence);
-	vkWaitForFences(g.device, 1, &g.debugFence, VK_TRUE, UINT64_MAX);
+	const VkResult submitted =
+		vkQueueSubmit(g.queue, 1, &submit, g.debugFence);
+	g.debugSubmissionPending = submitted == VK_SUCCESS;
+	if(submitted != VK_SUCCESS)
+		LOGE("debug overlay submit failed: %d", (int)submitted);
 
 	xrReleaseSwapchainImage(g.debugSwapchain, &releaseInfo);
 }
@@ -1611,6 +1953,16 @@ void
 setFrameRenderer(FrameRenderer renderer)
 {
 	g.frameRenderer = renderer;
+}
+
+void
+setTheaterMode(bool enabled)
+{
+	g.theaterMode = enabled;
+	if(!enabled){
+		g.theaterAnchorValid = false;
+		g.theaterSpace = XR_NULL_HANDLE;
+	}
 }
 
 void
@@ -1642,40 +1994,17 @@ pollEvents(void)
 					XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 				if(XR_SUCCEEDED(xrBeginSession(g.session, &beginInfo))){
 					g.running = true;
-					// A Quest app runs at 72 Hz unless it asks for more --
-					// the system setting alone does not raise it. Take the
-					// highest rate the runtime offers, which is what the
-					// headset's own setting caps.
-					if(g.hasRefreshRateExt){
-						PFN_xrEnumerateDisplayRefreshRatesFB enumerate = nullptr;
-						PFN_xrRequestDisplayRefreshRateFB request = nullptr;
-						xrGetInstanceProcAddr(g.instance,
-							"xrEnumerateDisplayRefreshRatesFB",
-							(PFN_xrVoidFunction *)&enumerate);
-						xrGetInstanceProcAddr(g.instance,
-							"xrRequestDisplayRefreshRateFB",
-							(PFN_xrVoidFunction *)&request);
-						if(enumerate != nullptr && request != nullptr){
-							uint32_t count = 0;
-							enumerate(g.session, 0, &count, nullptr);
-							std::vector<float> rates(count);
-							if(count > 0 &&
-							   XR_SUCCEEDED(enumerate(g.session, count, &count,
-							                          rates.data()))){
-								float best = 0.0f;
-								for(float rate : rates)
-									if(rate > best)
-										best = rate;
-								if(best > 0.0f){
-									const XrResult result =
-										request(g.session, best);
-									LOGI("display refresh: requested %.0f Hz "
-									     "of %u offered, result %d",
-									     best, count, (int)result);
-								}
-							}
-						}
-					}
+					g.refreshRateRequestAttempted = false;
+					g.refreshRateRetryCount = 0;
+					g.nextRefreshRateRetryTime = 0;
+				}
+			}else if(g.sessionState == XR_SESSION_STATE_FOCUSED){
+				// Apply the stable 72 Hz target after the session owns focus.
+				// This avoids frame-rate changes while the game is running.
+				if(!g.refreshRateRequestAttempted){
+					g.refreshRateRequestAttempted = true;
+					requestPreferredDisplayRefreshRate();
+					g.refreshRateRetryCount = 1;
 				}
 			}else if(g.sessionState == XR_SESSION_STATE_STOPPING){
 				g.running = false;
@@ -1690,6 +2019,20 @@ pollEvents(void)
 		case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
 			g.exitRequested = true;
 			break;
+		case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB: {
+			const XrEventDataDisplayRefreshRateChangedFB &changed =
+				*(const XrEventDataDisplayRefreshRateChangedFB *)&event;
+			g.currentRefreshRateHz = changed.toDisplayRefreshRate;
+			LOGI("display refresh changed: %.1f -> %.1f Hz",
+			     changed.fromDisplayRefreshRate,
+			     changed.toDisplayRefreshRate);
+			if(fabsf(changed.toDisplayRefreshRate -
+			         kTargetDisplayRefreshRateHz) >= 0.5f){
+				g.refreshRateRetryCount = 0;
+				g.nextRefreshRateRetryTime = 0;
+			}
+			break;
+		}
 		default:
 			break;
 		}
@@ -1716,6 +2059,29 @@ renderFrame(void)
 	g.predictedDisplayTime = frameState.predictedDisplayTime;
 	g.lastPredictedDisplayTimeNs = (long long)frameState.predictedDisplayTime;
 
+	// A focused Quest session can acknowledge a rate request before the display
+	// has actually switched. Retry at a low rate for a bounded period, stopping
+	// as soon as the runtime confirms the stable 72 Hz target.
+	if(g.sessionState == XR_SESSION_STATE_FOCUSED && g.hasRefreshRateExt &&
+	   g.getRefreshRate != nullptr && g.refreshRateRetryCount < 8 &&
+	   (g.nextRefreshRateRetryTime == 0 ||
+	    frameState.predictedDisplayTime >= g.nextRefreshRateRetryTime)){
+		float current = 0.0f;
+		const XrResult currentResult =
+			g.getRefreshRate(g.session, &current);
+		if(XR_SUCCEEDED(currentResult) &&
+		   fabsf(current - kTargetDisplayRefreshRateHz) < 0.5f){
+			g.currentRefreshRateHz = current;
+			LOGI("display refresh confirmed at %.1f Hz", current);
+			g.refreshRateRetryCount = 8;
+		}else{
+			requestPreferredDisplayRefreshRate();
+			g.refreshRateRetryCount++;
+			g.nextRefreshRateRetryTime =
+				frameState.predictedDisplayTime + (XrTime)1000000000;
+		}
+	}
+
 	XrFrameBeginInfo beginInfo = { XR_TYPE_FRAME_BEGIN_INFO };
 	if(XR_FAILED(xrBeginFrame(g.session, &beginInfo)))
 		return;
@@ -1726,6 +2092,7 @@ renderFrame(void)
 
 	XrCompositionLayerProjectionView projectionViews[2] = {};
 	XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+	XrCompositionLayerQuad theaterLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerQuad debugLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	const XrCompositionLayerBaseHeader *layers[2] = { nullptr, nullptr };
 	uint32_t layerCount = 0;
@@ -1767,42 +2134,104 @@ renderFrame(void)
 
 		if(XR_SUCCEEDED(located) &&
 		   (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
+		   (locateControllerPoses(submitSpace,
+		                          frameState.predictedDisplayTime), true) &&
 		   renderLayer(views)){
 
-			for(int eye = 0; eye < 2; eye++){
-				projectionViews[eye] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-				projectionViews[eye].pose = views[eye].pose;
-				projectionViews[eye].fov = views[eye].fov;
-				projectionViews[eye].subImage.swapchain = g.swapchain;
-				projectionViews[eye].subImage.imageRect.extent = {
-					(int32_t)g.renderWidth, (int32_t)g.renderHeight };
-				// Both eyes share one swapchain; the array index is what
-				// separates them, matching the multiview layer.
-				projectionViews[eye].subImage.imageArrayIndex = (uint32_t)eye;
-			}
+			if(g.theaterMode){
+				// Latch once on entry. Only yaw is retained, exactly like the
+				// desktop cinema layer, so the screen stays upright and fixed
+				// in the room while the player looks around.
+				if(!g.theaterAnchorValid || g.theaterSpace != submitSpace){
+					XrPosef head = views[0].pose;
+					head.position.x =
+						(views[0].pose.position.x +
+						 views[1].pose.position.x)*0.5f;
+					head.position.y =
+						(views[0].pose.position.y +
+						 views[1].pose.position.y)*0.5f;
+					head.position.z =
+						(views[0].pose.position.z +
+						 views[1].pose.position.z)*0.5f;
+					const XrQuaternionf &q = head.orientation;
+					const float fx = -(2.0f*(q.x*q.z + q.y*q.w));
+					const float fz =
+						-(1.0f - 2.0f*(q.x*q.x + q.y*q.y));
+					const float yaw = atan2f(-fx, -fz);
+					g.theaterPose = {};
+					g.theaterPose.orientation.y = sinf(yaw*0.5f);
+					g.theaterPose.orientation.w = cosf(yaw*0.5f);
+					const float forwardX = -sinf(yaw);
+					const float forwardZ = -cosf(yaw);
+					g.theaterPose.position.x =
+						head.position.x + forwardX*2.0f;
+					g.theaterPose.position.y = head.position.y;
+					g.theaterPose.position.z =
+						head.position.z + forwardZ*2.0f;
+					g.theaterSpace = submitSpace;
+					g.theaterAnchorValid = true;
+				}
 
-			layer.space = submitSpace;
-			layer.viewCount = 2;
-			layer.views = projectionViews;
-			layers[0] = (const XrCompositionLayerBaseHeader *)&layer;
-			layerCount = 1;
+				theaterLayer.space = submitSpace;
+				theaterLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+				theaterLayer.subImage.swapchain = g.swapchain;
+				theaterLayer.subImage.imageRect.extent = {
+					(int32_t)g.renderWidth, (int32_t)g.renderHeight };
+				theaterLayer.subImage.imageArrayIndex = 0;
+				theaterLayer.pose = g.theaterPose;
+				// Keep the complete 16:9 frame comfortably inside the Quest
+				// binocular field of view. The old 3.2 m quad filled roughly
+				// 77 degrees horizontally at this two-metre distance.
+				theaterLayer.size.width = 2.56f;
+				theaterLayer.size.height = 1.44f;
+				layers[0] =
+					(const XrCompositionLayerBaseHeader *)&theaterLayer;
+				layerCount = 1;
+			}else{
+				for(int eye = 0; eye < 2; eye++){
+					projectionViews[eye] = {
+						XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+					projectionViews[eye].pose = views[eye].pose;
+					projectionViews[eye].fov = views[eye].fov;
+					projectionViews[eye].subImage.swapchain = g.swapchain;
+					projectionViews[eye].subImage.imageRect.extent = {
+						(int32_t)g.renderWidth,
+						(int32_t)g.renderHeight };
+					// Both eyes share one swapchain; the array index is what
+					// separates them, matching the multiview layer.
+					projectionViews[eye].subImage.imageArrayIndex =
+						(uint32_t)eye;
+				}
+
+				layer.space = submitSpace;
+				layer.viewCount = 2;
+				layer.views = projectionViews;
+				layers[0] =
+					(const XrCompositionLayerBaseHeader *)&layer;
+				layerCount = 1;
+			}
 
 			// Head-locked debug overlay: pose and size are the desktop's.
 			if(g.debugVisible && g.debugSwapchain != XR_NULL_HANDLE &&
 			   g.viewSpace != XR_NULL_HANDLE){
+				const bool fullMenu =
+					g.debugContentWidth > 512 || g.debugContentHeight > 128;
 				debugLayer.layerFlags =
 					XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 				debugLayer.space = g.viewSpace;
 				debugLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 				debugLayer.subImage.swapchain = g.debugSwapchain;
 				debugLayer.subImage.imageRect.extent = {
-					(int32_t)g.debugWidth, (int32_t)g.debugHeight };
+					(int32_t)g.debugContentWidth,
+					(int32_t)g.debugContentHeight };
 				debugLayer.pose.orientation.w = 1.0f;
-				debugLayer.pose.position.y = -0.24f;
-				debugLayer.pose.position.z = -1.5f;
-				debugLayer.size.width = 1.2f;
+				debugLayer.pose.position.y = fullMenu ? 0.0f : -0.24f;
+				debugLayer.pose.position.z = fullMenu ? -1.65f : -1.5f;
+				debugLayer.size.width = fullMenu ? 2.15f : 1.2f;
 				debugLayer.size.height =
-					1.2f*(float)g.debugHeight/(float)g.debugWidth;
+					debugLayer.size.width*
+					(float)g.debugContentHeight/
+					(float)g.debugContentWidth;
 				layers[layerCount++] =
 					(const XrCompositionLayerBaseHeader *)&debugLayer;
 			}
@@ -1834,6 +2263,41 @@ renderFrame(void)
 			LOGE("xrEndFrame failed: %d", (int)ended);
 		}
 	}
+
+	// Sample after submission so these counters describe the latest app frame.
+	// They are consumed by the next frame's debug overlay.
+	if(g.performanceMetricsEnabled &&
+	   g.queryPerformanceCounter != nullptr){
+		auto queryFrameTime = [&](XrPath path, float *value,
+		                          bool *valid){
+			*valid = false;
+			if(path == XR_NULL_PATH)
+				return;
+			XrPerformanceMetricsCounterMETA counter = {
+				XR_TYPE_PERFORMANCE_METRICS_COUNTER_META };
+			if(XR_FAILED(g.queryPerformanceCounter(
+				g.session, path, &counter)))
+				return;
+			if(counter.counterUnit !=
+			   XR_PERFORMANCE_METRICS_COUNTER_UNIT_MILLISECONDS_META)
+				return;
+			if((counter.counterFlags &
+			    XR_PERFORMANCE_METRICS_COUNTER_FLOAT_VALUE_VALID_BIT_META)
+			   != 0){
+				*value = counter.floatValue;
+				*valid = true;
+			}else if((counter.counterFlags &
+			          XR_PERFORMANCE_METRICS_COUNTER_UINT_VALUE_VALID_BIT_META)
+			         != 0){
+				*value = (float)counter.uintValue;
+				*valid = true;
+			}
+		};
+		queryFrameTime(g.appCpuFrameTimePath,
+			&g.appCpuFrameTimeMs, &g.appCpuFrameTimeValid);
+		queryFrameTime(g.appGpuFrameTimePath,
+			&g.appGpuFrameTimeMs, &g.appGpuFrameTimeValid);
+	}
 }
 
 void
@@ -1846,11 +2310,12 @@ destroy(void)
 		if(image.fence) vkDestroyFence(g.device, image.fence, nullptr);
 		if(image.framebuffer) vkDestroyFramebuffer(g.device, image.framebuffer, nullptr);
 		if(image.view) vkDestroyImageView(g.device, image.view, nullptr);
-		if(image.uniformMemory){
+		if(image.uniformMapped)
 			vkUnmapMemory(g.device, image.uniformMemory);
+		if(image.uniformBuffer)
+			vkDestroyBuffer(g.device, image.uniformBuffer, nullptr);
+		if(image.uniformMemory)
 			vkFreeMemory(g.device, image.uniformMemory, nullptr);
-		}
-		if(image.uniformBuffer) vkDestroyBuffer(g.device, image.uniformBuffer, nullptr);
 	}
 	g.images.clear();
 
@@ -1876,9 +2341,14 @@ destroy(void)
 
 	if(g.debugSwapchain) xrDestroySwapchain(g.debugSwapchain);
 	if(g.swapchain) xrDestroySwapchain(g.swapchain);
+	for(int hand = 0; hand < 2; hand++){
+		if(g.gripSpace[hand]) xrDestroySpace(g.gripSpace[hand]);
+		if(g.aimSpace[hand]) xrDestroySpace(g.aimSpace[hand]);
+	}
 	if(g.viewSpace) xrDestroySpace(g.viewSpace);
 	if(g.localSpace) xrDestroySpace(g.localSpace);
 	if(g.space) xrDestroySpace(g.space);
+	if(g.actionSet) xrDestroyActionSet(g.actionSet);
 	if(g.session) xrDestroySession(g.session);
 	if(g.device) vkDestroyDevice(g.device, nullptr);
 	if(g.vkInstance) vkDestroyInstance(g.vkInstance, nullptr);

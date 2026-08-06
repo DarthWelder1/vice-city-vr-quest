@@ -22,6 +22,7 @@ namespace platform {
 void redirectStdioToLog(void);
 
 void setStorageRoot(const char *path);
+void setNativeActivity(ANativeActivity *activity);
 
 // Stall diagnostics.
 //
@@ -47,6 +48,20 @@ char *resolveGamePath(char *buffer, size_t bufferSize, const char *relative);
 // is case sensitive, so a direct open would fail for most of the data set.
 // Returns false when nothing matches.
 bool resolveGamePathCaseInsensitive(char *buffer, size_t bufferSize, const char *relative);
+
+// Android MediaPlayer bridge used by the streamed-audio half of the native
+// audio backend.  SFX are mixed through AAudio; long MP3/ADF tracks stay in the
+// platform decoder so radio and cutscenes do not consume game-thread time.
+bool audioLoadStream(int stream, const char *absolutePath, int positionMs,
+	bool loop, bool autoStart);
+void audioPlayStream(int stream);
+void audioPauseStream(int stream, bool pause);
+void audioStopStream(int stream);
+void audioSetStreamVolume(int stream, float left, float right);
+void audioSetStreamLoop(int stream, bool loop);
+int audioGetStreamPosition(int stream);
+int audioGetStreamDuration(int stream);
+bool audioIsStreamPlaying(int stream);
 
 } // namespace platform
 

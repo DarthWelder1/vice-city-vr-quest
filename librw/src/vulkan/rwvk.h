@@ -45,6 +45,7 @@ bool32 imageFindRasterFormat(Image *image, int32 type,
 bool32 rasterFromImage(Raster *raster, Image *image);
 Image *rasterToImage(Raster *raster);
 void setRasterHasAlpha(Raster *raster, bool32 hasAlpha);
+bool32 rasterHasAlpha(Raster *raster);
 
 // Compressed uploads. Adreno exposes ASTC and ETC2 natively but not BC/DXT,
 // which is what every Vice City TXD actually contains, so the DXT path has to
@@ -192,6 +193,13 @@ struct Im2DVertex
 bool32 beginFrame(VkImage colourImage, VkImageView colourView);
 void endFrame(void);
 
+// Native profiler support.  GPU time is measured by two Vulkan timestamp
+// queries around the complete multiview render pass and resolve.  The value
+// returned is from the latest completed submission, never a CPU-frame-time
+// estimate. Unsupported devices return false from getGpuFrameTimeMs.
+void setGpuFrameTimingEnabled(bool32 enabled);
+bool32 getGpuFrameTimeMs(float32 *milliseconds);
+
 // Per-eye view-projection matrices for the multiview uniform block.
 void setStereoViewProjection(const float32 left[16], const float32 right[16]);
 
@@ -202,6 +210,19 @@ void setStereoViewProjection(const float32 left[16], const float32 right[16]);
 // back at its true world position instead of flattened onto the plane.
 void setIm2DTransform(const float32 transform[16], float32 planeDistance,
                       const float32 eye[3]);
+
+// Scales immediate-mode UI vertices around the render-target centre. The game
+// enables this only while drawing the immersive gameplay interface, keeping
+// world-space sprites and theater/menu frames on their exact projection.
+void setIm2DSafeAreaScale(float32 scale);
+void setIm2DSafeAreaTransform(float32 scaleX, float32 scaleY,
+                              float32 offsetX, float32 offsetY);
+
+// Radar tiles use the original RenderWare depth-mask trick: four invisible
+// corner fans write depth, then the map is accepted only inside the circle.
+// The role is supplied per immediate-mode draw by the game renderer.
+void setImmediate2DStrictDepth(bool32 enabled);
+bool32 getImmediate2DStrictDepth(void);
 
 // Mid-eye pose in play space this frame: position plus yaw about the vertical
 // (0 = play forward -Z, positive turning left). The world transform pins the
@@ -218,6 +239,17 @@ void setHeadPose(const float32 position[3], float32 yaw,
 bool32 getFirstPersonViewFrame(float32 rwRight[3], float32 rwUp[3],
                                float32 rwAt[3], float32 position[3]);
 
+// Converts an OpenXR pose expressed in the current play space into Vice
+// City's world. Axes are the controller's local +X, +Y and forward -Z. This
+// uses the exact same first-person anchor as world rendering, keeping native
+// Quest hands rigidly registered with both eyes and the game world.
+bool32 playPoseToFirstPersonWorld(const float32 playPosition[3],
+                                  const float32 playQuaternion[4],
+                                  float32 worldRight[3],
+                                  float32 worldUp[3],
+                                  float32 worldForward[3],
+                                  float32 worldPosition[3]);
+
 // First person: anchor the view on the player's head in the game world
 // instead of on the follow camera. headingYaw is the character's (or the
 // vehicle's) facing in world (radians, atan2(fwd.y, fwd.x)). On activation
@@ -229,13 +261,34 @@ bool32 getFirstPersonViewFrame(float32 rwRight[3], float32 rwUp[3],
 void setFirstPersonAnchor(const float32 headWorld[3], float32 headingYaw,
                           bool32 followHeading, bool32 active);
 
+// Vehicle variant of setFirstPersonAnchor. right/up/forward are the
+// vehicle's orthonormal world axes. It preserves pitch and roll while still
+// applying the physical-yaw latch used by cockpit mode.
+void setFirstPersonAnchorBasis(const float32 headWorld[3],
+                               const float32 right[3],
+                               const float32 up[3],
+                               const float32 forward[3],
+                               float32 headingYaw, bool32 active);
+
 // View direction in game-world yaw while first person is active. Returns 0
 // when inactive. Lets the pad layer make stick movement view-relative.
 bool32 getFirstPersonViewYaw(float32 *yawOut);
 
+// HMD yaw relative to the facing direction latched when first-person mode was
+// entered or recentered. This is the stable basis used by head-relative
+// locomotion; vehicle heading and world heading are deliberately excluded.
+bool32 getFirstPersonLocalHeadYaw(float32 *yawOut);
+
 // Sky colour for the frame; used as the render pass clear colour so the sky
 // covers the full view rather than the 2D panel.
 void setClearColour(uint8 red, uint8 green, uint8 blue);
+
+// Final-image colour treatment. Mode 0 is a plain resolve and mode 1 is Vice
+// City's POSTFX_NORMAL filter. The filter runs once for both multiview layers
+// after all world and 2D rendering has completed.
+void setPostFx(uint32 mode, uint32 red, uint32 green, uint32 blue,
+               float32 intensity);
+void setFxaaEnabled(bool32 enabled);
 
 // Texture straight from DXT blocks (BC formats), no CPU decode. Returns nil
 // when the device lacks BC support or the type is not DXT1/3/5; the caller
