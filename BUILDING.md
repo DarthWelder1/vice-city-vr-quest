@@ -56,6 +56,9 @@ including the quirk that `adb push` cannot create directories under
 
 ## Troubleshooting
 
+- **ninja: mkdir ... No such file or directory** — the assembled tree sits in
+  a path that is too long for Windows. Assemble into a short path such as
+  `C:\build-tree`; the CMake object paths add hundreds of characters.
 - **Patch fails to apply** — your reVC tree is either modified or not the
   final master state. Start from a pristine tree.
 - **Gradle cannot find the SDK** — create `android/local.properties` with
