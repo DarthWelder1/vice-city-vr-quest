@@ -1,0 +1,141 @@
+// Port of the desktop VR debug overlay (src/vr/OpenXRVR.cpp): the software
+// glyph font, DrawDebugText, the FPS line and the grips+A toggle chord are
+// carried over verbatim. Only the delivery differs -- the pixels reach the
+// compositor through the Android session's quad layer instead of a D3D12/GL
+// swapchain upload.
+
+#include "common.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+#include "android.h"
+
+enum {
+	VR_DEBUG_WIDTH = 512,
+	VR_DEBUG_HEIGHT = 128,
+};
+
+// --- verbatim from OpenXRVR.cpp -------------------------------------------
+struct DebugGlyph { char character; uint8 rows[7]; };
+static const DebugGlyph gDebugGlyphs[] = {
+	{' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, {'%',{0x11,0x12,0x02,0x04,0x08,0x09,0x11}},
+	{'-',{0x00,0x00,0x00,0x1F,0x00,0x00,0x00}}, {'<',{0x02,0x04,0x08,0x10,0x08,0x04,0x02}},
+	{'>',{0x08,0x04,0x02,0x01,0x02,0x04,0x08}},
+	{':',{0x00,0x04,0x04,0x00,0x04,0x04,0x00}}, {'0',{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
+	{'1',{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}}, {'2',{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}},
+	{'3',{0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E}}, {'4',{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
+	{'5',{0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E}}, {'6',{0x0E,0x10,0x10,0x1E,0x11,0x11,0x0E}},
+	{'7',{0x1F,0x01,0x02,0x04,0x08,0x08,0x08}}, {'8',{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
+	{'9',{0x0E,0x11,0x11,0x0F,0x01,0x01,0x0E}}, {'A',{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}},
+	{'B',{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}},
+	{'C',{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}}, {'D',{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}},
+	{'E',{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}}, {'F',{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}},
+	{'G',{0x0E,0x11,0x10,0x17,0x11,0x11,0x0E}}, {'H',{0x11,0x11,0x11,0x1F,0x11,0x11,0x11}},
+	{'I',{0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}}, {'J',{0x01,0x01,0x01,0x01,0x11,0x11,0x0E}},
+	{'K',{0x11,0x12,0x14,0x18,0x14,0x12,0x11}}, {'L',{0x10,0x10,0x10,0x10,0x10,0x10,0x1F}},
+	{'M',{0x11,0x1B,0x15,0x15,0x11,0x11,0x11}}, {'N',{0x11,0x19,0x19,0x15,0x13,0x13,0x11}},
+	{'O',{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, {'P',{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
+	{'Q',{0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}},
+	{'R',{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}}, {'S',{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}},
+	{'T',{0x1F,0x04,0x04,0x04,0x04,0x04,0x04}}, {'U',{0x11,0x11,0x11,0x11,0x11,0x11,0x0E}},
+	{'V',{0x11,0x11,0x11,0x11,0x11,0x0A,0x04}}, {'W',{0x11,0x11,0x11,0x15,0x15,0x15,0x0A}},
+	{'X',{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}}, {'Y',{0x11,0x11,0x0A,0x04,0x04,0x04,0x04}},
+	{'Z',{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}}
+};
+
+static bool gDebugVisible;
+static uint8 gDebugPixels[VR_DEBUG_WIDTH*VR_DEBUG_HEIGHT*4];
+static int gDebugFps;
+static double gDebugPreviousFrameMs;
+static float gDebugSmoothedFrameMs;
+static bool gTouchDebugShortcutDown;
+
+static const uint8 *
+FindDebugGlyph(char character)
+{
+	if(character >= 'a' && character <= 'z')
+		character = character-'a'+'A';
+	for(uint32 i = 0; i < ARRAY_SIZE(gDebugGlyphs); i++)
+		if(gDebugGlyphs[i].character == character)
+			return gDebugGlyphs[i].rows;
+	return gDebugGlyphs[0].rows;
+}
+
+static void
+PutDebugPixel(int x, int y, uint8 red, uint8 green, uint8 blue, uint8 alpha)
+{
+	if(x < 0 || y < 0 || x >= VR_DEBUG_WIDTH || y >= VR_DEBUG_HEIGHT) return;
+	// Vulkan images are top-down, same as the desktop's D3D12 branch.
+	const int offset = (y*VR_DEBUG_WIDTH+x)*4;
+	gDebugPixels[offset+0] = red; gDebugPixels[offset+1] = green;
+	gDebugPixels[offset+2] = blue; gDebugPixels[offset+3] = alpha;
+}
+
+static void
+DrawDebugText(const char *value, int centreX, int y, int scale,
+              uint8 red, uint8 green, uint8 blue)
+{
+	const int advance = scale*6;
+	int x = centreX-(int)strlen(value)*advance/2;
+	for(const char *ch = value; *ch; ch++, x += advance){
+		const uint8 *rows = FindDebugGlyph(*ch);
+		for(int row = 0; row < 7; row++) for(int column = 0; column < 5; column++)
+			if(rows[row]&(1<<(4-column)))
+				for(int py = 0; py < scale; py++) for(int px = 0; px < scale; px++)
+					PutDebugPixel(x+column*scale+px, y+row*scale+py, red, green, blue, 255);
+	}
+}
+// --------------------------------------------------------------------------
+
+namespace androidgame {
+
+// Runs once per rendered frame from the pad path: the desktop's toggle chord
+// (both grips + A while no weapon is held; there is no weapon system here
+// yet, so the grips alone qualify as the modifier) and the desktop's frame
+// time smoothing feeding the FPS number.
+void
+VrDebugUpdate(const PadInput &in)
+{
+	const bool modifier = in.leftGrip >= 0.75f && in.rightGrip >= 0.75f;
+	const bool debugShortcut = modifier && in.a;
+	if(debugShortcut && !gTouchDebugShortcutDown)
+		gDebugVisible = !gDebugVisible;
+	gTouchDebugShortcutDown = debugShortcut;
+
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	const double now = ts.tv_sec*1000.0 + ts.tv_nsec/1e6;
+	if(gDebugPreviousFrameMs > 0.0){
+		const float frameMs = (float)(now-gDebugPreviousFrameMs);
+		gDebugSmoothedFrameMs = gDebugSmoothedFrameMs > 0.0f ?
+			gDebugSmoothedFrameMs*0.9f+frameMs*0.1f : frameMs;
+		gDebugFps = gDebugSmoothedFrameMs > 0.0f ?
+			(int)(1000.0f/gDebugSmoothedFrameMs+0.5f) : 0;
+	}
+	gDebugPreviousFrameMs = now;
+}
+
+// Fills the overlay exactly as the desktop's UpdateDebugSwapchain does; the
+// desktop-only status lines (AA/VRS/SPS) have no subsystems here yet and are
+// omitted rather than faked. Returns nil while hidden.
+const unsigned char *
+VrDebugPixels(int *width, int *height)
+{
+	*width = VR_DEBUG_WIDTH;
+	*height = VR_DEBUG_HEIGHT;
+	if(!gDebugVisible)
+		return nil;
+
+	for(int pixel = 0; pixel < VR_DEBUG_WIDTH*VR_DEBUG_HEIGHT; pixel++){
+		gDebugPixels[pixel*4+0] = 0; gDebugPixels[pixel*4+1] = 0;
+		gDebugPixels[pixel*4+2] = 0; gDebugPixels[pixel*4+3] = 210;
+	}
+	char value[64];
+	sprintf(value, "OPENXR FPS:%d", gDebugFps);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 10, 3, 255, 230, 64);
+	return gDebugPixels;
+}
+
+}

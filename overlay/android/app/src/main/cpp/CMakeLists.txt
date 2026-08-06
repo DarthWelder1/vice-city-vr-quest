@@ -1,0 +1,238 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(miamivr C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Repository root, from android/app/src/main/cpp
+get_filename_component(REVC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
+set(LIBRW_DIR "${REVC_ROOT}/vendor/librw")
+
+# Staged port. Bring-up builds only the OpenXR + Vulkan session so the
+# toolchain, the loader and the headset round-trip can be validated before the
+# game's 700-odd translation units enter the build.
+option(MIAMIVR_BRINGUP "Build only the OpenXR/Vulkan bring-up target" OFF)
+
+# AddressSanitizer. Two separate threads have faulted inside the Meta runtime
+# on pointers holding UTF-16 text and on null, which is the signature of heap
+# corruption somewhere else in the process rather than a fault at the site.
+# ASan reports the write that does the damage instead of the read that trips
+# over it later. Costs roughly 2-3x, which is fine for diagnosis.
+option(MIAMIVR_ASAN "Build with AddressSanitizer" OFF)
+if(MIAMIVR_ASAN)
+	add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+	add_link_options(-fsanitize=address)
+	message(STATUS "miamivr: AddressSanitizer enabled")
+endif()
+
+# The AAR is published as org.khronos.openxr:openxr_loader_for_android, but the
+# prefab package it exposes is named OpenXR, with targets OpenXR::openxr_loader
+# and OpenXR::headers.
+find_package(OpenXR REQUIRED CONFIG)
+
+# ---------------------------------------------------------------------------
+# Shaders: GLSL -> SPIR-V, embedded as C arrays.
+# ---------------------------------------------------------------------------
+find_program(GLSLC glslc
+	HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}"
+	      "${ANDROID_NDK}/shader-tools/windows-x86_64"
+	      "${ANDROID_NDK}/shader-tools/linux-x86_64"
+	REQUIRED)
+
+set(SPIRV_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/spirv")
+file(MAKE_DIRECTORY "${SPIRV_OUT_DIR}")
+
+# compile_shader(<source> <stage> <symbol> <outdir> <includedir>)
+# Emits a C initialiser list, consumed as:  static const uint32_t x[] =
+# #include "x.h"
+# ;
+function(compile_shader SRC STAGE SYMBOL OUTDIR INCDIR)
+	set(OUT "${OUTDIR}/${SYMBOL}.h")
+	# The depfile is what makes an edit to an included .glsl rebuild every
+	# shader that includes it. Listing only SRC is not enough and fails
+	# silently in the worst possible way: a stale shader keeps the previous
+	# uniform block offsets and reads the new buffer at the old addresses.
+	add_custom_command(
+		OUTPUT "${OUT}"
+		COMMAND "${GLSLC}" -fshader-stage=${STAGE} --target-env=vulkan1.1 -O
+		        -I "${INCDIR}" -MD -MF "${OUT}.d" -mfmt=c -o "${OUT}" "${SRC}"
+		DEPENDS "${SRC}"
+		DEPFILE "${OUT}.d"
+		COMMENT "glslc ${SYMBOL}"
+		VERBATIM)
+	set(SHADER_OUTPUTS ${SHADER_OUTPUTS} "${OUT}" PARENT_SCOPE)
+endfunction()
+
+# App bring-up shaders
+set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+set(SHADER_OUTPUTS "")
+compile_shader("${SHADER_DIR}/bringup.vert" vertex bringup_vert "${SPIRV_OUT_DIR}" "${SHADER_DIR}")
+set(MIAMIVR_SPIRV_HEADERS ${SHADER_OUTPUTS})
+compile_shader("${SHADER_DIR}/bringup.frag" fragment bringup_frag "${SPIRV_OUT_DIR}" "${SHADER_DIR}")
+list(APPEND MIAMIVR_SPIRV_HEADERS ${SHADER_OUTPUTS})
+
+add_custom_target(miamivr_shaders DEPENDS ${MIAMIVR_SPIRV_HEADERS})
+
+# librw backend shaders. They live with the backend, and rw_common.glsl is
+# pulled in by all of them, hence the include directory.
+set(LIBRW_SHADER_DIR "${LIBRW_DIR}/src/vulkan/shaders")
+set(LIBRW_SPIRV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spirv-librw")
+file(MAKE_DIRECTORY "${LIBRW_SPIRV_DIR}")
+
+set(LIBRW_SPIRV_HEADERS "")
+foreach(SHADER rw_world:vert:vertex rw_world:frag:fragment
+               rw_im2d:vert:vertex  rw_im2d:frag:fragment
+               rw_im3d:vert:vertex  rw_skin:vert:vertex)
+	string(REPLACE ":" ";" PARTS "${SHADER}")
+	list(GET PARTS 0 SHADER_NAME)
+	list(GET PARTS 1 SHADER_EXT)
+	list(GET PARTS 2 SHADER_STAGE)
+	set(SHADER_OUTPUTS "")
+	compile_shader("${LIBRW_SHADER_DIR}/${SHADER_NAME}.${SHADER_EXT}"
+	               ${SHADER_STAGE} "${SHADER_NAME}_${SHADER_EXT}"
+	               "${LIBRW_SPIRV_DIR}" "${LIBRW_SHADER_DIR}")
+	list(APPEND LIBRW_SPIRV_HEADERS ${SHADER_OUTPUTS})
+endforeach()
+
+add_custom_target(librw_shaders DEPENDS ${LIBRW_SPIRV_HEADERS})
+
+# ---------------------------------------------------------------------------
+# librw with the Vulkan backend
+#
+# Every backend directory is compiled, not just src/vulkan. The other backends
+# are disabled by their own #ifdefs and collapse to almost nothing, but librw's
+# core calls into them unconditionally -- rw::gl3::initSkin, d3d8::initMatFX,
+# ps2::readNativeTexture and so on -- so their stub definitions have to exist
+# or the link fails.
+# ---------------------------------------------------------------------------
+file(GLOB LIBRW_CORE_SOURCES "${LIBRW_DIR}/src/*.cpp")
+file(GLOB LIBRW_VULKAN_SOURCES "${LIBRW_DIR}/src/vulkan/*.cpp")
+file(GLOB LIBRW_D3D_SOURCES "${LIBRW_DIR}/src/d3d/*.cpp")
+file(GLOB LIBRW_D3D12_SOURCES "${LIBRW_DIR}/src/d3d12/*.cpp")
+file(GLOB LIBRW_GL_SOURCES "${LIBRW_DIR}/src/gl/*.cpp")
+file(GLOB LIBRW_PS2_SOURCES "${LIBRW_DIR}/src/ps2/*.cpp")
+file(GLOB LIBRW_LODEPNG_SOURCES "${LIBRW_DIR}/src/lodepng/*.cpp")
+
+add_library(librw STATIC
+	${LIBRW_CORE_SOURCES} ${LIBRW_VULKAN_SOURCES}
+	${LIBRW_D3D_SOURCES} ${LIBRW_D3D12_SOURCES}
+	${LIBRW_GL_SOURCES} ${LIBRW_PS2_SOURCES} ${LIBRW_LODEPNG_SOURCES})
+add_dependencies(librw librw_shaders)
+target_include_directories(librw PUBLIC "${LIBRW_DIR}" "${LIBRW_DIR}/src")
+target_include_directories(librw PRIVATE "${LIBRW_SPIRV_DIR}")
+target_compile_definitions(librw PUBLIC RW_VULKAN)
+target_link_libraries(librw vulkan log)
+target_compile_options(librw PRIVATE
+	-Wno-unused-parameter
+	-Wno-unused-variable
+	-Wno-unused-function
+	# librw casts between plugin storage and concrete types throughout; the
+	# warning fires thousands of times and hides real diagnostics.
+	-Wno-invalid-offsetof)
+
+# ---------------------------------------------------------------------------
+# native_app_glue
+# ---------------------------------------------------------------------------
+add_library(native_app_glue STATIC
+	"${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c")
+target_include_directories(native_app_glue PUBLIC
+	"${ANDROID_NDK}/sources/android/native_app_glue")
+set_target_properties(native_app_glue PROPERTIES COMPILE_FLAGS "-Wno-unused-parameter")
+
+# ---------------------------------------------------------------------------
+# Main shared library loaded by NativeActivity (android.app.lib_name=miamivr)
+# ---------------------------------------------------------------------------
+set(MIAMIVR_SOURCES
+	android_main.cpp
+	xr_vulkan_session.cpp
+	platform_android.cpp)
+
+if(NOT MIAMIVR_BRINGUP)
+	message(STATUS "miamivr: full game build selected")
+
+	set(GAME_DIRS
+		animation audio buildings collision control core entities extras
+		fakerw math modelinfo objects peds render rw save skel skel/android
+		text vehicles weapons)
+
+	set(GAME_SOURCES "")
+	foreach(d ${GAME_DIRS})
+		file(GLOB _dir_sources "${REVC_ROOT}/src/${d}/*.cpp")
+		list(APPEND GAME_SOURCES ${_dir_sources})
+	endforeach()
+
+	# Audio: sampman_null is selected by defining neither AUDIO_OAL nor
+	# AUDIO_MSS. It is a real no-op backend, which is exactly what the first
+	# device bring-up wants -- it removes OpenAL Soft and mpg123, neither of
+	# which is built for arm64 yet, from the critical path.
+	list(REMOVE_ITEM GAME_SOURCES
+		"${REVC_ROOT}/src/audio/sampman_oal.cpp"
+		"${REVC_ROOT}/src/audio/sampman_miles.cpp")
+
+	# GitSHA1.cpp is generated, not committed; the desktop build makes it with
+	# printHash.bat as a prebuild step.
+	execute_process(
+		COMMAND git rev-parse HEAD
+		WORKING_DIRECTORY "${REVC_ROOT}"
+		OUTPUT_VARIABLE GIT_SHA1
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+		ERROR_QUIET)
+	if(NOT GIT_SHA1)
+		set(GIT_SHA1 "unknown")
+	endif()
+	configure_file("${REVC_ROOT}/src/extras/GitSHA1.cpp.in"
+	               "${CMAKE_CURRENT_BINARY_DIR}/GitSHA1.cpp" @ONLY)
+	list(APPEND GAME_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/GitSHA1.cpp")
+
+	list(APPEND MIAMIVR_SOURCES ${GAME_SOURCES})
+
+	foreach(d ${GAME_DIRS} "")
+		list(APPEND GAME_INCLUDES "${REVC_ROOT}/src/${d}")
+	endforeach()
+	list(APPEND GAME_INCLUDES "${REVC_ROOT}/src" "${REVC_ROOT}/src/audio/oal")
+	# The skeleton reaches into the app layer for the storage roots.
+	list(APPEND GAME_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+add_library(miamivr SHARED ${MIAMIVR_SOURCES})
+add_dependencies(miamivr miamivr_shaders)
+
+target_include_directories(miamivr PRIVATE
+	"${CMAKE_CURRENT_SOURCE_DIR}"
+	"${SPIRV_OUT_DIR}"
+	"${LIBRW_DIR}"
+	${GAME_INCLUDES})
+
+target_compile_definitions(miamivr PRIVATE
+	XR_USE_PLATFORM_ANDROID
+	XR_USE_GRAPHICS_API_VULKAN
+	VK_USE_PLATFORM_ANDROID_KHR)
+
+if(NOT MIAMIVR_BRINGUP)
+	target_compile_definitions(miamivr PRIVATE LIBRW RW_VULKAN)
+	# 2003-era C++ read by a 2024 clang. These are style diagnostics, not
+	# defects, and at this volume they bury the errors that matter.
+	target_compile_options(miamivr PRIVATE
+		-Wno-invalid-offsetof
+		-Wno-writable-strings
+		-Wno-unused-value
+		-Wno-parentheses
+		-Wno-switch
+		-Wno-format-security)
+endif()
+
+if(MIAMIVR_BRINGUP)
+	target_compile_definitions(miamivr PRIVATE MIAMIVR_BRINGUP=1)
+endif()
+
+target_link_libraries(miamivr
+	native_app_glue
+	librw
+	OpenXR::openxr_loader
+	vulkan
+	android
+	log)
+
+# NativeActivity resolves ANativeActivity_onCreate from the glue; without this
+# the linker drops it as unreferenced and the app dies at startup.
+target_link_options(miamivr PRIVATE "-u" "ANativeActivity_onCreate")

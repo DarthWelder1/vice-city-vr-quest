@@ -1,0 +1,14 @@
+# never commit build products or anything installable
+*.apk
+*.so
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.keystore
+*.jks
+build/
+.gradle/
+.cxx/
+local.properties
