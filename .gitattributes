@@ -1,0 +1,5 @@
+* text=auto
+# the patch must survive checkout byte-exact on every platform
+patches/*.patch -text
+*.png -text
+*.uxrh -text
