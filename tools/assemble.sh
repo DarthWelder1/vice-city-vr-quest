@@ -5,7 +5,7 @@
 #
 # The reVC source tree is not part of this repository and is not distributed
 # with it. Obtain the miami branch separately; the tested patch base is commit
-# 06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87.
+# 026cd10f3fdbd92c089830e5067c4457c53c1b51 from mrxenginner/reVC.
 set -e
 REVC="$1"
 OUT="$2"
@@ -23,8 +23,12 @@ rm -rf "$OUT/.git"
 echo "[2/4] Applying the port patch..."
 cd "$OUT"
 git init -q
+git apply --whitespace=nowarn "$REPO/patches/revc-public-base-compat.patch" || {
+    echo "Public reVC compatibility patch did not apply. Use clean commit 026cd10f3fdbd92c089830e5067c4457c53c1b51."
+    exit 1
+}
 git apply --whitespace=nowarn "$REPO/patches/revc-quest.patch" || {
-    echo "Patch did not apply. Use the clean tested miami commit 06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87."
+    echo "Patch did not apply after public-base compatibility."
     exit 1
 }
 git apply --whitespace=nowarn "$REPO/patches/revc-quest-v050.patch" || {

@@ -2,13 +2,14 @@
 
 > **NO APK IS PROVIDED. THIS IS A SOURCE-BUILD RELEASE.**
 >
-> On Windows, install the Android Studio SDK components listed below, connect
-> the Quest, then double-click **`BUILD_AND_INSTALL.bat`**. The wizard obtains
+> On Windows, connect the Quest and double-click **`BUILD_AND_INSTALL.bat`**.
+> The wizard obtains portable Git, JDK 21, the Android command-line SDK,
 > the exact reVC source, assembles the port, builds your personal APK, installs
 > it without clearing existing data, and can copy only the required folders
 > from your legally owned Vice City installation.
-> Missing JDK 21 and Gradle distributions are downloaded from their official
-> sources and verified against pinned SHA256 hashes automatically.
+> Missing build tools and SDK packages are downloaded from their official
+> sources and verified against pinned SHA256 hashes automatically. Google SDK
+> licenses are still shown for the user to accept.
 > You may also download only **`BUILD_AND_INSTALL.bat`**. If the rest of the
 > source kit is not beside it, the BAT downloads and extracts the complete
 > public repository automatically.
@@ -42,18 +43,15 @@ hand asset under `overlay/gamefiles/models/vrhands/`.
 
 ## Required external source
 
-The exact patch base is obtained separately from the public development fork:
+The exact patch base comes from the public upstream reVC project:
 
-<https://github.com/dubrovskiy-yevhen-stakelogic/re3-miami-vr>
+<https://github.com/mrxenginner/reVC>
 
-The tested base is commit
-`06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87`. The assembly scripts never modify
-that checkout: they copy it to a new directory, apply this project's patches,
-and add the Quest-only files.
-
-The upstream reVC project is <https://github.com/mrxenginner/reVC>. Its current
-`miami` history does not contain the exact tested patch-base commit, so do not
-substitute an arbitrary upstream revision when using the manual build path.
+The tested public `miami` commit is
+`026cd10f3fdbd92c089830e5067c4457c53c1b51`. The assembly scripts never modify
+that checkout: they copy it to a new directory, apply the public-base
+compatibility patch followed by this project's patches, and add Quest-only
+files. No private repository is required or referenced.
 
 Complete prerequisites and copy-paste commands are in
 [BUILDING.md](BUILDING.md).

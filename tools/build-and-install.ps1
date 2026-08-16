@@ -17,8 +17,15 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$testedRevcCommit = "06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87"
-$revcUrl = "https://github.com/dubrovskiy-yevhen-stakelogic/re3-miami-vr.git"
+$testedRevcCommit = "026cd10f3fdbd92c089830e5067c4457c53c1b51"
+$revcUrl = "https://github.com/mrxenginner/reVC.git"
+$revcBranch = "miami"
+$gitVersion = "2.55.0.3"
+$gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/MinGit-2.55.0.3-64-bit.zip"
+$gitSha256 = "F48E2D2DC74A24454ADC6D8FD0AC25BF9C2386F19CFB06202B9465AAAD4F9F05"
+$androidCommandLineToolsVersion = "15859902"
+$androidCommandLineToolsUrl = "https://dl.google.com/android/repository/commandlinetools-win-15859902_latest.zip"
+$androidCommandLineToolsSha256 = "90AE805D20434428BFFCB699C290860F19BB5F66A67E6B330067E3DE801FB04A"
 $jdkVersion = "21.0.11+10"
 $jdkUrl = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_x64_windows_hotspot_21.0.11_10.zip"
 $jdkSha256 = "D3625E7CADF23787EA540229544B6E2AB494B3B54DA1801879E583E1DFEE0A64"
@@ -122,6 +129,35 @@ function Find-JavaHome {
     return $downloadedJavaHome
 }
 
+function Find-Git {
+    $installed = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($null -ne $installed) { return $installed.Source }
+
+    $gitWorkRoot = [IO.Path]::GetFullPath($WorkDir)
+    $gitDownloads = Join-Path $gitWorkRoot ".downloads"
+    $gitTools = Join-Path $gitWorkRoot ".tools"
+    $gitZip = Join-Path $gitDownloads "MinGit-$gitVersion-64-bit.zip"
+    $gitHome = Join-Path $gitTools "MinGit-$gitVersion"
+    $gitExe = Join-Path $gitHome "cmd\git.exe"
+    New-Item -ItemType Directory -Path $gitDownloads,$gitTools -Force | Out-Null
+
+    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $gitZip -PathType Leaf)) {
+            Write-Host "Git was not found; downloading official portable MinGit $gitVersion..." -ForegroundColor Yellow
+            Invoke-WebRequest -UseBasicParsing -Uri $gitUrl -OutFile $gitZip
+        }
+        $observedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitZip).Hash
+        if ($observedHash -ne $gitSha256) {
+            throw "MinGit archive hash mismatch. Expected $gitSha256, got $observedHash. Delete $gitZip and retry."
+        }
+        Expand-Archive -LiteralPath $gitZip -DestinationPath $gitHome -Force
+    }
+    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) {
+        throw "Portable MinGit extraction did not create $gitExe"
+    }
+    return $gitExe
+}
+
 function Find-AndroidSdk {
     $candidates = [System.Collections.Generic.List[string]]::new()
     if (-not [string]::IsNullOrWhiteSpace($AndroidSdk)) { $candidates.Add($AndroidSdk) }
@@ -131,28 +167,51 @@ function Find-AndroidSdk {
 
     foreach ($candidate in $candidates) {
         if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-        if (Test-Path -LiteralPath (Join-Path $candidate "platform-tools\adb.exe") -PathType Leaf) {
+        $hasAdb = Test-Path -LiteralPath (Join-Path $candidate "platform-tools\adb.exe") -PathType Leaf
+        $hasManager = Test-Path -LiteralPath (Join-Path $candidate "cmdline-tools\latest\bin\sdkmanager.bat") -PathType Leaf
+        if ($hasAdb -or $hasManager) {
             return (Resolve-Path -LiteralPath $candidate).Path
         }
     }
-    throw @"
-Android SDK/Platform-Tools were not found. In Android Studio open:
-  More Actions > SDK Manager
-Install Android SDK Platform 35 and, under SDK Tools:
-  Android SDK Build-Tools 35.0.0
-  Android SDK Platform-Tools
-  Android SDK Command-line Tools (latest)
-  NDK (Side by side) 27.2.12479018
-  CMake 3.22.1
-Then rerun BUILD_AND_INSTALL.bat.
-"@
+
+    $sdkWorkRoot = [IO.Path]::GetFullPath($WorkDir)
+    $sdkRoot = Join-Path $sdkWorkRoot ".android-sdk"
+    $sdkDownloads = Join-Path $sdkWorkRoot ".downloads"
+    $sdkTools = Join-Path $sdkWorkRoot ".tools"
+    $toolsZip = Join-Path $sdkDownloads "commandlinetools-win-$androidCommandLineToolsVersion.zip"
+    $extractRoot = Join-Path $sdkTools "android-command-line-tools-$androidCommandLineToolsVersion"
+    $latestRoot = Join-Path $sdkRoot "cmdline-tools\latest"
+    $sdkManager = Join-Path $latestRoot "bin\sdkmanager.bat"
+    New-Item -ItemType Directory -Path $sdkDownloads,$sdkTools,$sdkRoot -Force | Out-Null
+
+    if (-not (Test-Path -LiteralPath $sdkManager -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $toolsZip -PathType Leaf)) {
+            Write-Host "Android SDK was not found; downloading official command-line tools..." -ForegroundColor Yellow
+            Invoke-WebRequest -UseBasicParsing -Uri $androidCommandLineToolsUrl -OutFile $toolsZip
+        }
+        $observedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $toolsZip).Hash
+        if ($observedHash -ne $androidCommandLineToolsSha256) {
+            throw "Android command-line tools hash mismatch. Expected $androidCommandLineToolsSha256, got $observedHash. Delete $toolsZip and retry."
+        }
+        Expand-Archive -LiteralPath $toolsZip -DestinationPath $extractRoot -Force
+        $extractedTools = Join-Path $extractRoot "cmdline-tools"
+        if (-not (Test-Path -LiteralPath (Join-Path $extractedTools "bin\sdkmanager.bat") -PathType Leaf)) {
+            throw "Android command-line tools archive has an unexpected layout."
+        }
+        New-Item -ItemType Directory -Path $latestRoot -Force | Out-Null
+        Copy-Item -Path (Join-Path $extractedTools "*") -Destination $latestRoot -Recurse -Force
+    }
+    if (-not (Test-Path -LiteralPath $sdkManager -PathType Leaf)) {
+        throw "Android SDK bootstrap did not create $sdkManager"
+    }
+    return $sdkRoot
 }
 
 function Get-MissingSdkPackages {
     param([string]$SdkRoot)
     $requirements = @(
         [PSCustomObject]@{ Path = "platforms\android-35\android.jar"; Package = "platforms;android-35" },
-        [PSCustomObject]@{ Path = "build-tools\35.0.0"; Package = "build-tools;35.0.0" },
+        [PSCustomObject]@{ Path = "build-tools\34.0.0"; Package = "build-tools;34.0.0" },
         [PSCustomObject]@{ Path = "platform-tools\adb.exe"; Package = "platform-tools" },
         [PSCustomObject]@{ Path = "ndk\$ndkVersion"; Package = "ndk;$ndkVersion" },
         [PSCustomObject]@{ Path = "cmake\$cmakeVersion"; Package = "cmake;$cmakeVersion" }
@@ -187,9 +246,9 @@ function Ensure-SdkPackages {
     if (-not [string]::IsNullOrWhiteSpace($answer) -and $answer -notmatch '^[Yy]') {
         throw "Required SDK components were not installed."
     }
-    & $sdkManager --licenses
+    & $sdkManager "--sdk_root=$SdkRoot" --licenses
     if ($LASTEXITCODE -ne 0) { throw "Android SDK license step failed." }
-    Invoke-Checked -FilePath $sdkManager -Arguments @($missing.Package) `
+    Invoke-Checked -FilePath $sdkManager -Arguments (@("--sdk_root=$SdkRoot") + @($missing.Package)) `
         -FailureMessage "Android SDK component installation failed"
     $stillMissing = @(Get-MissingSdkPackages -SdkRoot $SdkRoot)
     if ($stillMissing.Count -ne 0) {
@@ -272,16 +331,20 @@ try {
     Write-Host "Vice City VR v0.5.1 - personal Quest build wizard" -ForegroundColor Green
     Write-Host "This repository supplies source/build tooling only; no APK or GTA data is bundled."
 
-    Write-Step 1 "Checking Git, JDK 21 and the Android SDK"
-    $gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue
-    if ($null -eq $gitCommand) { throw "Git was not found. Install Git for Windows, then rerun." }
+    Write-Step 1 "Preparing Git, JDK 21 and the Android SDK"
+    $gitExe = Find-Git
+    $gitCommandDirectory = Split-Path -Parent $gitExe
+    if (($env:PATH -split ';') -notcontains $gitCommandDirectory) {
+        $env:PATH = "$gitCommandDirectory;$env:PATH"
+    }
     $resolvedJavaHome = Find-JavaHome
-    $resolvedSdk = Find-AndroidSdk
-    Ensure-SdkPackages -SdkRoot $resolvedSdk
     $env:JAVA_HOME = $resolvedJavaHome
+    $resolvedSdk = Find-AndroidSdk
     $env:ANDROID_HOME = $resolvedSdk
     $env:ANDROID_SDK_ROOT = $resolvedSdk
+    Ensure-SdkPackages -SdkRoot $resolvedSdk
     $script:adb = Join-Path $resolvedSdk "platform-tools\adb.exe"
+    Write-Host "Git: $gitExe"
     Write-Host "JDK: $resolvedJavaHome"
     Write-Host "Android SDK: $resolvedSdk"
 
@@ -295,15 +358,12 @@ try {
     Write-Step 3 "Obtaining the exact tested reVC source"
     $revcDir = Join-Path $resolvedWork "reVC-base"
     if (-not (Test-Path -LiteralPath $revcDir)) {
-        Invoke-Checked -FilePath $gitCommand.Source -Arguments @(
-            "clone", "--recursive", "-b", "dev", $revcUrl, $revcDir
+        Invoke-Checked -FilePath $gitExe -Arguments @(
+            "clone", "--no-checkout", "-b", $revcBranch, $revcUrl, $revcDir
         ) -FailureMessage "reVC clone failed"
-        Invoke-Checked -FilePath $gitCommand.Source -Arguments @(
+        Invoke-Checked -FilePath $gitExe -Arguments @(
             "-C", $revcDir, "checkout", "--detach", $testedRevcCommit
         ) -FailureMessage "Could not select the tested reVC commit"
-        Invoke-Checked -FilePath $gitCommand.Source -Arguments @(
-            "-C", $revcDir, "submodule", "update", "--init", "--recursive"
-        ) -FailureMessage "reVC submodule setup failed"
     } else {
         if (-not (Test-Path -LiteralPath (Join-Path $revcDir ".git"))) {
             throw "$revcDir exists but is not the wizard's reVC checkout. Choose another -WorkDir."
@@ -311,9 +371,9 @@ try {
         $savedErrorPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            $headOutput = & $gitCommand.Source -C $revcDir rev-parse HEAD 2>&1
+            $headOutput = & $gitExe -C $revcDir rev-parse HEAD 2>&1
             $headExit = $LASTEXITCODE
-            $dirtyOutput = & $gitCommand.Source -C $revcDir status --porcelain 2>&1
+            $dirtyOutput = & $gitExe -C $revcDir status --porcelain 2>&1
             $dirtyExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorPreference
@@ -326,9 +386,6 @@ try {
         if ($head -ne $testedRevcCommit -or $dirty.Length -ne 0) {
             throw "$revcDir is not a clean checkout of $testedRevcCommit. Preserve your work and choose another -WorkDir."
         }
-        Invoke-Checked -FilePath $gitCommand.Source -Arguments @(
-            "-C", $revcDir, "submodule", "update", "--init", "--recursive"
-        ) -FailureMessage "reVC submodule verification failed"
         Write-Host "Reusing verified clean reVC source."
     }
 

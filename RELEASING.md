@@ -10,8 +10,8 @@ Before a tag or GitHub release:
 2. Confirm the repository contains no APK/AAB/SO/EXE/DLL, signing key,
    `release-signing.properties`, game data, save, profiler CSV, log, Modern
    model overlay, `.codex*`, `.claude`, `.agents`, `build`, `dist` or cache.
-3. Assemble from a clean reVC `miami` checkout at commit
-   `06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87` into a new output directory.
+3. Assemble from a clean public `mrxenginner/reVC` `miami` checkout at commit
+   `026cd10f3fdbd92c089830e5067c4457c53c1b51` into a new output directory.
 4. Build `:app:assembleDebug` from that new assembled tree with the toolchain
    listed in `BUILDING.md`. Do not treat an incremental `qbuild` build as the
    reproducibility test.

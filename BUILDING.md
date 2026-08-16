@@ -5,23 +5,24 @@ below produce a personal debug-signed APK on your own machine.
 
 ## Easiest Windows method
 
-1. Install Android Studio and Git for Windows.
-2. In Android Studio, open **More Actions > SDK Manager**.
-3. Install Android SDK Platform 35. Under **SDK Tools**, enable Android SDK
-   Build-Tools 35.0.0, Platform-Tools, Command-line Tools (latest), NDK (Side
-   by side) 27.2.12479018, and CMake 3.22.1.
-4. Connect the Quest, enable USB debugging, and accept the authorization prompt
+1. Connect the Quest, enable USB debugging, and accept the authorization prompt
    inside the headset.
-5. Double-click **`BUILD_AND_INSTALL.bat`** in this repository.
+2. Double-click **`BUILD_AND_INSTALL.bat`** in this repository.
+
+No Android Studio, system Git, system Java or manually prepared Android SDK is
+required for this route. The wizard downloads portable Git, JDK 21, Android
+command-line tools, Platform 35, Build-Tools 34.0.0, Platform-Tools, NDK
+27.2.12479018, CMake 3.22.1 and Gradle 8.13. The user must accept Google's SDK
+licenses when prompted.
 
 Do not launch `tools\build-and-install.ps1` directly. The `.bat` wrapper keeps
 the window open and always prints the location of the persistent diagnostic
 log: `%TEMP%\ViceCityVR-Build-And-Install.log`. If the build fails, attach that
 file instead of sending a video of a closing console window.
 
-The wizard downloads and SHA256-verifies a pinned official Eclipse Temurin JDK
-21 when Android Studio does not expose a suitable Java runtime. It likewise
-downloads and verifies Gradle, obtains the exact tested reVC commit, assembles
+The wizard downloads and SHA256-verifies pinned official portable Git, Eclipse
+Temurin JDK 21, Android command-line tools and Gradle. It then installs the
+required SDK packages, obtains the exact tested public reVC commit, assembles
 the private tree, builds a personal debug APK, installs it with
 `adb install -r`, bootstraps application-owned storage, and asks for the legally
 owned Vice City folder when game data must be copied. It never uninstalls the
@@ -48,7 +49,7 @@ Tested versions:
 
 - Git
 - JDK 21
-- Android SDK Platform 35 and Build Tools 35.0.0
+- Android SDK Platform 35 and Build Tools 34.0.0
 - Android NDK `27.2.12479018`
 - CMake 3.22.1
 - Gradle 8.13, or Android Studio with an equivalent Gradle installation
@@ -60,20 +61,14 @@ path limits.
 
 ## 2. Obtain the required reVC source
 
-The source is supplied by its own project, not by this repository:
+The source is supplied by the public upstream project, not by this repository:
 
 ```powershell
-git clone --recursive -b dev https://github.com/dubrovskiy-yevhen-stakelogic/re3-miami-vr.git C:\src\reVC
-git -C C:\src\reVC checkout --detach 06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87
-git -C C:\src\reVC submodule update --init --recursive
+git clone --no-checkout -b miami https://github.com/mrxenginner/reVC.git C:\src\reVC
+git -C C:\src\reVC checkout --detach 026cd10f3fdbd92c089830e5067c4457c53c1b51
 ```
 
-Tested build-base repository:
-<https://github.com/dubrovskiy-yevhen-stakelogic/re3-miami-vr>.
-
-Upstream reVC project: <https://github.com/mrxenginner/reVC>. The upstream
-`miami` history currently does not contain the exact patch-base commit above;
-the two repositories therefore cannot be substituted blindly.
+Tested build-base repository: <https://github.com/mrxenginner/reVC>.
 
 Use a clean checkout at that exact commit. A different revision or local edits
 can make a patch fail; the script stops instead of silently producing a mixed

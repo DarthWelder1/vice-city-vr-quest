@@ -1,0 +1,747 @@
+diff --git a/README.md b/README.md
+index c53eac62..559afce3 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,5 @@
++# Take Two, all of their employees, and anyone who supports them can go fuck themselves :). Sincerely, Starman. 
++
+ <img src="https://github.com/GTAmodding/re3/blob/miami/logo.png?raw=true" alt="reVC logo" width="200">
+ 
+ [![Build Status](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Factions-badge.atrox.dev%2FGTAmodding%2Fre3%2Fbadge%3Fref%3Dmiami&style=flat)](https://actions-badge.atrox.dev/GTAmodding/re3/goto?ref=miami)
+@@ -17,7 +19,7 @@ We cannot build for PS2 or Xbox yet. If you're interested in doing so, get in to
+ ## How can I try it?
+ 
+ - reVC requires game assets to work, so you **must** own [a copy of GTA Vice City](https://store.steampowered.com/app/12110/Grand_Theft_Auto_Vice_City/).
+-- Build reVC or download the latest nightly build:
++- Build reVC or download the latest build:
+   - [Windows D3D9 MSS 32bit](https://nightly.link/GTAmodding/re3/workflows/reVC_msvc_x86/miami/reVC_Release_win-x86-librw_d3d9-mss.zip)
+   - [Windows D3D9 64bit](https://nightly.link/GTAmodding/re3/workflows/reVC_msvc_amd64/miami/reVC_Release_win-amd64-librw_d3d9-oal.zip)
+   - [Windows OpenGL 64bit](https://nightly.link/GTAmodding/re3/workflows/reVC_msvc_amd64/miami/reVC_Release_win-amd64-librw_gl3_glfw-oal.zip)
+diff --git a/src/audio/MusicManager.cpp b/src/audio/MusicManager.cpp
+index 9c6f61f6..f2e3cfd0 100644
+--- a/src/audio/MusicManager.cpp
++++ b/src/audio/MusicManager.cpp
+@@ -1308,6 +1308,10 @@ cMusicManager::DisplayRadioStationName()
+ 			case STREAMED_SOUND_RADIO_TAXI:
+ 				return;
+ 			default: {
++				// Otherwise pausing-resuming game will show RADIO OFF, since radio isn't set yet
++				if (m_nPlayingTrack == NO_TRACK && m_nFrontendTrack == NO_TRACK)
++					return;
++
+ 				extern wchar WideErrorString[];
+ 
+ 				string = TheText.Get("FEA_NON");
+diff --git a/src/audio/sampman_miles.cpp b/src/audio/sampman_miles.cpp
+index 36f230b4..3eee78ae 100644
+--- a/src/audio/sampman_miles.cpp
++++ b/src/audio/sampman_miles.cpp
+@@ -2082,142 +2082,136 @@ cSampleManager::StartPreloadedStreamedFile(uint8 nStream)
+ bool
+ cSampleManager::StartStreamedFile(uint32 nFile, uint32 nPos, uint8 nStream)
+ {
++	int i = 0;
+ 	uint32 position = nPos;
+ 	char filename[MAX_PATH];
+ 	
+-	if ( m_bInitialised && nFile < TOTAL_STREAMED_SOUNDS )
++	if ( !m_bInitialised || nFile >= TOTAL_STREAMED_SOUNDS )
++		return false;
++
++	if ( mp3Stream[nStream] )
+ 	{
+-		if ( mp3Stream[nStream] )
+-		{
+-			AIL_pause_stream(mp3Stream[nStream], 1);
+-			AIL_close_stream(mp3Stream[nStream]);
+-		}
+-		
+-		if ( nFile == STREAMED_SOUND_RADIO_MP3_PLAYER )
++		AIL_pause_stream(mp3Stream[nStream], 1);
++		AIL_close_stream(mp3Stream[nStream]);
++	}
++	if ( nFile == STREAMED_SOUND_RADIO_MP3_PLAYER )
++	{
++		do
+ 		{
+-			uint32 i = 0;
+-			do {
+-				if(i != 0 || _bIsMp3Active) {
+-					if(++_CurMP3Index >= nNumMP3s) _CurMP3Index = 0;
+-
+-					_CurMP3Pos = 0;
+-
+-					tMP3Entry *mp3 = _GetMP3EntryByIndex(_CurMP3Index);
+-
+-					if(mp3) {
+-						mp3 = _pMP3List;
+-						if(mp3 == NULL) {
+-							_bIsMp3Active = false;
+-							nFile = 0;
+-							strcpy(filename, m_MiscomPath);
+-							strcat(filename, StreamedNameTable[nFile]);
+-
+-							mp3Stream[nStream] =
+-							    AIL_open_stream(DIG, filename, 0);
+-							if(mp3Stream[nStream]) {
+-								AIL_set_stream_loop_count(
+-								    mp3Stream[nStream], nStreamLoopedFlag[nStream] ? 0 : 1);
+-								nStreamLoopedFlag[nStream] = true;
+-								AIL_set_stream_ms_position(
+-								    mp3Stream[nStream], position);
+-								AIL_pause_stream(mp3Stream[nStream],
+-								                 0);
+-								return true;
+-							}
+-
+-							return false;
+-						}
++			// Just switched to MP3 player
++			if ( !_bIsMp3Active && i == 0 )
++			{
++				if ( nPos > nStreamLength[STREAMED_SOUND_RADIO_MP3_PLAYER] )
++					position = 0;
++				tMP3Entry *e = _pMP3List;
++
++				// Try to continue from previous song, if already started
++				if(!_GetMP3PosFromStreamPos(&position, &e) && !e) {
++					nFile = 0;
++					strcpy(filename, m_MiscomPath);
++					strcat(filename, StreamedNameTable[nFile]);
++					mp3Stream[nStream] =
++					    AIL_open_stream(DIG, filename, 0);
++					if(mp3Stream[nStream]) {
++						AIL_set_stream_loop_count(mp3Stream[nStream], nStreamLoopedFlag[nStream] ? 0 : 1);
++						nStreamLoopedFlag[nStream] = true;
++						AIL_set_stream_ms_position(mp3Stream[nStream], position);
++						AIL_pause_stream(mp3Stream[nStream], 0);
++						return true;
+ 					}
++					return false;
+ 
+-					if(mp3->pLinkPath != NULL)
+-						mp3Stream[nStream] =
+-						    AIL_open_stream(DIG, mp3->pLinkPath, 0);
++				} else {
++					if ( e->pLinkPath != NULL )
++						mp3Stream[nStream] = AIL_open_stream(DIG, e->pLinkPath, 0);
+ 					else {
+ 						strcpy(filename, _mp3DirectoryPath);
+-						strcat(filename, mp3->aFilename);
+-
+-						mp3Stream[nStream] =
+-						    AIL_open_stream(DIG, filename, 0);
++						strcat(filename, e->aFilename);
++					
++						mp3Stream[nStream] = AIL_open_stream(DIG, filename, 0);
+ 					}
+-
+-					if(mp3Stream[nStream]) {
++										
++					if ( mp3Stream[nStream] ) {
+ 						AIL_set_stream_loop_count(mp3Stream[nStream], 1);
+-						AIL_set_stream_ms_position(mp3Stream[nStream], 0);
++						AIL_set_stream_ms_position(mp3Stream[nStream], position);
+ 						AIL_pause_stream(mp3Stream[nStream], 0);
++						
++						_bIsMp3Active = true;
++				
+ 						return true;
+ 					}
+-
+-					_bIsMp3Active = false;
+-					continue;
++					// fall through, start playing from another song
+ 				}
+-				if ( nPos > nStreamLength[STREAMED_SOUND_RADIO_MP3_PLAYER] )
+-					position = 0;
+-				
+-				tMP3Entry *e;
+-				if ( !_GetMP3PosFromStreamPos(&position, &e) )
++			} else {
++				if(++_CurMP3Index >= nNumMP3s) _CurMP3Index = 0;
++
++				_CurMP3Pos = 0;
++
++				tMP3Entry *mp3 = _GetMP3EntryByIndex(_CurMP3Index);
++				if ( !mp3 )
+ 				{
+-					if ( e == NULL )
++					mp3 = _pMP3List;
++					if ( !_pMP3List )
+ 					{
+ 						nFile = 0;
++						_bIsMp3Active = 0;
+ 						strcpy(filename, m_MiscomPath);
+ 						strcat(filename, StreamedNameTable[nFile]);
++
+ 						mp3Stream[nStream] =
+ 						    AIL_open_stream(DIG, filename, 0);
+ 						if(mp3Stream[nStream]) {
+-							AIL_set_stream_loop_count(mp3Stream[nStream], nStreamLoopedFlag[nStream] ? 0 : 1);
++							AIL_set_stream_loop_count(
++							    mp3Stream[nStream], nStreamLoopedFlag[nStream] ? 0 : 1);
+ 							nStreamLoopedFlag[nStream] = true;
+-							AIL_set_stream_ms_position(mp3Stream[nStream], position);
+-							AIL_pause_stream(mp3Stream[nStream], 0);
++							AIL_set_stream_ms_position(
++							    mp3Stream[nStream], position);
++							AIL_pause_stream(mp3Stream[nStream],
++							                 0);
+ 							return true;
+ 						}
+-
+ 						return false;
+ 					}
+ 				}
+-
+-				if ( e->pLinkPath != NULL )
+-					mp3Stream[nStream] = AIL_open_stream(DIG, e->pLinkPath, 0);
+-				else
+-				{
++				if(mp3->pLinkPath != NULL)
++					mp3Stream[nStream] = AIL_open_stream(DIG, mp3->pLinkPath, 0);
++				else {
+ 					strcpy(filename, _mp3DirectoryPath);
+-					strcat(filename, e->aFilename);
+-				
+-					mp3Stream[nStream] = AIL_open_stream(DIG, filename, 0);
++					strcat(filename, mp3->aFilename);
++
++					mp3Stream[nStream] =
++					    AIL_open_stream(DIG, filename, 0);
+ 				}
+-									
+-				if ( mp3Stream[nStream] )
+-				{
++
++				if(mp3Stream[nStream]) {
+ 					AIL_set_stream_loop_count(mp3Stream[nStream], 1);
+-					AIL_set_stream_ms_position(mp3Stream[nStream], position);
++					AIL_set_stream_ms_position(mp3Stream[nStream], 0);
+ 					AIL_pause_stream(mp3Stream[nStream], 0);
+-					
++#ifdef FIX_BUGS
+ 					_bIsMp3Active = true;
+-			
++#endif
+ 					return true;
+ 				}
+-				
+-				_bIsMp3Active = false;
+ 
+-			} while(++i < nNumMP3s);
+-
+-			position = 0;
+-			nFile = 0;
+-		}
+-		
+-		strcpy(filename, m_MiscomPath);
+-		strcat(filename, StreamedNameTable[nFile]);
+-		
+-		mp3Stream[nStream] = AIL_open_stream(DIG, filename, 0);
+-		if ( mp3Stream[nStream] )
+-		{
+-			AIL_set_stream_loop_count(mp3Stream[nStream], nStreamLoopedFlag[nStream] ? 0 : 1);
+-			nStreamLoopedFlag[nStream] = true;
+-			AIL_set_stream_ms_position(mp3Stream[nStream], position);
+-			AIL_pause_stream(mp3Stream[nStream], 0);
+-			return true;
++			}
++			_bIsMp3Active = 0;
+ 		}
++		while ( ++i < nNumMP3s );
++		position = 0;
++		nFile = 0;
+ 	}
++	strcpy(filename, m_MiscomPath);
++	strcat(filename, StreamedNameTable[nFile]);
+ 	
++	mp3Stream[nStream] = AIL_open_stream(DIG, filename, 0);
++	if ( mp3Stream[nStream] )
++	{
++		AIL_set_stream_loop_count(mp3Stream[nStream], nStreamLoopedFlag[nStream] ? 0 : 1);
++		nStreamLoopedFlag[nStream] = true;
++		AIL_set_stream_ms_position(mp3Stream[nStream], position);
++		AIL_pause_stream(mp3Stream[nStream], 0);
++		return true;
++	}
+ 	return false;
+ }
+ 
+diff --git a/src/audio/sampman_oal.cpp b/src/audio/sampman_oal.cpp
+index ae4b1cbb..5a300cff 100644
+--- a/src/audio/sampman_oal.cpp
++++ b/src/audio/sampman_oal.cpp
+@@ -1734,93 +1734,94 @@ cSampleManager::StartPreloadedStreamedFile(uint8 nStream)
+ bool
+ cSampleManager::StartStreamedFile(uint32 nFile, uint32 nPos, uint8 nStream)
+ {
++	int i = 0;
+ 	uint32 position = nPos;
+-	char filename[256];
+-	
+-	ASSERT( nStream < MAX_STREAMS );
++	char filename[MAX_PATH];
+ 	
+-	if ( nFile < TOTAL_STREAMED_SOUNDS )
++	if ( nFile >= TOTAL_STREAMED_SOUNDS )
++		return false;
++
++	if ( aStream[nStream] )
+ 	{
+-		if ( aStream[nStream] )
+-		{
+-			delete aStream[nStream];
+-			aStream[nStream] = NULL;
+-		}
+-		
+-		if ( nFile == STREAMED_SOUND_RADIO_MP3_PLAYER )
++		delete aStream[nStream];
++		aStream[nStream] = NULL;
++	}
++	if ( nFile == STREAMED_SOUND_RADIO_MP3_PLAYER )
++	{
++		do
+ 		{
+-			uint32 i = 0;
+-			do {
+-				if(i != 0 || _bIsMp3Active) {
+-					if(++_CurMP3Index >= nNumMP3s) _CurMP3Index = 0;
+-
+-					_CurMP3Pos = 0;
+-
+-					tMP3Entry *mp3 = _GetMP3EntryByIndex(_CurMP3Index);
+-
+-					if(mp3) {
+-						mp3 = _pMP3List;
+-						if(mp3 == NULL) {
+-							_bIsMp3Active = false;
+-							nFile = 0;
+-							strcat(filename, StreamedNameTable[nFile]);
++			// Just switched to MP3 player
++			if ( !_bIsMp3Active && i == 0 )
++			{
++				if ( nPos > nStreamLength[STREAMED_SOUND_RADIO_MP3_PLAYER] )
++					position = 0;
++				tMP3Entry *e = _pMP3List;
+ 
+-							CStream* stream = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+-							ASSERT(stream != NULL);
++				// Try to continue from previous song, if already started
++				if(!_GetMP3PosFromStreamPos(&position, &e) && !e) {
++					nFile = 0;
+ 
+-							aStream[nStream] = stream;
++					strcpy(filename, StreamedNameTable[nFile]);
++					CStream* stream = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+ 
+-							if (stream->Setup()) {
+-								stream->SetLoopCount(nStreamLoopedFlag[nStream] ? 0 : 1);
+-								nStreamLoopedFlag[nStream] = true;
+-								if (position != 0)
+-									stream->SetPosMS(position);
++					aStream[nStream] = stream;
+ 
+-								stream->Start();
++					if (stream->Setup()) {
++						stream->SetLoopCount(nStreamLoopedFlag[nStream] ? 0 : 1);
++						nStreamLoopedFlag[nStream] = true;
++						if (position != 0)
++							stream->SetPosMS(position);
+ 
+-								return true;
+-							} else {
+-								delete stream;
+-								aStream[nStream] = NULL;
+-							}
++						stream->Start();
+ 
+-							return false;
+-						}
++						return true;
++					} else {
++						delete stream;
++						aStream[nStream] = NULL;
+ 					}
++					return false;
+ 
+-					if (mp3->pLinkPath != NULL)
+-						aStream[nStream] = new CStream(mp3->pLinkPath, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
++				} else {
++
++					if (e->pLinkPath != NULL)
++						aStream[nStream] = new CStream(e->pLinkPath, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+ 					else {
+ 						strcpy(filename, _mp3DirectoryPath);
+-						strcat(filename, mp3->aFilename);
++						strcat(filename, e->aFilename);
+ 
+-						aStream[nStream] = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
++						aStream[nStream] = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream]);
+ 					}
+ 
+ 					if (aStream[nStream]->Setup()) {
++						if (position != 0)
++							aStream[nStream]->SetPosMS(position);
++
+ 						aStream[nStream]->Start();
+ 
++						_bIsMp3Active = true;
+ 						return true;
+ 					} else {
+ 						delete aStream[nStream];
+ 						aStream[nStream] = NULL;
+ 					}
+-
+-					_bIsMp3Active = false;
+-					continue;
++					// fall through, start playing from another song
+ 				}
+-				if ( nPos > nStreamLength[STREAMED_SOUND_RADIO_MP3_PLAYER] )
+-					position = 0;
+-				
+-				tMP3Entry *e;
+-				if ( !_GetMP3PosFromStreamPos(&position, &e) )
++			} else {
++				if(++_CurMP3Index >= nNumMP3s) _CurMP3Index = 0;
++
++				_CurMP3Pos = 0;
++
++				tMP3Entry *mp3 = _GetMP3EntryByIndex(_CurMP3Index);
++				if ( !mp3 )
+ 				{
+-					if ( e == NULL )
++					mp3 = _pMP3List;
++					if ( !_pMP3List )
+ 					{
+ 						nFile = 0;
+-						strcat(filename, StreamedNameTable[nFile]);
++						_bIsMp3Active = 0;
++						strcpy(filename, StreamedNameTable[nFile]);
++
+ 						CStream* stream = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+-						ASSERT(stream != NULL);
+ 
+ 						aStream[nStream] = stream;
+ 
+@@ -1837,63 +1838,55 @@ cSampleManager::StartStreamedFile(uint32 nFile, uint32 nPos, uint8 nStream)
+ 							delete stream;
+ 							aStream[nStream] = NULL;
+ 						}
+-
+ 						return false;
+ 					}
+ 				}
+-
+-				if (e->pLinkPath != NULL)
+-					aStream[nStream] = new CStream(e->pLinkPath, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
++				if (mp3->pLinkPath != NULL)
++					aStream[nStream] = new CStream(mp3->pLinkPath, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+ 				else {
+ 					strcpy(filename, _mp3DirectoryPath);
+-					strcat(filename, e->aFilename);
++					strcat(filename, mp3->aFilename);
+ 
+-					aStream[nStream] = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream]);
++					aStream[nStream] = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+ 				}
+ 
+ 				if (aStream[nStream]->Setup()) {
+-					if (position != 0)
+-						aStream[nStream]->SetPosMS(position);
+-
+ 					aStream[nStream]->Start();
+-
++#ifdef FIX_BUGS
+ 					_bIsMp3Active = true;
++#endif
+ 					return true;
+ 				} else {
+ 					delete aStream[nStream];
+ 					aStream[nStream] = NULL;
+ 				}
+-				
+-				_bIsMp3Active = false;
+-
+-			} while(++i < nNumMP3s);
+ 
+-			position = 0;
+-			nFile = 0;
++			}
++			_bIsMp3Active = 0;
+ 		}
++		while ( ++i < nNumMP3s );
++		position = 0;
++		nFile = 0;
++	}
++	strcpy(filename, StreamedNameTable[nFile]);
++	
++	CStream *stream = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+ 
+-		strcpy(filename, StreamedNameTable[nFile]);
+-		
+-		CStream *stream = new CStream(filename, ALStreamSources[nStream], ALStreamBuffers[nStream], IsThisTrackAt16KHz(nFile) ? 16000 : 32000);
+-		ASSERT(stream != NULL);
++	aStream[nStream] = stream;
++	
++	if ( stream->Setup() ) {
++		stream->SetLoopCount(nStreamLoopedFlag[nStream] ? 0 : 1);
++		nStreamLoopedFlag[nStream] = true;
++		if (position != 0)
++			stream->SetPosMS(position);	
+ 
+-		aStream[nStream] = stream;
++		stream->Start();
+ 		
+-		if ( stream->Setup() ) {
+-			stream->SetLoopCount(nStreamLoopedFlag[nStream] ? 0 : 1);
+-			nStreamLoopedFlag[nStream] = true;
+-			if (position != 0)
+-				stream->SetPosMS(position);	
+-
+-			stream->Start();
+-			
+-			return true;
+-		} else {
+-			delete stream;
+-			aStream[nStream] = NULL;
+-		}
++		return true;
++	} else {
++		delete stream;
++		aStream[nStream] = NULL;
+ 	}
+-	
+ 	return false;
+ }
+ 
+diff --git a/src/control/CarCtrl.cpp b/src/control/CarCtrl.cpp
+index d05d9827..8db6fd95 100644
+--- a/src/control/CarCtrl.cpp
++++ b/src/control/CarCtrl.cpp
+@@ -3238,7 +3238,7 @@ bool CCarCtrl::GenerateOneEmergencyServicesCar(uint32 mi, CVector vecPos)
+ 		attempts += 1;
+ 	}
+ 	if (attempts >= 5)
+-		return nil;
++		return false;
+ 	CAutomobile* pVehicle = new CAutomobile(mi, RANDOM_VEHICLE);
+ 	pVehicle->AutoPilot.m_vecDestinationCoors = vecPos;
+ 	pVehicle->SetPosition(spawnPos);
+diff --git a/src/core/re3.cpp b/src/core/re3.cpp
+index 3f99b793..0ce7f834 100644
+--- a/src/core/re3.cpp
++++ b/src/core/re3.cpp
+@@ -1072,6 +1072,7 @@ extern bool gbRenderWorld2;
+ 		DebugMenuAddVarBool8("Debug", "Show Timebars", &gbShowTimebars, nil);
+ #endif
+ #ifndef FINAL
++		DebugMenuAddVarBool8("Debug", "Use debug render groups", &bDebugRenderGroups, nil);
+ 		DebugMenuAddVarBool8("Debug", "Print Memory Usage", &gbPrintMemoryUsage, nil);
+ #ifdef USE_CUSTOM_ALLOCATOR
+ 		DebugMenuAddCmd("Debug", "Parse Heap", ParseHeap);
+diff --git a/src/render/WaterLevel.cpp b/src/render/WaterLevel.cpp
+index e91aa790..0d114db9 100644
+--- a/src/render/WaterLevel.cpp
++++ b/src/render/WaterLevel.cpp
+@@ -611,14 +611,14 @@ CWaterLevel::TestVisibilityForFineWaterBlocks(const CVector &worldPos)
+ 
+ 		if ((lineEnd.x > WORLD_MIN_X && lineEnd.x < WORLD_MAX_X) && (lineEnd.y > WORLD_MIN_Y && lineEnd.y < WORLD_MAX_Y))
+ 		{
+-			if (!CWorld::ProcessLineOfSight(lineStart, lineEnd, col, entity, true, false, false, false, true, false, nil))
++			if (!CWorld::ProcessLineOfSight(lineStart, lineEnd, col, entity, true, false, false, false, true, false))
+ 			{
+ 				lineStart.x += 0.4f;
+ 				lineStart.y += 0.4f;
+ 				lineEnd.x += 0.4f;
+ 				lineEnd.y += 0.4f;
+ 
+-				if (!CWorld::ProcessLineOfSight(lineStart, lineEnd, col, entity, true, false, false, false, true, false, nil))
++				if (!CWorld::ProcessLineOfSight(lineStart, lineEnd, col, entity, true, false, false, false, true, false))
+ 				{
+ 					return false;
+ 				}
+diff --git a/src/rw/RwHelper.cpp b/src/rw/RwHelper.cpp
+index 11fde99d..9b0ba137 100644
+--- a/src/rw/RwHelper.cpp
++++ b/src/rw/RwHelper.cpp
+@@ -9,6 +9,7 @@
+ #endif
+ #ifndef FINAL
+ RtCharset *debugCharset;
++bool bDebugRenderGroups;
+ #endif
+ 
+ #ifdef PS2_ALPHA_TEST
+@@ -106,6 +107,8 @@ SetCullMode(uint32 mode)
+ void
+ PushRendergroup(const char *name)
+ {
++	if(!bDebugRenderGroups)
++		return;
+ #if defined(RW_OPENGL)
+ 	if(GLAD_GL_KHR_debug)
+ 		glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, -1, name);
+@@ -119,6 +122,8 @@ PushRendergroup(const char *name)
+ void
+ PopRendergroup(void)
+ {
++	if(!bDebugRenderGroups)
++		return;
+ #if defined(RW_OPENGL)
+ 	if(GLAD_GL_KHR_debug)
+ 		glPopDebugGroup();
+diff --git a/src/rw/RwHelper.h b/src/rw/RwHelper.h
+index 9352d1fd..a3a1928c 100644
+--- a/src/rw/RwHelper.h
++++ b/src/rw/RwHelper.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++extern bool bDebugRenderGroups;
+ extern bool gPS2alphaTest;
+ extern bool gBackfaceCulling;
+ 
+diff --git a/utils/gxt/german.txt b/utils/gxt/german.txt
+index 23047f03..f5ff5e24 100644
+--- a/utils/gxt/german.txt
++++ b/utils/gxt/german.txt
+@@ -14579,16 +14579,16 @@ RUSSISCH
+ 
+ { new display menus }
+ [FET_GFX]
+-GRAFIK-SETUP
++GRAPHICS SETUP
+ 
+ [FED_MIP]
+ MIP MAPPING
+ 
+ [FED_AAS]
+-KANTENGLÄTTUNG
++ANTI ALIASING
+ 
+ [FED_FIL]
+-TEXTURFILTERUNG
++TEXTURE FILTERING
+ 
+ [FED_BIL]
+ BILINEAR
+@@ -14597,44 +14597,44 @@ BILINEAR
+ TRILINEAR
+ 
+ [FED_WND]
+-FENSTERMODUS
++WINDOWED
+ 
+ [FED_FLS]
+-VOLLBILD
++FULLSCREEN
+ 
+ [FEM_CSB]
+-CUTSCENE BALKEN
++CUTSCENE BORDERS
+ 
+ [FEM_SCF]
+-BILDSCHIRMFORMAT
++SCREEN FORMAT
+ 
+ [FEM_ISL]
+-KARTENSPEICHERNUTZUNG
++MAP MEMORY USAGE
+ 
+ [FEM_LOW]
+-NIEDRIG
++LOW
+ 
+ [FEM_MED]
+-MITTEL
++MEDIUM
+ 
+ [FEM_HIG]
+-HOCH
++HIGH
+ 
+ [FEM_2PR]
+ PS2 ALPHA TEST
+ 
+ [FEC_FRC]
+-FREIE KAMERA
++FREE CAM
+ 
+ { Linux joy detection }
+ [FEC_JOD]
+-JOYSTICK ERKENNEN
++DETECT JOYSTICK
+ 
+ [FEC_JPR]
+-Drücke eine beliebige Taste auf dem Joystick der für das Spiel verwendet werden soll, und er wird ausgewählt.
++Press any key on the joystick of your choice that you want to use on the game, and it will be selected.
+ 
+ [FEC_JDE]
+-Joystick erkannt
++Detected joystick
+ 
+ { mission restart }
+ [FET_RMS]
+@@ -14644,25 +14644,25 @@ MISSION WIEDERHOLEN
+ WIEDERHOLEN?
+ 
+ [FED_VPL]
+-FAHRZEUG-PIPELINE
++VEHICLE PIPELINE
+ 
+ [FED_PRM]
+-CHARAKTER KANTEN LICHT
++PED RIM LIGHT
+ 
+ [FED_RGL]
+-GLÄNZENDE STRAßEN
++ROAD GLOSS
+ 
+ [FED_CLF]
+-FARBFILTER
++COLOUR FILTER
+ 
+ [FED_WLM]
+-WELT LIGHTMAPS
++WORLD LIGHTMAPS
+ 
+ [FED_MBL]
+-BEWEGUNGSUNSCHÄRFE
++MOTION BLUR
+ 
+ [FEM_SIM]
+-SIMPEL
++SIMPLE
+ 
+ [FEM_NRM]
+ NORMAL
+@@ -14683,7 +14683,7 @@ PS2
+ XBOX
+ 
+ [FEC_IVP]
+-PAD VERTIKAL INVERTIEREN
++INVERT PAD VERTICALLY
+ 
+ [FEM_NON]
+ NONE
+@@ -14704,14 +14704,14 @@ XBOX 360 CONTROLLER
+ XBOX ONE CONTROLLER
+ 
+ [FEC_TYP]
+-GAMEPAD-TYP
++GAMEPAD TYPE
+ 
+ [FET_AGS]
+-KONTROLLEREINSTELLUNGEN
++GAMEPAD SETTINGS
+ 
+ [FEM_AUT] { aspect ratio related }
+ AUTO
+ 
+ [DUMMY]
+ THIS LABEL NEEDS TO BE HERE !!!
+-AS THE LAST LABEL DOES NOT GET COMPILED
++AS THE LAST LABEL DOES NOT GET COMPILED
+\ No newline at end of file
