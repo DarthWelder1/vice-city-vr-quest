@@ -1,0 +1,3134 @@
+diff --git a/src/collision/Collision.cpp b/src/collision/Collision.cpp
+index 50c22e3..fefc3ec 100644
+--- a/src/collision/Collision.cpp
++++ b/src/collision/Collision.cpp
+@@ -23,6 +23,9 @@
+ #include "Collision.h"
+ #include "Camera.h"
+ #include "ColStore.h"
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#include "PhysicsDirector.h"
++#endif
+ 
+ #ifdef VU_COLLISION
+ #include "VuCollision.h"
+@@ -1749,6 +1752,11 @@ CCollision::ProcessColModels(const CMatrix &matrixA, CColModel &modelA,
+ 		if(GetVUresult())
+ 			aTriangleIndicesB[numTrianglesB++] = i-1;
+ 	}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorRecordProcessColModelsWork(
++		modelA.numLines, numSpheresA, numSpheresB, numBoxesB,
++		numTrianglesB);
++#endif
+ 	// No collision
+ 	if(numSpheresB == 0 && numBoxesB == 0 && numTrianglesB == 0)
+ 		return 0;
+@@ -2030,6 +2038,11 @@ CCollision::ProcessColModels(const CMatrix &matrixA, CColModel &modelA,
+ 	assert(numSpheresB <= MAXNUMSPHERES);
+ 	assert(numBoxesB <= MAXNUMBOXES);
+ 	assert(numTrianglesB <= MAXNUMTRIS);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorRecordProcessColModelsWork(
++		numLinesA, numSpheresA, numSpheresB, numBoxesB,
++		numTrianglesB);
++#endif
+ 	// No collision
+ 	if(numSpheresB == 0 && numBoxesB == 0 && numTrianglesB == 0)
+ 		return 0;
+diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
+index 989dc9f..0092d82 100644
+--- a/src/core/Pad.cpp
++++ b/src/core/Pad.cpp
+@@ -49,6 +49,8 @@
+ #include "WeaponInfo.h"
+ #include "Bike.h"
+ #include "VehicleModelInfo.h"
++#include "Object.h"
++#include "Pools.h"
+ 
+ #ifdef GTA_PS2
+ #include "eetypes.h"
+@@ -700,14 +702,127 @@ static const char *gVrCheatNames[] = {
+ 	"SHOW CHASE STATS", "SMOKING TOMMY", "SUICIDE"
+ };
+ 
++enum eVrSpecialCheatIndex {
++	VR_SPECIAL_PASS_CURRENT_MISSION = 0,
++	VR_SPECIAL_SPAWN_NEXT_CAR,
++	VR_SPECIAL_SPAWN_NEXT_MOTORCYCLE,
++	VR_SPECIAL_SPAWN_NEXT_HELICOPTER,
++	VR_SPECIAL_SPAWN_NEXT_AIRPLANE,
++	VR_SPECIAL_GOD_MODE,
++	VR_SPECIAL_RUN_WITHOUT_LIMITS,
++	VR_SPECIAL_OPEN_STORY_BRIDGES,
++	VR_SPECIAL_UNLOCK_SIX_STAR_WANTED_CAP,
++	VR_SPECIAL_CHEAT_COUNT
++};
++
+ static const int gVrCycleBikeModels[] = {
+ 	MI_ANGEL, MI_FREEWAY, MI_PCJ600,
+ 	MI_FAGGIO, MI_PIZZABOY, MI_SANCHEZ
+ };
++static const int gVrCycleHelicopterModels[] = {
++	MI_HUNTER, MI_SEASPAR, MI_SPARROW,
++	MI_MAVERICK, MI_VCNMAV, MI_POLMAV
++};
++static const int gVrCycleAirplaneModels[] = { MI_SKIMMER };
+ static int gVrCycleBikeIndex;
++static int gVrCycleHelicopterIndex;
++static int gVrCycleAirplaneIndex;
+ static int gVrCycleCarCursor = MI_FIRST_VEHICLE;
+ static bool gVrGodModeEnabled;
+ 
++static bool
++IsVrRunWithoutLimitsEnabled(void)
++{
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	return OculusVR::IsRunWithoutLimitsEnabled();
++#else
++	return false;
++#endif
++}
++
++enum eVrMissionCategory
++{
++	VR_MISSION_CATEGORY_STORY = 0,
++	VR_MISSION_CATEGORY_ASSETS,
++	VR_MISSION_CATEGORY_ACTIVITIES,
++	VR_MISSION_CATEGORY_COUNT
++};
++
++// Canonical 97-entry order from Vice City's native MISSION_SWITCHER table.
++// The ordinal is the index into MultiScriptArray parsed from the active
++// installation's main.scm; no byte offsets are guessed here.
++static const char *gVrMissionNames[] = {
++	"Initial", "Intro", "An Old Friend", "The Party", "Back Alley Brawl",
++	"Jury Fury", "Riot", "Treacherous Swine", "Mall Shootout",
++	"Guardian Angels", "Sir, Yes Sir!", "All Hands On Deck!", "The Chase",
++	"Phnom Penh '86", "The Fastest Boat", "Supply & Demand", "Rub Out",
++	"Death Row", "Four Iron", "Demolition Man", "Two Bit Hit", "No Escape?",
++	"The Shootist", "The Driver", "The Job", "Gun Runner",
++	"Boomshine Saigon", "Recruitment Drive", "Dildo Dodo",
++	"Martha's Mug Shot", "G-spotlight", "Shakedown", "Bar Brawl", "Cop Land",
++	"Spilling the Beans", "Hit the Courier", "Printworks Buy",
++	"Sunshine Autos", "Interglobal Films Buy", "Cherry Popper Icecreams Buy",
++	"Kaufman Cabs Buy", "Malibu Club Buy", "The Boatyard Buy",
++	"Pole Position Club Buy", "El Swanko Casa Buy", "Links View Apartment Buy",
++	"Hyman Condo Buy", "Ocean Heighs Aprt. Buy", "1102 Washington Street Buy",
++	"Vice Point Buy", "Skumole Shack Buy", "Cap the Collector",
++	"Keep your Friends Close...", "Alloy Wheels of Steel",
++	"Messing with the Man", "Hog Tied", "Stunt Boat Challenge",
++	"Cannon Fodder", "Naval Engagement", "Trojan Voodoo", "Juju Scramble",
++	"Bombs Away!", "Dirty Lickin's", "Love Juice", "Psycho Killer",
++	"Publicity Tour", "Weapon Range", "Road Kill", "Waste the Wife", "Autocide",
++	"Check Out at the Check In", "Loose Ends", "V.I.P.", "Friendly Rivalry",
++	"Cabmaggedon", "TAXI DRIVER", "PARAMEDIC", "FIREFIGHTER", "VIGILANTE",
++	"HOTRING", "BLOODRING", "DIRTRING", "Sunshine Autos Races",
++	"Distribution", "Downtown Chopper Checkpoint",
++	"Ocean Beach Chopper Checkpoint", "Vice Point Chopper Checkpoint",
++	"Little Haiti Chopper Checkpoint", "Trial by Dirt", "Test Track",
++	"PCJ Playground", "Cone Crazy", "PIZZA BOY", "RC Raider Pickup",
++	"RC Bandit Race", "RC Baron Race", "Checkpoint Charlie"
++};
++
++static const uint8 gVrStoryMissions[] = {
++	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
++	19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
++	51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
++	68, 69, 70, 71
++};
++static const uint8 gVrAssetAndProfessionMissions[] = {
++	36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
++	72, 73, 74, 75, 76, 77, 78, 82, 83, 92, 96
++};
++static const uint8 gVrSideActivityMissions[] = {
++	79, 80, 81, 84, 85, 86, 87, 88, 89, 90, 91, 93, 94, 95
++};
++
++static_assert(ARRAY_SIZE(gVrMissionNames) == 97,
++	"VR mission names must match the Vice City mission table");
++static_assert(ARRAY_SIZE(gVrStoryMissions)+
++	ARRAY_SIZE(gVrAssetAndProfessionMissions)+
++	ARRAY_SIZE(gVrSideActivityMissions) == ARRAY_SIZE(gVrMissionNames),
++	"Every VR mission must appear exactly once");
++
++static const uint8 *
++GetVrMissionCategoryEntries(int category, int *count)
++{
++	if(!count)
++		return nil;
++	switch(category){
++	case VR_MISSION_CATEGORY_STORY:
++		*count = ARRAY_SIZE(gVrStoryMissions);
++		return gVrStoryMissions;
++	case VR_MISSION_CATEGORY_ASSETS:
++		*count = ARRAY_SIZE(gVrAssetAndProfessionMissions);
++		return gVrAssetAndProfessionMissions;
++	case VR_MISSION_CATEGORY_ACTIVITIES:
++		*count = ARRAY_SIZE(gVrSideActivityMissions);
++		return gVrSideActivityMissions;
++	default:
++		*count = 0;
++		return nil;
++	}
++}
++
+ struct VrMissionPassEntry
+ {
+ 	const char *scriptName;
+@@ -827,6 +942,20 @@ SetVrGodMode(bool enabled)
+ 	CWorld::Players[CWorld::PlayerInFocus].m_bFireproof = false;
+ }
+ 
++static void
++ApplyVrRunWithoutLimits(void)
++{
++	if(!IsVrRunWithoutLimitsEnabled())
++		return;
++	CPlayerPed *player = FindPlayerPed();
++	if(!player)
++		return;
++	// Refill every frame so enabling the toggle while already exhausted takes
++	// effect immediately and a newly-created player inherits the cheat.
++	player->m_fCurrentStamina = player->m_fMaxStamina;
++	player->m_fStaminaProgress = 0.0f;
++}
++
+ static bool
+ IsVrCycleCarModel(int model)
+ {
+@@ -884,23 +1013,172 @@ GetVrVehicleModelName(int model)
+ 
+ int GetVrCheatCount(void)
+ {
+-	return 4+ARRAY_SIZE(gVrCheatNames);
++	return VR_SPECIAL_CHEAT_COUNT+ARRAY_SIZE(gVrCheatNames);
++}
++
++bool GetVrCheatToggleState(int index, bool *enabled)
++{
++	if(!enabled)
++		return false;
++	if(index == VR_SPECIAL_GOD_MODE){
++		*enabled = gVrGodModeEnabled;
++		return true;
++	}
++	if(index == VR_SPECIAL_RUN_WITHOUT_LIMITS){
++		*enabled = IsVrRunWithoutLimitsEnabled();
++		return true;
++	}
++	return false;
++}
++
++int GetVrMissionCategoryCount(void)
++{
++	return VR_MISSION_CATEGORY_COUNT;
++}
++
++const char *GetVrMissionCategoryName(int category)
++{
++	switch(category){
++	case VR_MISSION_CATEGORY_STORY: return "STORY / CONTACT MISSIONS";
++	case VR_MISSION_CATEGORY_ASSETS: return "ASSETS / PROFESSIONS";
++	case VR_MISSION_CATEGORY_ACTIVITIES: return "SIDE ACTIVITIES";
++	default: return "UNKNOWN";
++	}
++}
++
++int GetVrMissionCount(int category)
++{
++	int count = 0;
++	GetVrMissionCategoryEntries(category, &count);
++	return count;
++}
++
++const char *GetVrMissionName(int category, int item)
++{
++	static char label[112];
++	int count = 0;
++	const uint8 *entries = GetVrMissionCategoryEntries(category, &count);
++	if(!entries || item < 0 || item >= count)
++		return "UNKNOWN";
++	const int mission = entries[item];
++	sprintf(label, "%02d  %s", mission, gVrMissionNames[mission]);
++	return label;
++}
++
++bool ActivateVrMission(int category, int item)
++{
++	int count = 0;
++	const uint8 *entries = GetVrMissionCategoryEntries(category, &count);
++	if(!FindPlayerPed() || !entries || item < 0 || item >= count)
++		return false;
++#ifdef MISSION_SWITCHER
++	if(!CTheScripts::TrySwitchToMission(entries[item]))
++		return false;
++	CPad::bHasPlayerCheated = true;
++	return true;
++#else
++	return false;
++#endif
++}
++
++static int
++FindVrCycleCarModelDirection(int start, int direction)
++{
++	const int count = MI_LAST_VEHICLE-MI_FIRST_VEHICLE+1;
++	direction = direction < 0 ? -1 : 1;
++	int model = start;
++	while(model < MI_FIRST_VEHICLE) model += count;
++	while(model > MI_LAST_VEHICLE) model -= count;
++	for(int checked = 0; checked < count; checked++){
++		if(IsVrCycleCarModel(model)) return model;
++		model += direction;
++		if(model > MI_LAST_VEHICLE) model = MI_FIRST_VEHICLE;
++		if(model < MI_FIRST_VEHICLE) model = MI_LAST_VEHICLE;
++	}
++	return -1;
++}
++
++static void
++CycleVrModelIndex(int &index, int count, int direction)
++{
++	if(count > 0 && direction != 0)
++		index = (index+count+(direction > 0 ? 1 : -1))%count;
++}
++
++bool
++CycleVrCheatSelection(int index, int direction)
++{
++	if(direction == 0) return false;
++	if(index == VR_SPECIAL_SPAWN_NEXT_CAR){
++		const int current = FindVrCycleCarModel(gVrCycleCarCursor);
++		if(current < 0) return false;
++		gVrCycleCarCursor = FindVrCycleCarModelDirection(
++			current+(direction > 0 ? 1 : -1), direction);
++		return gVrCycleCarCursor >= 0;
++	}
++	if(index == VR_SPECIAL_SPAWN_NEXT_MOTORCYCLE)
++		CycleVrModelIndex(gVrCycleBikeIndex,
++			ARRAY_SIZE(gVrCycleBikeModels), direction);
++	else if(index == VR_SPECIAL_SPAWN_NEXT_HELICOPTER)
++		CycleVrModelIndex(gVrCycleHelicopterIndex,
++			ARRAY_SIZE(gVrCycleHelicopterModels), direction);
++	else if(index == VR_SPECIAL_SPAWN_NEXT_AIRPLANE)
++		CycleVrModelIndex(gVrCycleAirplaneIndex,
++			ARRAY_SIZE(gVrCycleAirplaneModels), direction);
++	else
++		return false;
++	return true;
++}
++
++static bool
++OpenVrStoryBridges(void)
++{
++	if(CPools::GetObjectPool() == nil || ThePaths.m_numCarPathNodes <= 0)
++		return false;
++	int changed = 0;
++	for(int i = CPools::GetObjectPool()->GetSize()-1; i >= 0; i--){
++		CObject *object = CPools::GetObjectPool()->GetSlot(i);
++		if(!object || object->ObjectCreatedBy != MISSION_OBJECT ||
++		   object->bIsPickup) continue;
++		const CVector position = object->GetPosition();
++		bool onClosedPath = false;
++		for(int n = 0; n < ThePaths.m_numCarPathNodes; n++){
++			if(!ThePaths.m_pathNodes[n].bDisabled ||
++			   ThePaths.WasDisabledByMap(n)) continue;
++			const CVector node = ThePaths.m_pathNodes[n].GetPosition();
++			if(Abs(node.z-position.z) < 5.0f &&
++			   (CVector2D(node.x,node.y)-CVector2D(position.x,position.y)).
++				MagnitudeSqr() < 144.0f){ onClosedPath = true; break; }
++		}
++		if(!onClosedPath) continue;
++		CWorld::Remove(object);
++		object->SetPosition(CVector(position.x, position.y, position.z-500.0f));
++		object->GetMatrix().UpdateRW(); object->UpdateRwFrame();
++		CWorld::Add(object); changed++;
++	}
++	for(int n = 0; n < ThePaths.m_numCarPathNodes; n++)
++		if(ThePaths.m_pathNodes[n].bDisabled &&
++		   !ThePaths.WasDisabledByMap(n)){
++			ThePaths.m_pathNodes[n].bDisabled = false; changed++;
++		}
++	return changed != 0;
+ }
+ 
+ const char *GetVrCheatName(int index)
+ {
+ 	static char carName[64];
+ 	static char bikeName[64];
+-	if(index == 0)
++	static char helicopterName[64];
++	static char airplaneName[64];
++	if(index == VR_SPECIAL_PASS_CURRENT_MISSION)
+ 		return "PASS CURRENT MISSION";
+-	index--;
+-	if(index == 0){
++	if(index == VR_SPECIAL_SPAWN_NEXT_CAR){
+ 		const int model = FindVrCycleCarModel(gVrCycleCarCursor);
+ 		sprintf(carName, "SPAWN NEXT CAR - %s",
+ 			GetVrVehicleModelName(model));
+ 		return carName;
+ 	}
+-	if(index == 1){
++	if(index == VR_SPECIAL_SPAWN_NEXT_MOTORCYCLE){
+ 		const int model =
+ 			gVrCycleBikeModels[gVrCycleBikeIndex %
+ 				ARRAY_SIZE(gVrCycleBikeModels)];
+@@ -908,12 +1186,33 @@ const char *GetVrCheatName(int index)
+ 			GetVrVehicleModelName(model));
+ 		return bikeName;
+ 	}
+-	if(index == 2)
++	if(index == VR_SPECIAL_SPAWN_NEXT_HELICOPTER){
++		const int model = gVrCycleHelicopterModels[gVrCycleHelicopterIndex %
++			ARRAY_SIZE(gVrCycleHelicopterModels)];
++		sprintf(helicopterName, "SPAWN HELICOPTER - %s",
++			GetVrVehicleModelName(model));
++		return helicopterName;
++	}
++	if(index == VR_SPECIAL_SPAWN_NEXT_AIRPLANE){
++		const int model = gVrCycleAirplaneModels[gVrCycleAirplaneIndex %
++			ARRAY_SIZE(gVrCycleAirplaneModels)];
++		sprintf(airplaneName, "SPAWN AIRPLANE - %s",
++			GetVrVehicleModelName(model));
++		return airplaneName;
++	}
++	if(index == VR_SPECIAL_GOD_MODE)
+ 		return gVrGodModeEnabled ?
+ 			"GOD MODE - ON" : "GOD MODE - OFF";
+-	index -= 3;
+-	return index >= 0 && index < (int)ARRAY_SIZE(gVrCheatNames) ?
+-		gVrCheatNames[index] : "UNKNOWN";
++	if(index == VR_SPECIAL_RUN_WITHOUT_LIMITS)
++		return IsVrRunWithoutLimitsEnabled() ?
++			"RUN WITHOUT LIMITS - ON" : "RUN WITHOUT LIMITS - OFF";
++	if(index == VR_SPECIAL_OPEN_STORY_BRIDGES)
++		return "OPEN STORY BRIDGES";
++	if(index == VR_SPECIAL_UNLOCK_SIX_STAR_WANTED_CAP)
++		return "UNLOCK 6-STAR WANTED CAP";
++	const int legacy = index-VR_SPECIAL_CHEAT_COUNT;
++	return legacy >= 0 && legacy < (int)ARRAY_SIZE(gVrCheatNames) ?
++		gVrCheatNames[legacy] : "UNKNOWN";
+ }
+ 
+ const char *GetVrCurrentWeaponName(void)
+@@ -954,10 +1253,9 @@ bool IsVrWeaponSlotOwned(int slot)
+ 
+ bool ActivateVrCheat(int index)
+ {
+-	if(index == 0)
++	if(index == VR_SPECIAL_PASS_CURRENT_MISSION)
+ 		return PassCurrentVrMission();
+-	index--;
+-	if(index == 0){
++	if(index == VR_SPECIAL_SPAWN_NEXT_CAR){
+ 		if(!FindPlayerPed())
+ 			return false;
+ 		const int model = FindVrCycleCarModel(gVrCycleCarCursor);
+@@ -968,7 +1266,7 @@ bool ActivateVrCheat(int index)
+ 			model+1 : MI_FIRST_VEHICLE;
+ 		return true;
+ 	}
+-	if(index == 1){
++	if(index == VR_SPECIAL_SPAWN_NEXT_MOTORCYCLE){
+ 		if(!FindPlayerPed())
+ 			return false;
+ 		const int model =
+@@ -979,13 +1277,45 @@ bool ActivateVrCheat(int index)
+ 			(gVrCycleBikeIndex+1) % ARRAY_SIZE(gVrCycleBikeModels);
+ 		return true;
+ 	}
+-	if(index == 2){
++	if(index == VR_SPECIAL_SPAWN_NEXT_HELICOPTER){
++		if(!FindPlayerPed()) return false;
++		VehicleCheat(gVrCycleHelicopterModels[gVrCycleHelicopterIndex %
++			ARRAY_SIZE(gVrCycleHelicopterModels)]);
++		gVrCycleHelicopterIndex = (gVrCycleHelicopterIndex+1)%
++			ARRAY_SIZE(gVrCycleHelicopterModels);
++		return true;
++	}
++	if(index == VR_SPECIAL_SPAWN_NEXT_AIRPLANE){
++		if(!FindPlayerPed()) return false;
++		VehicleCheat(gVrCycleAirplaneModels[gVrCycleAirplaneIndex %
++			ARRAY_SIZE(gVrCycleAirplaneModels)]);
++		gVrCycleAirplaneIndex = (gVrCycleAirplaneIndex+1)%
++			ARRAY_SIZE(gVrCycleAirplaneModels);
++		return true;
++	}
++	if(index == VR_SPECIAL_GOD_MODE){
+ 		if(!FindPlayerPed())
+ 			return false;
+ 		SetVrGodMode(!gVrGodModeEnabled);
+ 		return true;
+ 	}
+-	const int legacyIndex = index-3;
++	if(index == VR_SPECIAL_RUN_WITHOUT_LIMITS){
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		OculusVR::SetRunWithoutLimitsEnabled(
++			!OculusVR::IsRunWithoutLimitsEnabled());
++		ApplyVrRunWithoutLimits();
++		return true;
++#else
++		return false;
++#endif
++	}
++	if(index == VR_SPECIAL_OPEN_STORY_BRIDGES)
++		return OpenVrStoryBridges();
++	if(index == VR_SPECIAL_UNLOCK_SIX_STAR_WANTED_CAP){
++		CWanted::SetMaximumWantedLevel(6);
++		return true;
++	}
++	const int legacyIndex = index-VR_SPECIAL_CHEAT_COUNT;
+ 	// Weather and time-of-day effects are harmless before a player exists; all
+ 	// other cheats are deliberately rejected while in the front end.
+ 	if(!FindPlayerPed() && !(legacyIndex >= 38 && legacyIndex <= 43))
+@@ -2114,6 +2444,7 @@ void CPad::UpdatePads(void)
+ 		OculusVR::ToggleCheatMenu();
+ #endif
+ 	ApplyVrGodMode();
++	ApplyVrRunWithoutLimits();
+ }
+ 
+ void CPad::ProcessPCSpecificStuff(void)
+diff --git a/src/core/World.cpp b/src/core/World.cpp
+index d94706d..0dacb66 100644
+--- a/src/core/World.cpp
++++ b/src/core/World.cpp
+@@ -24,6 +24,12 @@
+ #include "WaterLevel.h"
+ #include "World.h"
+ 
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++#include "../skel/android/QuestProfiler.h"
++#include "PhysicsDirector.h"
++#define QUEST_WORLD_SIM_PROFILER
++#endif
++
+ #define OBJECT_REPOSITION_OFFSET_Z 2.0f
+ 
+ CColPoint gaTempSphereColPoints[MAX_COLLISION_POINTS];
+@@ -1921,9 +1927,29 @@ CWorld::RemoveStaticObjects()
+ void
+ CWorld::Process(void)
+ {
++#ifdef QUEST_WORLD_SIM_PROFILER
++	const bool profileWorldSimulation = androidgame::QuestProfilerIsEnabled();
++	androidgame::QuestWorldSimSample worldSimSample = {};
++	const uint64 worldSimulationStart = profileWorldSimulation ?
++		androidgame::QuestProfilerNowNanoseconds() : 0;
++	auto worldEntityClass = [](CEntity *entity) -> int32 {
++		if(entity->IsPed())
++			return androidgame::QUEST_WORLD_ENTITY_PED;
++		if(entity->IsVehicle())
++			return androidgame::QUEST_WORLD_ENTITY_VEHICLE;
++		if(entity->IsObject())
++			return androidgame::QUEST_WORLD_ENTITY_OBJECT;
++		return -1;
++	};
++	androidgame::QuestPhysicsDirectorBeginFrame(profileWorldSimulation);
++#endif
+ 	if(!(CTimer::GetFrameCounter() & 63)) CReferences::PruneAllReferencesInWorld();
+ 
+ 	if(bProcessCutsceneOnly) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++		const uint64 cutsceneStart = profileWorldSimulation ?
++			androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 		for(int i = 0; i < NUMCUTSCENEOBJECTS; i++) {
+ 			CCutsceneObject *csObj = CCutsceneMgr::GetCutsceneObject(i);
+ 			if(csObj && csObj->m_entryInfoList.first) {
+@@ -1945,14 +1971,36 @@ CWorld::Process(void)
+ 		}
+ 		CRecordDataForChase::ProcessControlCars();
+ 		CRecordDataForChase::SaveOrRetrieveCarPositions();
++#ifdef QUEST_WORLD_SIM_PROFILER
++		if(profileWorldSimulation)
++			worldSimSample.cutsceneNs +=
++				androidgame::QuestProfilerNowNanoseconds()-cutsceneStart;
++#endif
+ 	} else {
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++		// Dispatch from an immutable pre-simulation snapshot. The worker runs
++		// alongside animation/control preparation; every consumer remains
++		// non-blocking and falls back to the original sector scan on a miss.
++		CCarCtrl::BeginVrTrafficJobFrame();
++#endif
+ 		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 			CEntity *movingEnt = (CEntity *)node->item;
+ 			if(!movingEnt->bRemoveFromWorld && movingEnt->m_rwObject && RwObjectGetType(movingEnt->m_rwObject) == rpCLUMP &&
+ 			   RpAnimBlendClumpGetFirstAssociation(movingEnt->GetClump())) {
+-				if (movingEnt->IsObject())
++				if (movingEnt->IsObject()) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++					const uint64 animationStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					RpAnimBlendClumpUpdateAnimations(movingEnt->GetClump(), CTimer::GetTimeStepNonClippedInSeconds());
+-							else {
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(profileWorldSimulation) {
++						worldSimSample.animationNs[androidgame::QUEST_WORLD_ENTITY_OBJECT] +=
++							androidgame::QuestProfilerNowNanoseconds()-animationStart;
++						worldSimSample.animationCalls[androidgame::QUEST_WORLD_ENTITY_OBJECT]++;
++					}
++#endif
++				} else {
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ 					// The desktop camera no longer describes what the player can see:
+ 					// the headset may be looking anywhere around it. Never leave a ped
+@@ -1960,34 +2008,86 @@ CWorld::Process(void)
+ 					// it happens to enter the monitor camera frustum.
+ 					if (movingEnt->IsPed()) {
+ 						movingEnt->bOffscreen = false;
++#ifdef QUEST_WORLD_SIM_PROFILER
++						const uint64 animationStart = profileWorldSimulation ?
++							androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 						RpAnimBlendClumpUpdateAnimations(movingEnt->GetClump(), CTimer::GetTimeStepInSeconds(), true);
++#ifdef QUEST_WORLD_SIM_PROFILER
++						if(profileWorldSimulation) {
++							worldSimSample.animationNs[androidgame::QUEST_WORLD_ENTITY_PED] +=
++								androidgame::QuestProfilerNowNanoseconds()-animationStart;
++							worldSimSample.animationCalls[androidgame::QUEST_WORLD_ENTITY_PED]++;
++						}
++#endif
+ 					} else
+ #endif
+ 					{
+ 						if (!movingEnt->bOffscreen)
+ 							movingEnt->bOffscreen = !movingEnt->GetIsOnScreen();
++#ifdef QUEST_WORLD_SIM_PROFILER
++						const int32 entityClass = profileWorldSimulation ?
++							worldEntityClass(movingEnt) : -1;
++						const uint64 animationStart = profileWorldSimulation ?
++							androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 						RpAnimBlendClumpUpdateAnimations(movingEnt->GetClump(), CTimer::GetTimeStepInSeconds(), !movingEnt->bOffscreen);
++#ifdef QUEST_WORLD_SIM_PROFILER
++						if(entityClass >= 0) {
++							worldSimSample.animationNs[entityClass] +=
++								androidgame::QuestProfilerNowNanoseconds()-animationStart;
++							worldSimSample.animationCalls[entityClass]++;
++						}
++#endif
+ 					}
+ 				}
+ 			}
+ 		}
+-		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
++		for(CPtrNode *node = ms_listMovingEntityPtrs.first, *next; node; node = next) {
++			next = node->next;
+ 			CPhysical *movingEnt = (CPhysical *)node->item;
+ 			if(movingEnt->bRemoveFromWorld) {
+ 				RemoveEntityInsteadOfProcessingIt(movingEnt);
+ 			} else {
++#ifdef QUEST_WORLD_SIM_PROFILER
++				const int32 entityClass = profileWorldSimulation ?
++					worldEntityClass(movingEnt) : -1;
++				const uint64 controlStart = profileWorldSimulation ?
++					androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 				movingEnt->ProcessControl();
++#ifdef QUEST_WORLD_SIM_PROFILER
++				if(entityClass >= 0) {
++					worldSimSample.controlNs[entityClass] +=
++						androidgame::QuestProfilerNowNanoseconds()-controlStart;
++					worldSimSample.controlCalls[entityClass]++;
++				}
++#endif
+ 				if(movingEnt->GetIsStatic()) { movingEnt->RemoveFromMovingList(); }
+ 			}
+ 		}
+ 		bForceProcessControl = true;
+-		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
++		for(CPtrNode *node = ms_listMovingEntityPtrs.first, *next; node; node = next) {
++			next = node->next;
+ 			CPhysical *movingEnt = (CPhysical *)node->item;
+ 			if(movingEnt->bWasPostponed) {
+ 				if(movingEnt->bRemoveFromWorld) {
+ 					RemoveEntityInsteadOfProcessingIt(movingEnt);
+ 				} else {
++#ifdef QUEST_WORLD_SIM_PROFILER
++					const int32 entityClass = profileWorldSimulation ?
++						worldEntityClass(movingEnt) : -1;
++					const uint64 controlStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->ProcessControl();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0) {
++						worldSimSample.postponedControlNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-controlStart;
++						worldSimSample.postponedControlCalls[entityClass]++;
++					}
++#endif
+ 					if(movingEnt->GetIsStatic()) { movingEnt->RemoveFromMovingList(); }
+ 				}
+ 			}
+@@ -1997,17 +2097,48 @@ CWorld::Process(void)
+ 			for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 				CEntity *movingEnt = (CEntity *)node->item;
+ 				movingEnt->bIsInSafePosition = true;
++#ifdef QUEST_WORLD_SIM_PROFILER
++				const int32 entityClass = profileWorldSimulation ?
++					worldEntityClass(movingEnt) : -1;
++				const uint64 transformStart = profileWorldSimulation ?
++					androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 				movingEnt->GetMatrix().UpdateRW();
+ 				movingEnt->UpdateRwFrame();
++#ifdef QUEST_WORLD_SIM_PROFILER
++				if(entityClass >= 0)
++					worldSimSample.transformNs[entityClass] +=
++						androidgame::QuestProfilerNowNanoseconds()-transformStart;
++#endif
+ 			}
+ 		} else {
+ 			bNoMoreCollisionTorque = false;
+ 			for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 				CEntity *movingEnt = (CEntity *)node->item;
+ 				if(!movingEnt->bIsInSafePosition) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++					const int32 entityClass = profileWorldSimulation ?
++						worldEntityClass(movingEnt) : -1;
++					const uint64 collisionStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->ProcessCollision();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0) {
++						worldSimSample.collisionNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-collisionStart;
++						worldSimSample.collisionCalls[entityClass]++;
++					}
++					const uint64 transformStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->GetMatrix().UpdateRW();
+ 					movingEnt->UpdateRwFrame();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0)
++						worldSimSample.transformNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-transformStart;
++#endif
+ 				}
+ 			}
+ 			bNoMoreCollisionTorque = true;
+@@ -2015,9 +2146,29 @@ CWorld::Process(void)
+ 				for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 					CEntity *movingEnt = (CEntity *)node->item;
+ 					if(!movingEnt->bIsInSafePosition) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++						const int32 entityClass = profileWorldSimulation ?
++							worldEntityClass(movingEnt) : -1;
++						const uint64 collisionStart = profileWorldSimulation ?
++							androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 						movingEnt->ProcessCollision();
++#ifdef QUEST_WORLD_SIM_PROFILER
++						if(entityClass >= 0) {
++							worldSimSample.collisionNs[entityClass] +=
++								androidgame::QuestProfilerNowNanoseconds()-collisionStart;
++							worldSimSample.collisionCalls[entityClass]++;
++						}
++						const uint64 transformStart = profileWorldSimulation ?
++							androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 						movingEnt->GetMatrix().UpdateRW();
+ 						movingEnt->UpdateRwFrame();
++#ifdef QUEST_WORLD_SIM_PROFILER
++						if(entityClass >= 0)
++							worldSimSample.transformNs[entityClass] +=
++								androidgame::QuestProfilerNowNanoseconds()-transformStart;
++#endif
+ 					}
+ 				}
+ 			}
+@@ -2025,9 +2176,29 @@ CWorld::Process(void)
+ 				CEntity *movingEnt = (CEntity *)node->item;
+ 				if(!movingEnt->bIsInSafePosition) {
+ 					movingEnt->bIsStuck = true;
++#ifdef QUEST_WORLD_SIM_PROFILER
++					const int32 entityClass = profileWorldSimulation ?
++						worldEntityClass(movingEnt) : -1;
++					const uint64 collisionStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->ProcessCollision();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0) {
++						worldSimSample.collisionNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-collisionStart;
++						worldSimSample.collisionCalls[entityClass]++;
++					}
++					const uint64 transformStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->GetMatrix().UpdateRW();
+ 					movingEnt->UpdateRwFrame();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0)
++						worldSimSample.transformNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-transformStart;
++#endif
+ 					if(!movingEnt->bIsInSafePosition) { movingEnt->bIsStuck = true; }
+ 				}
+ 			}
+@@ -2035,9 +2206,29 @@ CWorld::Process(void)
+ 			for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 				CEntity *movingEnt = (CEntity *)node->item;
+ 				if(!movingEnt->bIsInSafePosition) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++					const int32 entityClass = profileWorldSimulation ?
++						worldEntityClass(movingEnt) : -1;
++					const uint64 shiftStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->ProcessShift();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0) {
++						worldSimSample.shiftNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-shiftStart;
++						worldSimSample.shiftCalls[entityClass]++;
++					}
++					const uint64 transformStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->GetMatrix().UpdateRW();
+ 					movingEnt->UpdateRwFrame();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0)
++						worldSimSample.transformNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-transformStart;
++#endif
+ 					if(!movingEnt->bIsInSafePosition) { movingEnt->bIsStuck = true; }
+ 				}
+ 			}
+@@ -2045,9 +2236,29 @@ CWorld::Process(void)
+ 			for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 				CPhysical *movingEnt = (CPhysical *)node->item;
+ 				if(!movingEnt->bIsInSafePosition) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++					const int32 entityClass = profileWorldSimulation ?
++						worldEntityClass(movingEnt) : -1;
++					const uint64 shiftStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->ProcessShift();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0) {
++						worldSimSample.shiftNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-shiftStart;
++						worldSimSample.shiftCalls[entityClass]++;
++					}
++					const uint64 transformStart = profileWorldSimulation ?
++						androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 					movingEnt->GetMatrix().UpdateRW();
+ 					movingEnt->UpdateRwFrame();
++#ifdef QUEST_WORLD_SIM_PROFILER
++					if(entityClass >= 0)
++						worldSimSample.transformNs[entityClass] +=
++							androidgame::QuestProfilerNowNanoseconds()-transformStart;
++#endif
+ 					if(!movingEnt->bIsInSafePosition) {
+ 						movingEnt->bIsStuck = true;
+ 						if(movingEnt->GetStatus() == STATUS_PLAYER) {
+@@ -2063,6 +2274,10 @@ CWorld::Process(void)
+ 		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 			CPed *movingPed = (CPed *)node->item;
+ 			if(movingPed->IsPed()) {
++#ifdef QUEST_WORLD_SIM_PROFILER
++				const uint64 attachmentStart = profileWorldSimulation ?
++					androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 				if(movingPed->bInVehicle && movingPed->m_nPedState != PED_EXIT_TRAIN ||
+ 				   movingPed->EnteringCar()) {
+ 					CVehicle *movingCar = movingPed->m_pMyVehicle;
+@@ -2098,6 +2313,11 @@ CWorld::Process(void)
+ 					movingPed->GetMatrix().UpdateRW();
+ 					movingPed->UpdateRwFrame();
+ 				}
++#ifdef QUEST_WORLD_SIM_PROFILER
++				if(profileWorldSimulation)
++					worldSimSample.pedAttachmentNs +=
++						androidgame::QuestProfilerNowNanoseconds()-attachmentStart;
++#endif
+ 			}
+ 		}
+ 		CMessages::Process();
+@@ -2109,6 +2329,13 @@ CWorld::Process(void)
+ 			RemoveFallenCars();
+ 		}
+ 	}
++#ifdef QUEST_WORLD_SIM_PROFILER
++	if(profileWorldSimulation) {
++		worldSimSample.worldTotalNs =
++			androidgame::QuestProfilerNowNanoseconds()-worldSimulationStart;
++		androidgame::QuestProfilerSubmitWorldSimSample(worldSimSample);
++	}
++#endif
+ }
+ 
+ void
+diff --git a/src/core/main.cpp b/src/core/main.cpp
+index ac73ade..b4bd0eb 100644
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -24,6 +24,7 @@
+ #include "Draw.h"
+ #include "Sprite2d.h"
+ #include "Renderer.h"
++#include "Occlusion.h"
+ #include "Coronas.h"
+ #include "WaterLevel.h"
+ #include "Weather.h"
+@@ -292,6 +293,13 @@ DoRWStuffStartOfFrame_Horizon(int16 TopRed, int16 TopGreen, int16 TopBlue, int16
+ 
+ 	TheCamera.m_viewMatrix.Update();
+ #ifdef RW_VULKAN
++	// ConstructRenderList runs before the HMD pose replaces the gameplay
++	// camera. Rebuild the 2D occluder silhouettes from the actual Quest view
++	// before per-view building submission.
++	if(CRenderer::GetVrOcclusionCullingMode() >=
++	   VR_OCCLUSION_CULLING_AUTHORED){
++		CRenderer::PrepareQuestOcclusionContexts();
++	}
+ 	// The sky gradient is drawn as full-screen 2D quads, which on the headset
+ 	// end up on the floating panel: a glassy rectangle hanging mid-view. Feed
+ 	// the sky colour to the backend as the clear colour instead, so it fills
+@@ -1338,6 +1346,16 @@ DisplayGameDebugText()
+ }
+ #endif
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++#define QUEST_RENDER_PROFILE_BEGIN(phase) \
++	androidgame::QuestProfilerBeginPhase(phase)
++#define QUEST_RENDER_PROFILE_END(phase) \
++	androidgame::QuestProfilerEndPhase(phase)
++#else
++#define QUEST_RENDER_PROFILE_BEGIN(phase) ((void)0)
++#define QUEST_RENDER_PROFILE_END(phase) ((void)0)
++#endif
++
+ #ifdef NEW_RENDERER
+ bool gbRenderRoads = true;
+ bool gbRenderEverythingBarRoads = true;
+@@ -1359,23 +1377,36 @@ MattRenderScene(void)
+ 	/// CRenderer::ClearForFrame();		// before ConstructRenderList
+ 	// CClock::CalcEnvMapTimeMultiplicator
+ 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WATER);
+ 	CWaterLevel::RenderWater();	// actually CMattRenderer::RenderWater
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WATER);
+ 	// CClock::ms_EnvMapTimeMultiplicator = 1.0f;
+ 	// cWorldStream::ClearDynamics
+ 	/// CRenderer::ConstructRenderList();	// before PreRender
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ if(gbRenderWorld0)
+ 	CRenderer::RenderWorld(0);	// roads
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ 	// CMattRenderer::ResetRenderStates
+ 	/// CRenderer::PreRender();	// has to be called before BeginUpdate because of cutscene shadows
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_REFLECTIONS);
+ 	CCoronas::RenderReflections();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_REFLECTIONS);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ if(gbRenderWorld1)
+ 	CRenderer::RenderWorld(1);	// opaque
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ if(gbRenderRoads)
+ 	CRenderer::RenderRoads();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ 
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ 	CRenderer::RenderPeds();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ 
+ 	// not sure where to put these since LCS has no underwater entities
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WATER);
+ if(gbRenderBoats)
+ 	CRenderer::RenderBoats();
+ if(gbRenderFadingInUnderwaterEntities)
+@@ -1383,9 +1414,12 @@ if(gbRenderFadingInUnderwaterEntities)
+ 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+ if(gbRenderWater)
+ 	CRenderer::RenderTransparentWater();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WATER);
+ 
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ if(gbRenderEverythingBarRoads)
+ 	CRenderer::RenderEverythingBarRoads();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ 	// seam fixer
+ 	// moved this:
+ 	// CRenderer::RenderFadingInEntities();
+@@ -1395,8 +1429,10 @@ void
+ RenderScene_new(void)
+ {
+ 	PUSH_RENDERGROUP("RenderScene_new");
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_SKY);
+ 	CClouds::Render();
+ 	DoRWRenderHorizon();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_SKY);
+ 
+ 	MattRenderScene();
+ 	DefinedState();
+@@ -1411,13 +1447,16 @@ void
+ RenderEffects_new(void)
+ {
+ 	PUSH_RENDERGROUP("RenderEffects_new");
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 	CShadows::RenderStaticShadows();
+ 	// CRenderer::GenerateEnvironmentMap
+ 	CShadows::RenderStoredShadows();
+ 	CSkidmarks::Render();
+ 	CRubbish::Render();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 
+ 	// these aren't really effects
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ 	DefinedState();
+ 	if(FredIsInFirstPersonCam()){
+ 		DefinedState();
+@@ -1433,23 +1472,39 @@ if(gbRenderWorld2)
+ if(gbRenderVehicles)
+ 		CRenderer::RenderVehicles();
+ 	}
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ 	// better render these after transparent world
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_FADING);
+ if(gbRenderFadingInEntities)
+ 	CRenderer::RenderFadingInEntities();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_FADING);
+ 
+ 	// actual effects here
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 	CGlass::Render();
+ 	// CMattRenderer::ResetRenderStates
+ 	DefinedState();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WEATHER);
+ 	CCoronas::RenderSunReflection();
+ 	CWeather::RenderRainStreaks();
+ 	// CWeather::AddSnow
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WEATHER);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 	CWaterCannons::Render();
+ 	CAntennas::Render();
+ 	CSpecialFX::Render();
+ 	CRopes::Render();
+ 	CCoronas::Render();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerBeginPhase(
++		androidgame::QUEST_PROFILER_PHASE_PARTICLE_RENDER);
++#endif
+ 	CParticle::Render();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerEndPhase(
++		androidgame::QUEST_PROFILER_PHASE_PARTICLE_RENDER);
++#endif
+ 	CPacManPickups::Render();
+ 	CWeaponEffects::Render();
+ 	CPointLights::RenderFogEffect();
+@@ -1462,6 +1517,7 @@ if(gbRenderFadingInEntities)
+ 	androidgame::RenderTrackedHands();
+ #endif
+ #endif
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 	POP_RENDERGROUP();
+ }
+ #endif
+@@ -1476,21 +1532,35 @@ RenderScene(void)
+ 	}
+ #endif
+ 	PUSH_RENDERGROUP("RenderScene");
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_SKY);
+ 	CClouds::Render();
+ 	DoRWRenderHorizon();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_SKY);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ 	CRenderer::RenderRoads();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_REFLECTIONS);
+ 	CCoronas::RenderReflections();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_REFLECTIONS);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
+ 	CRenderer::RenderEverythingBarRoads();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WORLD);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WATER);
+ 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+ 	CWaterLevel::RenderWater();
+ 	CRenderer::RenderBoats();
+ 	CRenderer::RenderFadingInUnderwaterEntities();
+ 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+ 	CWaterLevel::RenderTransparentWater();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WATER);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_FADING);
+ 	CRenderer::RenderFadingInEntities();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_FADING);
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_WEATHER);
+ 	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
+ 	CWeather::RenderRainStreaks();
+ 	CCoronas::RenderSunReflection();
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_WEATHER);
+ 	POP_RENDERGROUP();
+ }
+ 
+@@ -1642,7 +1712,11 @@ RenderVrTrackedHand(int hand)
+ {
+ 	CMatrix matrix;
+ 	float grip = 0.0f, trigger = 0.0f;
++	#if defined(GTA_VR_OPENXR) || defined(GTA_VR_WEAPONS)
++	if(!OculusVR::GetTrackedVisualHandMatrix(hand, &matrix, &grip, &trigger))
++	#else
+ 	if(!OculusVR::GetTrackedHandMatrix(hand, &matrix, &grip, &trigger))
++	#endif
+ 		return;
+ 	// Twelve rounded segments: wrist, palm and two phalanges for five digits.
+ 	RwIm3DVertex vertices[600];
+@@ -1658,7 +1732,11 @@ RenderVrTrackedHand(int hand)
+ 	const int modelHand = 1-hand;
+ 	CVector up = matrix.GetRight()*(modelHand == 0 ? 1.0f : -1.0f);
+ 	CVector aimOrigin, forward;
++	#if defined(GTA_VR_OPENXR) || defined(GTA_VR_WEAPONS)
++	if(!OculusVR::GetTrackedVisualHandAimRay(hand, &aimOrigin, &forward))
++	#else
+ 	if(!OculusVR::GetTrackedHandAimRay(hand, &aimOrigin, &forward))
++	#endif
+ 		forward = matrix.GetUp();
+ 	forward.Normalise();
+ 	// Keep the palm normal, but remove any component along the pointing axis so
+@@ -1669,9 +1747,20 @@ RenderVrTrackedHand(int hand)
+ 	up.Normalise();
+ 	CVector right = CrossProduct(up, forward);
+ 	right.Normalise();
++	// Synthetic steering sockets still need one final anatomical LEFT parity
++	// after the common controller-to-hand decode above. Without it the car glove
++	// is upside down and the bike glove faces the rider. Correct only this visual
++	// mesh axis; tracked pose, palm normal, aim and steering remain untouched.
++	if(hand == 0 && OculusVR::IsImmersiveSteeringHandleGrabbed(hand))
++		right *= -1.0f;
+ 	// The index finger and thumb must remain on the upper edge after lowering
+ 	// the hand from its former vertical, "raised in class" orientation.
+-	if(DotProduct(right, matrix.GetForward()) < 0.0f)
++	// A virtual handle already supplies one coherent wrist frame, including the
++	// explicit anatomical LEFT correction above. Do not run it through the raw
++	// controller handedness heuristic a second time. Keep that legacy check only
++	// for physical controllers, whose grip and aim poses are separate spaces.
++	if(!OculusVR::IsImmersiveSteeringHandleGrabbed(hand) &&
++	   DotProduct(right, matrix.GetForward()) < 0.0f)
+ 		right = right * -1.0f;
+ 	const CVector &position = matrix.GetPosition();
+ 	// Prefer the authored UltimateXR mesh. Missing/corrupt external assets
+@@ -1740,7 +1829,8 @@ GetVrHandBasis(int hand, CVector &position, CVector &right, CVector &up, CVector
+ 	up.Normalise();
+ 	right = CrossProduct(up, forward);
+ 	right.Normalise();
+-	if(DotProduct(right, matrix.GetForward()) < 0.0f)
++	if(!OculusVR::IsImmersiveSteeringHandleGrabbed(hand) &&
++	   DotProduct(right, matrix.GetForward()) < 0.0f)
+ 		right = right * -1.0f;
+ 	position = matrix.GetPosition();
+ 	return true;
+@@ -1748,6 +1838,17 @@ GetVrHandBasis(int hand, CVector &position, CVector &right, CVector &up, CVector
+ 
+ static RpAtomic *GetVrHolsterWeaponAtomic(int slot, int modelId);
+ 
++// Mirrored LEFT hand/model matrices reverse triangle winding. Detailed Modern
++// weapons make the wrong face-cull obvious, so select the visible side from the
++// actual submitted matrix rather than changing any calibrated axes.
++static RwCullMode
++GetVrWeaponCullMode(const CMatrix &modelMatrix)
++{
++	const float determinant = DotProduct(modelMatrix.GetRight(),
++		CrossProduct(modelMatrix.GetForward(), modelMatrix.GetUp()));
++	return determinant < 0.0f ? rwCULLMODECULLFRONT : rwCULLMODECULLBACK;
++}
++
+ static void
+ RenderVrTrackedWeapon(CPed *player, int hand)
+ {
+@@ -1840,8 +1941,10 @@ RenderVrTrackedWeapon(CPed *player, int hand)
+ 	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+ 	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+ 	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+-	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLBACK);
++	RwRenderStateSet(rwRENDERSTATECULLMODE,
++		(void*)GetVrWeaponCullMode(trackedWeapon));
+ 	GameRender::SubmitAtomic(atomic, GameRender::OBJECT_DRAW_VR_WEAPON);
++	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLBACK);
+ 
+ 	// The atomic belongs to CPed and is reused by gameplay. Never leave the
+ 	// tracked transform installed after this eye's draw.
+@@ -2194,8 +2297,10 @@ RenderVrWeaponHolsters(CPed *player)
+ 		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+ 		RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+ 		RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+-		RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLBACK);
++		RwRenderStateSet(rwRENDERSTATECULLMODE,
++			(void*)GetVrWeaponCullMode(modelMatrix));
+ 		GameRender::SubmitAtomic(atomic, GameRender::OBJECT_DRAW_VR_WEAPON);
++		RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLBACK);
+ 	}
+ 	if(markerVertexCount > 0){
+ 		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, nil);
+@@ -2343,6 +2448,8 @@ RenderVrSteeringHandleMarkers(void)
+ static void
+ RenderVrTrackedHands(void)
+ {
++	if(OculusVR::IsTrackedScopeActive())
++		return;
+ 	if(!OculusVR::AreTrackedHandsEnabled() ||
+ 	   CCutsceneMgr::IsRunning() || CCutsceneMgr::IsCutsceneProcessing() ||
+ 	   TheCamera.m_WideScreenOn ||
+@@ -2612,6 +2719,7 @@ RenderEffects(void)
+ 	}
+ #endif
+ 	PUSH_RENDERGROUP("RenderEffects");
++	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 	CGlass::Render();
+ 	CWaterCannons::Render();
+ 	CSpecialFX::Render();
+@@ -2622,7 +2730,15 @@ RenderEffects(void)
+ 	CAntennas::Render();
+ 	CRubbish::Render();
+ 	CCoronas::Render();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerBeginPhase(
++		androidgame::QUEST_PROFILER_PHASE_PARTICLE_RENDER);
++#endif
+ 	CParticle::Render();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerEndPhase(
++		androidgame::QUEST_PROFILER_PHASE_PARTICLE_RENDER);
++#endif
+ 	CPacManPickups::Render();
+ 	CWeaponEffects::Render();
+ 	CPointLights::RenderFogEffect();
+@@ -2638,9 +2754,13 @@ RenderEffects(void)
+ 	androidgame::RenderTrackedHands();
+ #endif
+ #endif
++	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_EFFECTS);
+ 	POP_RENDERGROUP();
+ }
+ 
++#undef QUEST_RENDER_PROFILE_BEGIN
++#undef QUEST_RENDER_PROFILE_END
++
+ #ifdef GTA_VR_OCULUS
+ struct VrDebugGlyph
+ {
+@@ -2864,7 +2984,6 @@ RenderVrStereoFrame(void)
+ 		CBrightLights::SetPreserveAfterRender(eye == 0);
+ 		CShinyTexts::SetPreserveAfterRender(eye == 0);
+ 		RenderEffects();
+-		RenderVrTrackedHands();
+ 		RwCameraEndUpdate(Scene.camera);
+ 		OculusVR::PerfEndPhase(eye == 0 ? OculusVR::PERF_PHASE_LEFT_EYE : OculusVR::PERF_PHASE_RIGHT_EYE);
+ 	}
+diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
+index 0cd8da7..d022ad6 100644
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -29,6 +29,9 @@
+ #ifdef GTA_VR_OCULUS
+ #include "OculusVR.h"
+ #endif
++#ifdef RW_VULKAN
++#include "vulkan/rwvk.h"
++#endif
+ 
+ int gBuildings;
+ 
+@@ -416,10 +419,17 @@ CEntity::Render(void)
+ 		OculusVR::PerfCountEntityRender();
+ #endif
+ 		bImBeingRendered = true;
++	#ifdef RW_VULKAN
++		const bool dynamicTemporalObject = IsVehicle() || IsPed();
++		rw::vulkan::setDynamicObjectPass(dynamicTemporalObject);
++	#endif
+ 		if(RwObjectGetType(m_rwObject) == rpATOMIC)
+ 			GameRender::SubmitAtomic((RpAtomic*)m_rwObject);
+ 		else
+ 			GameRender::SubmitClump((RpClump*)m_rwObject);
++	#ifdef RW_VULKAN
++		rw::vulkan::setDynamicObjectPass(false);
++	#endif
+ 		bImBeingRendered = false;
+ 	}
+ }
+diff --git a/src/entities/Entity.h b/src/entities/Entity.h
+index 2749e3f..e6c3589 100644
+--- a/src/entities/Entity.h
++++ b/src/entities/Entity.h
+@@ -3,6 +3,7 @@
+ #include "ModelInfo.h"
+ #include "Placeable.h"
+ 
++struct COcclusionContext;
+ struct CReference;
+ class CPtrList;
+ 
+@@ -158,6 +159,7 @@ public:
+ 	bool IsVisible(void);
+ 	bool IsVisibleComplex(void);
+ 	bool IsEntityOccluded(void);
++	bool IsEntityOccluded(const COcclusionContext &context);
+ 	int16 GetModelIndex(void) const { return m_modelIndex; }
+ 	void UpdateRwFrame(void);
+ 	void SetupBigBuilding(void);
+diff --git a/src/entities/Physical.cpp b/src/entities/Physical.cpp
+index f5f4b18..362053f 100644
+--- a/src/entities/Physical.cpp
++++ b/src/entities/Physical.cpp
+@@ -19,12 +19,288 @@
+ #include "Automobile.h"
+ #include "Bike.h"
+ #include "Pickups.h"
++#include "Pools.h"
+ #include "Physical.h"
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#include "PhysicsDirector.h"
++#endif
+ 
+ #ifdef WALLCLIMB_CHEAT
+ bool gGravityCheat;
+ #endif
+ 
++int32 CPhysical::NumVrCollisionFlatScopes;
++int32 CPhysical::NumVrCollisionFlatBuilds;
++int32 CPhysical::NumVrCollisionFlatReuses;
++int32 CPhysical::NumVrCollisionFlatStale;
++int32 CPhysical::NumVrCollisionFlatOverflows;
++int32 CPhysical::NumVrCollisionFlatItems;
++int32 CPhysical::NumVrCollisionFlatSavedNodeVisits;
++
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++namespace {
++
++// This cache never performs collision work.  It only records the exact sector,
++// list and node membership order so repeated CheckCollision calls avoid walking
++// the world's linked lists.  All live tests and all collision side effects stay
++// in ProcessCollisionSectorList on the main thread.
++enum {
++	VR_COLLISION_FLAT_MAX_SECTORS = 64,
++	VR_COLLISION_FLAT_MAX_ITEMS = 4096,
++	VR_COLLISION_FLAT_NUM_LISTS = ENTITYLIST_PEDS_OVERLAP + 1
++};
++
++struct SVrCollisionFlatItem
++{
++	int32 handle;
++	uint8 type;
++	uint8 pool;
++};
++
++enum eVrCollisionFlatPool {
++	VR_COLLISION_POOL_BUILDING,
++	VR_COLLISION_POOL_TREADABLE,
++	VR_COLLISION_POOL_VEHICLE,
++	VR_COLLISION_POOL_PED,
++	VR_COLLISION_POOL_OBJECT
++};
++
++struct SVrCollisionFlatRange
++{
++	uint16 first;
++	uint16 count;
++};
++
++struct SVrCollisionFlatSector
++{
++	SVrCollisionFlatRange lists[VR_COLLISION_FLAT_NUM_LISTS];
++};
++
++struct SVrCollisionFlatCache
++{
++	CPhysical *owner;
++	uint32 topologyRevision;
++	int32 scopeDepth;
++	int32 numSectors;
++	int32 numItems;
++	bool built;
++	bool disabled;
++	bool usedOnce;
++	SVrCollisionFlatSector sectors[VR_COLLISION_FLAT_MAX_SECTORS];
++	SVrCollisionFlatItem items[VR_COLLISION_FLAT_MAX_ITEMS];
++	CPtrNode nodes[VR_COLLISION_FLAT_MAX_ITEMS];
++	CPtrList listViews[VR_COLLISION_FLAT_MAX_SECTORS][VR_COLLISION_FLAT_NUM_LISTS];
++
++	SVrCollisionFlatCache(void)
++	 : owner(nil), topologyRevision(0), scopeDepth(0), numSectors(0),
++	   numItems(0), built(false), disabled(false), usedOnce(false)
++	{
++	}
++
++	~SVrCollisionFlatCache(void)
++	{
++		ClearViews();
++	}
++
++	void ClearViews(void)
++	{
++		for(int32 sector = 0; sector < VR_COLLISION_FLAT_MAX_SECTORS; sector++)
++			for(int32 list = 0; list < VR_COLLISION_FLAT_NUM_LISTS; list++)
++				listViews[sector][list].first = nil;
++	}
++
++	void Reset(CPhysical *newOwner)
++	{
++		ClearViews();
++		owner = newOwner;
++		topologyRevision = 0;
++		numSectors = 0;
++		numItems = 0;
++		built = false;
++		disabled = false;
++		usedOnce = false;
++	}
++};
++
++static SVrCollisionFlatCache gVrCollisionFlatCache;
++static uint32 gVrCollisionTopologyRevision = 1;
++
++static CEntity *
++VrResolveCollisionFlatItem(const SVrCollisionFlatItem &item)
++{
++	switch(item.pool){
++	case VR_COLLISION_POOL_BUILDING:
++		return CPools::GetBuildingPool()->GetAt(item.handle);
++	case VR_COLLISION_POOL_TREADABLE:
++		return CPools::GetTreadablePool()->GetAt(item.handle);
++	case VR_COLLISION_POOL_VEHICLE:
++		return CPools::GetVehicle(item.handle);
++	case VR_COLLISION_POOL_PED:
++		return CPools::GetPed(item.handle);
++	case VR_COLLISION_POOL_OBJECT:
++		return CPools::GetObject(item.handle);
++	default:
++		return nil;
++	}
++}
++
++static bool
++VrCaptureCollisionFlatItem(CEntity *entity, SVrCollisionFlatItem &item)
++{
++	item.type = entity->GetType();
++	switch(item.type){
++	case ENTITY_TYPE_BUILDING: {
++		CBuilding *building = (CBuilding*)entity;
++		if(building->GetIsATreadable()){
++			item.pool = VR_COLLISION_POOL_TREADABLE;
++			item.handle = CPools::GetTreadablePool()->GetIndex((CTreadable*)building);
++		}else{
++			item.pool = VR_COLLISION_POOL_BUILDING;
++			item.handle = CPools::GetBuildingPool()->GetIndex(building);
++		}
++		break;
++	}
++	case ENTITY_TYPE_VEHICLE:
++		item.pool = VR_COLLISION_POOL_VEHICLE;
++		item.handle = CPools::GetVehicleRef((CVehicle*)entity);
++		break;
++	case ENTITY_TYPE_PED:
++		item.pool = VR_COLLISION_POOL_PED;
++		item.handle = CPools::GetPedRef((CPed*)entity);
++		break;
++	case ENTITY_TYPE_OBJECT:
++		item.pool = VR_COLLISION_POOL_OBJECT;
++		item.handle = CPools::GetObjectRef((CObject*)entity);
++		break;
++	default:
++		return false;
++	}
++	return item.handle >= 0 && VrResolveCollisionFlatItem(item) == entity;
++}
++
++static bool
++VrBuildCollisionFlatCache(CPhysical *owner)
++{
++	SVrCollisionFlatCache &cache = gVrCollisionFlatCache;
++	cache.ClearViews();
++	cache.numSectors = 0;
++	cache.numItems = 0;
++
++	for(CEntryInfoNode *entry = owner->m_entryInfoList.first; entry; entry = entry->next){
++		if(cache.numSectors >= VR_COLLISION_FLAT_MAX_SECTORS)
++			goto overflow;
++
++		SVrCollisionFlatSector &flatSector = cache.sectors[cache.numSectors];
++		for(int32 listIndex = 0; listIndex < VR_COLLISION_FLAT_NUM_LISTS; listIndex++){
++			SVrCollisionFlatRange &range = flatSector.lists[listIndex];
++			range.first = (uint16)cache.numItems;
++			range.count = 0;
++			for(CPtrNode *node = entry->sector->m_lists[listIndex].first; node; node = node->next){
++				if(cache.numItems >= VR_COLLISION_FLAT_MAX_ITEMS)
++					goto overflow;
++				if(!VrCaptureCollisionFlatItem((CEntity*)node->item, cache.items[cache.numItems]))
++					goto stale;
++				cache.numItems++;
++				range.count++;
++			}
++		}
++		cache.numSectors++;
++	}
++
++	// Resolve and materialise every handle before exposing the cache to the
++	// collision loop.  This is the complete pre-side-effect validation pass.
++	for(int32 itemIndex = 0; itemIndex < cache.numItems; itemIndex++){
++		CEntity *entity = VrResolveCollisionFlatItem(cache.items[itemIndex]);
++		if(entity == nil || entity->GetType() != cache.items[itemIndex].type)
++			goto stale;
++		cache.nodes[itemIndex].item = entity;
++	}
++	for(int32 sectorIndex = 0; sectorIndex < cache.numSectors; sectorIndex++){
++		for(int32 listIndex = 0; listIndex < VR_COLLISION_FLAT_NUM_LISTS; listIndex++){
++			const SVrCollisionFlatRange &range = cache.sectors[sectorIndex].lists[listIndex];
++			CPtrList &view = cache.listViews[sectorIndex][listIndex];
++			view.first = range.count ? &cache.nodes[range.first] : nil;
++			for(int32 offset = 0; offset < range.count; offset++){
++				const int32 itemIndex = range.first + offset;
++				CPtrNode &node = cache.nodes[itemIndex];
++				node.prev = offset ? &cache.nodes[itemIndex - 1] : nil;
++				node.next = offset + 1 < range.count ? &cache.nodes[itemIndex + 1] : nil;
++			}
++		}
++	}
++
++	cache.topologyRevision = gVrCollisionTopologyRevision;
++	cache.built = true;
++	CPhysical::NumVrCollisionFlatBuilds++;
++	CPhysical::NumVrCollisionFlatItems += cache.numItems;
++	return true;
++
++overflow:
++	CPhysical::NumVrCollisionFlatOverflows++;
++	cache.disabled = true;
++	cache.built = false;
++	cache.ClearViews();
++	return false;
++
++stale:
++	CPhysical::NumVrCollisionFlatStale++;
++	cache.disabled = true;
++	cache.built = false;
++	cache.ClearViews();
++	return false;
++}
++
++// Complete validation happens before AdvanceCurrentScanCode and before the
++// first live collision test.  A failure therefore falls back to the untouched
++// original linked-list path without duplicating any side effect.
++static bool
++VrPrepareCollisionFlatCache(CPhysical *owner)
++{
++	SVrCollisionFlatCache &cache = gVrCollisionFlatCache;
++	if(cache.scopeDepth <= 0 || cache.owner != owner || cache.disabled)
++		return false;
++	if(!cache.built && !VrBuildCollisionFlatCache(owner))
++		return false;
++	if(cache.topologyRevision != gVrCollisionTopologyRevision){
++		CPhysical::NumVrCollisionFlatStale++;
++		cache.disabled = true;
++		cache.ClearViews();
++		return false;
++	}
++
++	if(cache.usedOnce){
++		CPhysical::NumVrCollisionFlatReuses++;
++		CPhysical::NumVrCollisionFlatSavedNodeVisits += cache.numItems;
++	}else
++		cache.usedOnce = true;
++	return true;
++}
++
++class CVrCollisionFlatScopeGuard
++{
++	CPhysical *m_owner;
++public:
++	CVrCollisionFlatScopeGuard(CPhysical *owner, bool activate)
++	 : m_owner(nil)
++	{
++		if(activate && owner->BeginVrCollisionFlatCacheScope())
++			m_owner = owner;
++	}
++	~CVrCollisionFlatScopeGuard(void)
++	{
++		if(m_owner)
++			m_owner->EndVrCollisionFlatCacheScope();
++	}
++	void Activate(CPhysical *owner)
++	{
++		if(m_owner == nil && owner->BeginVrCollisionFlatCacheScope())
++			m_owner = owner;
++	}
++};
++
++} // namespace
++#endif
++
+ 
+ CPhysical::CPhysical(void)
+ {
+@@ -137,6 +413,9 @@ CPhysical::Add(void)
+ 			assert(node);
+ 			m_entryInfoList.InsertItem(list, node, s);
+ 		}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	gVrCollisionTopologyRevision++;
++#endif
+ }
+ 
+ void
+@@ -148,11 +427,23 @@ CPhysical::Remove(void)
+ 		node->list->DeleteNode(node->listnode);
+ 		m_entryInfoList.DeleteNode(node);
+ 	}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	gVrCollisionTopologyRevision++;
++#endif
+ }
+ 
+ void
+ CPhysical::RemoveAndAdd(void)
+ {
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	// ADAPTIVE V2 may skip the linked-list churn only when a distant hidden
++	// rail/proxy car's exact sector footprint did not change. OFF/MEASURE/SAFE
++	// and every protected vehicle always execute the original function.
++	if(!androidgame::QuestPhysicsDirectorShouldRunRemoveAndAdd(this))
++		return;
++	const uint64 vrPhysicsRemoveAndAddStarted =
++		androidgame::QuestPhysicsDirectorBeginRemoveAndAdd(this);
++#endif
+ 	int x, xstart, xmid, xend;
+ 	int y, ystart, ymid, yend;
+ 	CSector *s;
+@@ -213,6 +504,11 @@ CPhysical::RemoveAndAdd(void)
+ 		node->list->DeleteNode(node->listnode);
+ 		m_entryInfoList.DeleteNode(node);
+ 	}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	gVrCollisionTopologyRevision++;
++	androidgame::QuestPhysicsDirectorEndRemoveAndAdd(this,
++		vrPhysicsRemoveAndAddStarted);
++#endif
+ }
+ 
+ CRect
+@@ -334,11 +630,25 @@ CPhysical::PlacePhysicalRelativeToOtherPhysical(CPhysical *other, CPhysical *phy
+ int32
+ CPhysical::ProcessEntityCollision(CEntity *ent, CColPoint *colpoints)
+ {
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	CVehicle *vrPhysicsVehicle = IsVehicle() ? (CVehicle *)this : nil;
++	if(vrPhysicsVehicle != nil)
++		androidgame::QuestPhysicsDirectorBeginVehicleNarrowPhase(
++			vrPhysicsVehicle);
++#endif
+ 	int32 numSpheres = CCollision::ProcessColModels(
+ 		GetMatrix(), *GetColModel(),
+ 		ent->GetMatrix(), *ent->GetColModel(),
+ 		colpoints,
+ 		nil, nil);	// No Lines allowed!
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	if(vrPhysicsVehicle != nil){
++		androidgame::QuestPhysicsDirectorRecordContactManifold(
++			vrPhysicsVehicle, numSpheres > 0);
++		androidgame::QuestPhysicsDirectorEndVehicleNarrowPhase(
++			vrPhysicsVehicle);
++	}
++#endif
+ 	if(numSpheres > 0){
+ 		AddCollisionRecord(ent);
+ 		if(!ent->IsBuilding())	// Can't this catch dummies too?
+@@ -1439,12 +1749,18 @@ CPhysical::ProcessCollisionSectorList_SimpleCar(CPtrList *lists)
+ 		// Find first collision in list
+ 		CPtrNode *listnode;
+ 		for(listnode = list->first; listnode; listnode = listnode->next){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			androidgame::QuestPhysicsDirectorRecordSectorNode(A);
++#endif
+ 			B = (CPhysical*)listnode->item;
+ 			if(B != A &&
+ 			   !(B->IsObject() && ((CObject*)B)->bIsStreetLight && B->GetUp().z < 0.66f) &&
+ 			   B->m_scanCode != CWorld::GetCurrentScanCode() &&
+ 			   B->bUsesCollision &&
+ 			   B->GetIsTouching(center, radius)){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				androidgame::QuestPhysicsDirectorRecordBroadphaseCandidate(A);
++#endif
+ 				B->m_scanCode = CWorld::GetCurrentScanCode();
+ 				numCollisions = A->ProcessEntityCollision(B, aColPoints);
+ 				if(numCollisions > 0)
+@@ -1602,6 +1918,9 @@ CPhysical::ProcessCollisionSectorList(CPtrList *lists)
+ 
+ 		CPtrNode *listnode;
+ 		for(listnode = list->first; listnode; listnode = listnode->next){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			androidgame::QuestPhysicsDirectorRecordSectorNode(A);
++#endif
+ 			B = (CPhysical*)listnode->item;
+ 			Bobj = (CObject*)B;
+ 			Bped = (CPed*)B;
+@@ -1623,6 +1942,9 @@ CPhysical::ProcessCollisionSectorList(CPtrList *lists)
+ 				}
+ 				continue;
+ 			}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			androidgame::QuestPhysicsDirectorRecordBroadphaseCandidate(A);
++#endif
+ 
+ 			A->bSkipLineCol = false;
+ 			skipCollision = false;
+@@ -2018,6 +2340,23 @@ bool
+ CPhysical::CheckCollision(void)
+ {
+ 	CEntryInfoNode *node;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorRecordCheckCollision(this, false);
++#endif
++
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	if(VrPrepareCollisionFlatCache(this)){
++		bCollisionProcessed = false;
++		CWorld::AdvanceCurrentScanCode();
++		for(int32 sectorIndex = 0;
++		    sectorIndex < gVrCollisionFlatCache.numSectors;
++		    sectorIndex++)
++			if(ProcessCollisionSectorList(
++			   gVrCollisionFlatCache.listViews[sectorIndex]))
++				return true;
++		return false;
++	}
++#endif
+ 
+ 	bCollisionProcessed = false;
+ 	CWorld::AdvanceCurrentScanCode();
+@@ -2027,10 +2366,60 @@ CPhysical::CheckCollision(void)
+ 	return false;
+ }
+ 
++bool
++CPhysical::BeginVrCollisionFlatCacheScope(void)
++{
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	SVrCollisionFlatCache &cache = gVrCollisionFlatCache;
++	if(cache.scopeDepth > 0){
++		if(cache.owner != this)
++			return false;
++		cache.scopeDepth++;
++		return true;
++	}
++	cache.Reset(this);
++	cache.scopeDepth = 1;
++	NumVrCollisionFlatScopes++;
++	return true;
++#else
++	return false;
++#endif
++}
++
++void
++CPhysical::EndVrCollisionFlatCacheScope(void)
++{
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	SVrCollisionFlatCache &cache = gVrCollisionFlatCache;
++	if(cache.scopeDepth <= 0 || cache.owner != this)
++		return;
++	cache.scopeDepth--;
++	if(cache.scopeDepth == 0){
++		cache.Reset(nil);
++		cache.owner = nil;
++	}
++#endif
++}
++
++void
++CPhysical::ResetVrCollisionFlatCacheDiagnostics(void)
++{
++	NumVrCollisionFlatScopes = 0;
++	NumVrCollisionFlatBuilds = 0;
++	NumVrCollisionFlatReuses = 0;
++	NumVrCollisionFlatStale = 0;
++	NumVrCollisionFlatOverflows = 0;
++	NumVrCollisionFlatItems = 0;
++	NumVrCollisionFlatSavedNodeVisits = 0;
++}
++
+ bool
+ CPhysical::CheckCollision_SimpleCar(void)
+ {
+ 	CEntryInfoNode *node;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorRecordCheckCollision(this, true);
++#endif
+ 
+ 	bCollisionProcessed = false;
+ 	CWorld::AdvanceCurrentScanCode();
+@@ -2121,7 +2510,30 @@ CPhysical::ProcessCollision(void)
+ 	}
+ 
+ 	if(GetStatus() == STATUS_SIMPLE){
+-		if(CheckCollision_SimpleCar() && GetStatus() == STATUS_SIMPLE){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++		androidgame::QuestPhysicsDirectorRecordSubsteps(
++			IsVehicle() ? (CVehicle *)this : nil, 1);
++		const bool runSimpleCollision = !IsVehicle() ||
++			androidgame::QuestPhysicsDirectorShouldRunSimpleCollision(
++				(CVehicle *)this);
++#else
++		const bool runSimpleCollision = true;
++#endif
++		bool simpleCollision = false;
++		if(runSimpleCollision){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			const uint64 vrSimpleCollisionStarted =
++				androidgame::QuestPhysicsDirectorBeginSimpleCollision(
++					IsVehicle() ? (CVehicle *)this : nil);
++#endif
++			simpleCollision = CheckCollision_SimpleCar();
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			androidgame::QuestPhysicsDirectorEndSimpleCollision(
++				IsVehicle() ? (CVehicle *)this : nil,
++				vrSimpleCollisionStarted);
++#endif
++		}
++		if(simpleCollision && GetStatus() == STATUS_SIMPLE){
+ 			SetStatus(STATUS_PHYSICS);
+ 			if(IsVehicle())
+ 				CCarCtrl::SwitchVehicleToRealPhysics((CVehicle*)this);
+@@ -2181,6 +2593,12 @@ CPhysical::ProcessCollision(void)
+ 				if(IsVehicle())
+ 					((CVehicle*)this)->bVehicleColProcessed = true;
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				if(IsVehicle())
++					androidgame::QuestPhysicsDirectorRecordSubsteps(
++						(CVehicle *)this, 1);
++#endif
++
+ 				bHitByTrain = false;
+ 				m_fDistanceTravelled = (GetPosition() - savedMatrix.GetPosition()).Magnitude();
+ 				bSkipLineCol = false;
+@@ -2233,6 +2651,16 @@ CPhysical::ProcessCollision(void)
+ 		}
+ 	}
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	if(IsVehicle())
++		androidgame::QuestPhysicsDirectorRecordSubsteps(
++			(CVehicle *)this, n);
++#endif
++
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	CVrCollisionFlatScopeGuard vrCollisionFlatScope(this, n > 1);
++#endif
++
+ 	for(i = 1; i < n; i++){
+ 		CTimer::SetTimeStep(i * step);
+ 		ApplyMoveSpeed();
+diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
+index 7f9362d..e7bde25 100644
+--- a/src/render/Hud.cpp
++++ b/src/render/Hud.cpp
+@@ -424,6 +424,17 @@ void CHud::Draw()
+ 					Sprites[sprite].Draw(CRect(rect), CRGBA(255, 255, 255, 255),
+ 						0.99f, 0.99f,  0.01f, 0.99f,  0.99f, 0.01f,  0.01f, 0.01f);
+ 
++					if (vrTrackedScope && WeaponType == WEAPONTYPE_LASERSCOPE) {
++						const float dotHalfWidth = SCREEN_SCALE_X(4.0f);
++						const float dotHalfHeight = SCREEN_SCALE_Y(4.0f);
++						Sprites[HUD_LASERDOT].Draw(CRect(
++							SCREEN_WIDTH / 2 - dotHalfWidth,
++							SCREEN_HEIGHT / 2 - dotHalfHeight,
++							SCREEN_WIDTH / 2 + dotHalfWidth,
++							SCREEN_HEIGHT / 2 + dotHalfHeight),
++							CRGBA(255, 255, 255, 255));
++					}
++
+ 					CVector dotPos;
+ 					float size = 25.0f;
+ 					if (!vrTrackedScope && WeaponType == WEAPONTYPE_LASERSCOPE &&
+diff --git a/src/render/Occlusion.cpp b/src/render/Occlusion.cpp
+index 3ea5678..bce1d29 100644
+--- a/src/render/Occlusion.cpp
++++ b/src/render/Occlusion.cpp
+@@ -31,6 +31,11 @@ bool gOccluderCoorsValid[8];
+ CVector gOccluderCoorsOnScreen[8];
+ CVector gOccluderCoors[8];
+ 
++static bool CalcScreenCoors(const COcclusionContext &context,
++	CVector const &in, CVector *out, float *outw, float *outh);
++static bool CalcScreenCoors(const COcclusionContext &context,
++	CVector const &in, CVector *out);
++
+ #ifndef MASTER
+ bool bDispayOccDebugStuff; // disPAY, yeah
+ #endif
+@@ -229,8 +234,11 @@ COccluder::ProcessOneOccluder(CActiveOccluder *occl) {
+ 	gOccluderCoors[6] = pos + vec[0] - vec[1] - vec[2];
+ 	gOccluderCoors[7] = pos - vec[0] - vec[1] - vec[2];
+ 
+-	for(int i = 0; i < 8; i++)
++	for(int i = 0; i < 8; i++){
+ 		gOccluderCoorsValid[i] = CalcScreenCoors(gOccluderCoors[i], &gOccluderCoorsOnScreen[i], &outX, &outY);
++		if(i == 0 || gOccluderCoorsOnScreen[i].z > occl->farDepth)
++			occl->farDepth = gOccluderCoorsOnScreen[i].z;
++	}
+ 
+ 	gMinYInOccluder = 999999.875f;
+ 	gMinXInOccluder = 999999.875f;
+@@ -370,6 +378,7 @@ COcclusion::ProcessBeforeRendering(void)
+ 							aActiveOccluders[k].lines[l] = aActiveOccluders[k + 1].lines[l];
+ 						aActiveOccluders[k].linesCount = aActiveOccluders[k + 1].linesCount;
+ 						aActiveOccluders[k].radius = aActiveOccluders[k + 1].radius;
++						aActiveOccluders[k].farDepth = aActiveOccluders[k + 1].farDepth;
+ 					}
+ 					NumActiveOccluders--;
+ 					i--;
+@@ -385,7 +394,31 @@ COcclusion::ProcessBeforeRendering(void)
+ 	}
+ }
+ 
+-bool CActiveOccluder::IsPointWithinOcclusionArea(float pX, float pY, float area) {
++void
++COcclusion::CaptureContext(COcclusionContext *context)
++{
++	if(context == nil)
++		return;
++	context->numActiveOccluders = NumActiveOccluders;
++	if(NumActiveOccluders > 0)
++		memcpy(context->activeOccluders, aActiveOccluders,
++			NumActiveOccluders*sizeof(CActiveOccluder));
++	context->viewMatrix.CopyOnlyMatrix(TheCamera.m_viewMatrix);
++	context->screenWidth = SCREEN_WIDTH;
++	context->screenHeight = SCREEN_HEIGHT;
++	context->fov = CDraw::GetFOV();
++}
++
++void
++COcclusion::ApplyContext(const COcclusionContext &context)
++{
++	NumActiveOccluders = context.numActiveOccluders;
++	if(NumActiveOccluders > 0)
++		memcpy(aActiveOccluders, context.activeOccluders,
++			NumActiveOccluders*sizeof(CActiveOccluder));
++}
++
++bool CActiveOccluder::IsPointWithinOcclusionArea(float pX, float pY, float area) const {
+ 	for (int i = 0; i < linesCount; i++) {
+ 		if (!IsPointInsideLine(lines[i].origin.x, lines[i].origin.y, lines[i].direction.x, lines[i].direction.y, pX, pY, area))
+ 			return false;
+@@ -527,4 +560,219 @@ bool CEntity::IsEntityOccluded(void) {
+ 	}
+ 
+ 	return false;
+-}
+\ No newline at end of file
++}
++
++bool
++CEntity::IsEntityOccluded(const COcclusionContext &context)
++{
++	if(context.numActiveOccluders == 0)
++		return false;
++
++	CColModel *colModel =
++		CModelInfo::GetModelInfo(GetModelIndex())->GetColModel();
++	if(colModel == nil)
++		return false;
++
++	const CVector &boundMin = colModel->boundingBox.min;
++	const CVector &boundMax = colModel->boundingBox.max;
++	CVector projectedCorners[8];
++	float nearestDepth = 0.0f;
++	for(int corner = 0; corner < 8; corner++){
++		const CVector localCorner(
++			(corner & 1) ? boundMax.x : boundMin.x,
++			(corner & 2) ? boundMax.y : boundMin.y,
++			(corner & 4) ? boundMax.z : boundMin.z);
++		const CVector worldCorner = m_matrix * localCorner;
++		if(!CalcScreenCoors(context, worldCorner, &projectedCorners[corner]))
++			return false;
++		if(corner == 0 || projectedCorners[corner].z < nearestDepth)
++			nearestDepth = projectedCorners[corner].z;
++	}
++
++	for(int i = 0; i < context.numActiveOccluders; i++){
++		const CActiveOccluder &occluder = context.activeOccluders[i];
++		if(nearestDepth <= occluder.farDepth)
++			continue;
++		bool fullyInside = true;
++		for(int corner = 0; corner < 8; corner++){
++			if(!occluder.IsPointWithinOcclusionArea(
++			     projectedCorners[corner].x, projectedCorners[corner].y, 0.0f)){
++				fullyInside = false;
++				break;
++			}
++		}
++		if(fullyInside)
++			return true;
++	}
++	return false;
++}
++
++static bool
++CalcScreenCoors(const COcclusionContext &context, CVector const &in,
++	CVector *out, float *outw, float *outh)
++{
++	*out = context.viewMatrix * in;
++	if(out->z <= 1.0f)
++		return false;
++	const float recip = 1.0f / out->z;
++	out->x *= context.screenWidth * recip;
++	out->y *= context.screenHeight * recip;
++	const float fovScale = DefaultFOV / context.fov;
++	*outw = fovScale * recip * context.screenWidth;
++	*outh = fovScale * recip * context.screenHeight;
++	return true;
++}
++
++static bool
++CalcScreenCoors(const COcclusionContext &context, CVector const &in,
++	CVector *out)
++{
++	float width, height;
++	return CalcScreenCoors(context, in, out, &width, &height);
++}
++
++bool
++COcclusion::IsPositionOccluded(const COcclusionContext &context,
++	CVector pos, float side)
++{
++	CVector coors;
++	float width, height;
++	if(context.numActiveOccluders == 0 ||
++	   !CalcScreenCoors(context, pos, &coors, &width, &height))
++		return false;
++
++	const float area = Max(width, height) * side;
++	for(int i = 0; i < context.numActiveOccluders; i++){
++		const CActiveOccluder &occluder = context.activeOccluders[i];
++		if(coors.z - side*0.85f > occluder.radius &&
++		   occluder.IsPointWithinOcclusionArea(coors.x, coors.y, area))
++			return true;
++	}
++	return false;
++}
++
++#ifdef RW_VULKAN
++static bool
++SegmentEntersOccluderBeforeTarget(const COccluder &occluder,
++	const CVector &eye, const CVector &target, float edgeInset,
++	float targetSeparation)
++{
++	const float angle = occluder.angle*TWOPI/UINT16_MAX;
++	const float s = Sin(angle);
++	const float c = Cos(angle);
++	const CVector axisLength(s, -c, 0.0f);
++	const CVector axisWidth(c, s, 0.0f);
++	const CVector centre((float)occluder.x, (float)occluder.y,
++		(float)occluder.z);
++	const CVector eyeDelta = eye-centre;
++	const CVector targetDelta = target-centre;
++	const float start[3] = {
++		DotProduct(eyeDelta, axisLength),
++		DotProduct(eyeDelta, axisWidth), eyeDelta.z
++	};
++	const float finish[3] = {
++		DotProduct(targetDelta, axisLength),
++		DotProduct(targetDelta, axisWidth), targetDelta.z
++	};
++	const float extent[3] = {
++		Max(0.0f, Abs((float)occluder.length)*0.5f-edgeInset),
++		Max(0.0f, Abs((float)occluder.width)*0.5f-edgeInset),
++		Max(0.0f, Abs((float)occluder.height)*0.5f-edgeInset)
++	};
++	if(extent[0] <= 0.0f || extent[1] <= 0.0f || extent[2] <= 0.0f)
++		return false;
++
++	// If the eye itself lies in an authored volume, fail open.  Treating the
++	// volume surrounding the camera as a wall would erase most of the scene.
++	if(Abs(start[0]) <= extent[0] && Abs(start[1]) <= extent[1] &&
++	   Abs(start[2]) <= extent[2])
++		return false;
++
++	float enter = 0.0f;
++	float leave = 1.0f;
++	for(int axis = 0; axis < 3; axis++){
++		const float delta = finish[axis]-start[axis];
++		if(Abs(delta) < 0.000001f){
++			if(start[axis] < -extent[axis] || start[axis] > extent[axis])
++				return false;
++			continue;
++		}
++		float nearT = (-extent[axis]-start[axis])/delta;
++		float farT = (extent[axis]-start[axis])/delta;
++		if(nearT > farT){
++			const float swap = nearT;
++			nearT = farT;
++			farT = swap;
++		}
++		enter = Max(enter, nearT);
++		leave = Min(leave, farT);
++		if(enter > leave)
++			return false;
++	}
++
++	const float segmentLength = (target-eye).Magnitude();
++	return enter >= 0.0f && enter <= 1.0f &&
++	       enter*segmentLength+targetSeparation < segmentLength;
++}
++
++bool
++COcclusion::IsEntityOccludedByVolumeStereo(CEntity *entity,
++	const CVector eyePosition[2], bool aggressive)
++{
++	if(entity == nil || eyePosition == nil || NumOccludersOnMap <= 0)
++		return false;
++	CBaseModelInfo *modelInfo = CModelInfo::GetModelInfo(entity->GetModelIndex());
++	CColModel *colModel = modelInfo != nil ? modelInfo->GetColModel() : nil;
++	if(colModel == nil)
++		return false;
++
++	const CVector &sourceMin = colModel->boundingBox.min;
++	const CVector &sourceMax = colModel->boundingBox.max;
++	const CVector localCentre = (sourceMin+sourceMax)*0.5f;
++	const float coreScale = aggressive ? 0.35f : 1.0f;
++	const CVector halfSize = (sourceMax-sourceMin)*(0.5f*coreScale);
++	CVector worldCorners[8];
++	for(int corner = 0; corner < 8; corner++){
++		const CVector local = localCentre+CVector(
++			(corner & 1) ? halfSize.x : -halfSize.x,
++			(corner & 2) ? halfSize.y : -halfSize.y,
++			(corner & 4) ? halfSize.z : -halfSize.z);
++		worldCorners[corner] = entity->GetMatrix()*local;
++	}
++
++	const CVector targetCentre = entity->GetBoundCentre();
++	const CVector headCentre = (eyePosition[0]+eyePosition[1])*0.5f;
++	const float edgeInset = aggressive ? 0.05f : 0.20f;
++	const float targetSeparation = aggressive ? 0.10f : 0.30f;
++	for(int32 index = 0; index < NumOccludersOnMap; index++){
++		const COccluder &occluder = aOccluders[index];
++		const CVector occluderCentre((float)occluder.x,
++			(float)occluder.y, (float)occluder.z);
++		const float broadRadius = Max(Abs((float)occluder.width),
++			Max(Abs((float)occluder.length), Abs((float)occluder.height)))*0.5f;
++		if((occluderCentre-headCentre).Magnitude()-broadRadius > 250.0f)
++			continue;
++		// A centre-ray miss proves that this convex box cannot contain every
++		// target-corner ray, and avoids the 16-ray detailed test in almost all
++		// cases.
++		if(!SegmentEntersOccluderBeforeTarget(occluder, eyePosition[0],
++		     targetCentre, edgeInset, targetSeparation) ||
++		   !SegmentEntersOccluderBeforeTarget(occluder, eyePosition[1],
++		     targetCentre, edgeInset, targetSeparation))
++			continue;
++
++		bool fullyHidden = true;
++		for(int eye = 0; eye < 2 && fullyHidden; eye++)
++			for(int corner = 0; corner < 8; corner++)
++				if(!SegmentEntersOccluderBeforeTarget(occluder,
++				     eyePosition[eye], worldCorners[corner], edgeInset,
++				     targetSeparation)){
++					fullyHidden = false;
++					break;
++				}
++		if(fullyHidden)
++			return true;
++	}
++	return false;
++}
++#endif
+diff --git a/src/render/Occlusion.h b/src/render/Occlusion.h
+index e0edef5..a50afc4 100644
+--- a/src/render/Occlusion.h
++++ b/src/render/Occlusion.h
+@@ -1,5 +1,9 @@
+ #pragma once
+ 
++#include "Matrix.h"
++
++class CEntity;
++
+ struct ActiveOccluderLine {
+ 	CVector2D origin;
+ 	CVector2D direction;
+@@ -11,9 +15,23 @@ class CActiveOccluder {
+ public:
+ 	ActiveOccluderLine lines[6];
+ 	int32 linesCount;
+-	float radius; 
++	float radius;
++	// Exact farthest camera-space depth of this occluder. The legacy radius
++	// remains for its ordering/fast approximate tests; stereo SAFE uses this
++	// value so the complete entity bound must sit behind the complete occluder.
++	float farDepth;
+ 
+-	bool IsPointWithinOcclusionArea(float x, float y, float area);
++	bool IsPointWithinOcclusionArea(float x, float y, float area) const;
++};
++
++struct COcclusionContext
++{
++	int16 numActiveOccluders;
++	CActiveOccluder activeOccluders[NUMACTIVEOCCLUDERS];
++	CMatrix viewMatrix;
++	float screenWidth;
++	float screenHeight;
++	float fov;
+ };
+ 
+ class COccluder
+@@ -45,10 +63,23 @@ public:
+ 
+ 	static void Init(void);
+ 	static void AddOne(float x, float y, float z, float width, float length, float height, float angle);
+-	static void ProcessBeforeRendering(void); 
++	static void ProcessBeforeRendering(void);
++	static void CaptureContext(COcclusionContext *context);
++	static void ApplyContext(const COcclusionContext &context);
+ 	static bool OccluderHidesBehind(CActiveOccluder *occl1, CActiveOccluder *occl2);
+ 	static bool IsAABoxOccluded(CVector pos, float width, float length, float height);
+ 	static bool IsPositionOccluded(CVector pos, float side);
++	static bool IsPositionOccluded(const COcclusionContext &context,
++		CVector pos, float side);
++#ifdef RW_VULKAN
++	// Conservative stereo test used by Quest.  Unlike the original 2D
++	// silhouette rasterizer this works entirely in world space, so asymmetric
++	// per-eye projections and headset roll cannot move an occluder across the
++	// middle of the image.  A building is rejected only when the same authored
++	// box blocks its complete bound from both physical eyes.
++	static bool IsEntityOccludedByVolumeStereo(CEntity *entity,
++		const CVector eyePosition[2], bool aggressive);
++#endif
+ #ifndef MASTER
+ 	static void Render();
+ #endif
+@@ -59,4 +90,4 @@ bool CalcScreenCoors(CVector const &in, CVector *out);
+ 
+ #ifndef MASTER
+ extern bool bDispayOccDebugStuff;
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/render/Renderer.cpp b/src/render/Renderer.cpp
+index 0c4b11a..61e7c4e 100644
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -17,6 +17,7 @@
+ #include "Clock.h"
+ #include "World.h"
+ #include "Camera.h"
++#include "CarCtrl.h"
+ #include "ModelIndices.h"
+ #include "Streaming.h"
+ #include "Shadows.h"
+@@ -32,6 +33,10 @@
+ #ifdef GTA_VR_OCULUS
+ #include "OculusVR.h"
+ #endif
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++#include "../skel/android/QuestProfiler.h"
++#include "VehicleVisualDirector.h"
++#endif
+ 
+ bool gbShowPedRoadGroups;
+ bool gbShowCarRoadGroups;
+@@ -76,6 +81,7 @@ CVehicle *CRenderer::m_pFirstPersonVehicle;
+ #if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
+ bool CRenderer::ms_bVrOmnidirectionalScan;
+ bool CRenderer::ms_bVrPerViewCulling;
++int32 CRenderer::ms_nVrOcclusionCullingMode = VR_OCCLUSION_CULLING_SAFE;
+ #endif
+ bool CRenderer::m_loadingPriority;
+ float CRenderer::ms_lodDistScale = 1.2f;
+@@ -146,6 +152,9 @@ CRenderer::RenderOneRoad(CEntity *e)
+ #endif
+ 	if(gbDontRenderBuildings)
+ 		return;
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerCountVisibleBuilding(e);
++#endif
+ 	if(gbShowCollisionPolys)
+ 		CCollision::DrawColModel_Coloured(e->GetMatrix(), *CModelInfo::GetModelInfo(e->GetModelIndex())->GetColModel(), e->GetModelIndex());
+ 	else{
+@@ -166,7 +175,7 @@ extern CEntity *gVrPlayerEntity;
+ #endif
+ 
+ void
+-CRenderer::RenderOneNonRoad(CEntity *e)
++CRenderer::RenderOneNonRoad(CEntity *e, bool fadingPath)
+ {
+ 	// Stereo reuses a render list for multiple passes. A transition can remove
+ 	// an entity's RenderWare object after the list was constructed.
+@@ -182,9 +191,12 @@ CRenderer::RenderOneNonRoad(CEntity *e)
+ #endif
+ 
+ 	CPed *ped;
+-	CVehicle *veh;
++	CVehicle *veh = nil;
+ 	int i;
+ 	bool resetLights;
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	bool useVehicleVisualVlo = false;
++#endif
+ 
+ #ifndef MASTER
+ 	if(gbShowCollisionPolys){
+@@ -222,19 +234,65 @@ CRenderer::RenderOneNonRoad(CEntity *e)
+ 	}
+ #endif
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	const bool profileRenderEntity =
++		androidgame::QuestProfilerIsEnabled();
++	androidgame::QuestRenderEntitySample renderSample = {};
++	uint64 renderEntityStartedNs = 0;
++	if(profileRenderEntity){
++		renderSample.entityClass = e->IsVehicle() ?
++			androidgame::QUEST_RENDER_ENTITY_VEHICLE :
++			(e->IsPed() ? androidgame::QUEST_RENDER_ENTITY_PED :
++			 androidgame::QUEST_RENDER_ENTITY_STATIC);
++		renderSample.fadingPath = fadingPath;
++		renderEntityStartedNs =
++			androidgame::QuestProfilerNowNanoseconds();
++	}
++#endif
++
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	if(e->IsBuilding())
++		androidgame::QuestProfilerCountVisibleBuilding(e);
++#endif
++
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	if(e->IsVehicle())
++		CCarCtrl::MarkVrVehicleRendered((CVehicle*)e);
++#endif
++
+ 	PUSH_RENDERGROUP(CModelInfo::GetModelInfo(e->GetModelIndex())->GetModelName());
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	const uint64 vehicleLightingSetupStartedNs =
++		profileRenderEntity && e->IsVehicle() ?
++			androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 	resetLights = e->SetupLighting();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	if(vehicleLightingSetupStartedNs != 0)
++		renderSample.vehiclePhaseNs
++			[androidgame::QUEST_VEHICLE_RENDER_PHASE_LIGHTING] +=
++			androidgame::QuestProfilerNowNanoseconds()-
++			vehicleLightingSetupStartedNs;
++#endif
+ 
+ 	if(e->IsVehicle()){
+ 		// unfortunately can't use GetClump here
+ 		CVisibilityPlugins::SetupVehicleVariables((RpClump*)e->m_rwObject);
+ 		CVisibilityPlugins::InitAlphaAtomicList();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		useVehicleVisualVlo =
++			androidgame::QuestVehicleVisualBudgetBeginVehicle((CVehicle*)e);
++#endif
+ 	}
+ 
+ 	// Render Peds in vehicle before vehicle itself
+ 	if(e->IsVehicle()){
+ 		veh = (CVehicle*)e;
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		const uint64 occupantsStartedNs = profileRenderEntity ?
++			androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 		if(veh->pDriver && veh->pDriver->m_nPedState == PED_DRIVING
+ #ifdef RW_VULKAN
+ 		   // In first person the player drives from inside their own model;
+@@ -242,25 +300,103 @@ CRenderer::RenderOneNonRoad(CEntity *e)
+ 		   && !(gVrHidePlayerBody && gVrFirstPersonActive &&
+ 		        (CEntity*)veh->pDriver == gVrPlayerEntity)
+ #endif
+-		   )
++		   ){
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++			if(useVehicleVisualVlo)
++				androidgame::QuestVehicleVisualBudgetRecordOccupantSkipped();
++			else
++#endif
+ 			GameRender::SubmitEntity(veh->pDriver, GameRender::ENTITY_DRAW_VEHICLE_OCCUPANT);
++			#if defined(RW_VULKAN) && defined(__ANDROID__)
++			if(profileRenderEntity && !useVehicleVisualVlo)
++				renderSample.vehicleOccupantsSubmitted++;
++			#endif
++		}
+ 		for(i = 0; i < 8; i++)
+-			if(veh->pPassengers[i] && veh->pPassengers[i]->m_nPedState == PED_DRIVING)
++			if(veh->pPassengers[i] && veh->pPassengers[i]->m_nPedState == PED_DRIVING){
++				#if defined(RW_VULKAN) && defined(__ANDROID__)
++				if(useVehicleVisualVlo)
++					androidgame::QuestVehicleVisualBudgetRecordOccupantSkipped();
++				else
++				#endif
+ 				GameRender::SubmitEntity(veh->pPassengers[i], GameRender::ENTITY_DRAW_VEHICLE_OCCUPANT);
++				#if defined(RW_VULKAN) && defined(__ANDROID__)
++				if(profileRenderEntity && !useVehicleVisualVlo)
++					renderSample.vehicleOccupantsSubmitted++;
++				#endif
++			}
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		if(occupantsStartedNs != 0)
++			renderSample.vehiclePhaseNs
++				[androidgame::QUEST_VEHICLE_RENDER_PHASE_OCCUPANTS] +=
++				androidgame::QuestProfilerNowNanoseconds()-
++				occupantsStartedNs;
++#endif
+ 		SetCullMode(rwCULLMODECULLNONE);
+ 	}
+-	GameRender::SubmitEntity(e);
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	const uint64 bodySubmitStartedNs =
++		profileRenderEntity && e->IsVehicle() ?
++			androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	const bool renderedVehicleVisualVlo = useVehicleVisualVlo &&
++		androidgame::QuestVehicleVisualBudgetRenderPreparedVehicle(veh);
++	if(!renderedVehicleVisualVlo)
++#endif
++		GameRender::SubmitEntity(e);
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	if(bodySubmitStartedNs != 0)
++		renderSample.vehiclePhaseNs
++			[androidgame::QUEST_VEHICLE_RENDER_PHASE_BODY_SUBMIT] +=
++			androidgame::QuestProfilerNowNanoseconds()-
++			bodySubmitStartedNs;
++#endif
+ 
+ 	if(e->IsVehicle()){
+ 		e->bImBeingRendered = true;
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		const uint64 alphaAtomicsStartedNs = profileRenderEntity ?
++			androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 		CVisibilityPlugins::RenderAlphaAtomics();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		if(alphaAtomicsStartedNs != 0)
++			renderSample.vehiclePhaseNs
++				[androidgame::QUEST_VEHICLE_RENDER_PHASE_ALPHA_ATOMICS] +=
++				androidgame::QuestProfilerNowNanoseconds()-
++				alphaAtomicsStartedNs;
++#endif
+ 		e->bImBeingRendered = false;
+ 		SetCullMode(rwCULLMODECULLBACK);
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestVehicleVisualBudgetEndVehicle();
++#endif
+ 	}
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	const uint64 vehicleLightingRemoveStartedNs =
++		profileRenderEntity && e->IsVehicle() ?
++			androidgame::QuestProfilerNowNanoseconds() : 0;
++#endif
+ 	e->RemoveLighting(resetLights);
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	if(vehicleLightingRemoveStartedNs != 0)
++		renderSample.vehiclePhaseNs
++			[androidgame::QUEST_VEHICLE_RENDER_PHASE_LIGHTING] +=
++			androidgame::QuestProfilerNowNanoseconds()-
++			vehicleLightingRemoveStartedNs;
++#endif
+ 
+ 	POP_RENDERGROUP();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	if(profileRenderEntity){
++		renderSample.totalNs =
++			androidgame::QuestProfilerNowNanoseconds()-
++			renderEntityStartedNs;
++		androidgame::QuestProfilerSubmitRenderEntitySample(renderSample);
++	}
++#endif
+ }
+ 
+ void
+@@ -293,25 +429,11 @@ CRenderer::RenderRoads(void)
+ 	DeActivateDirectional();
+ 	SetAmbientColours();
+ 
+-	int roads = 0;
+ 	for(i = 0; i < ms_nNoOfVisibleEntities; i++){
+ 		e = ms_aVisibleEntityPtrs[i];
+-		if(IsRoad(e)){
++		if(IsRoad(e))
+ 			RenderOneRoad(e);
+-			roads++;
+-		}
+-	}
+-#ifdef RW_VULKAN
+-	// Diagnostic: the ground does not appear in the headset. Whether road
+-	// entities are being submitted at all decides between a visibility bug
+-	// and a draw bug.
+-	{
+-		static int frame;
+-		if((frame++ % 300) == 0)
+-			printf("[probe] roads submitted %d of %d visible\n",
+-			       roads, ms_nNoOfVisibleEntities);
+ 	}
+-#endif
+ 	POP_RENDERGROUP();
+ }
+ 
+@@ -465,6 +587,16 @@ CRenderer::RenderOneBuilding(CEntity *ent, float camdist)
+ {
+ 	if(ent->m_rwObject == nil)
+ 		return;
++#if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
++	// NEW_RENDERER owns a separate building list and bypasses
++	// RenderOneRoad/RenderOneNonRoad. Apply the same tracked-view rejection at
++	// its actual submission point, matching the desktop VR path.
++	if(!ShouldRenderInCurrentView(ent))
++		return;
++#endif
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerCountVisibleBuilding(ent);
++#endif
+ 
+ 	ent->bImBeingRendered = true;	// TODO: this seems wrong, but do we even need it?
+ 
+@@ -737,6 +869,51 @@ CRenderer::IsEntityOutsideCurrentView(CEntity *ent, bool complex)
+ }
+ 
+ #if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
++#ifdef RW_VULKAN
++static CVector gQuestOcclusionEyePosition[2];
++static uint32 gQuestOcclusionPreparedFrame;
++static uint8 gQuestOcclusionPreparedMask;
++
++void
++CRenderer::PrepareQuestOcclusionContexts(void)
++{
++	const uint32 frame = CTimer::GetFrameCounter();
++	gQuestOcclusionPreparedFrame = frame;
++	gQuestOcclusionPreparedMask = 0;
++	if(ms_nVrOcclusionCullingMode < VR_OCCLUSION_CULLING_AUTHORED)
++		return;
++
++	for(uint32 eye = 0; eye < 2; eye++){
++		float rwRight[3], rwUp[3], rwAt[3], position[3];
++		if(!rw::vulkan::getFirstPersonEyeViewFrame(
++		     eye, rwRight, rwUp, rwAt, position))
++			continue;
++
++		gQuestOcclusionEyePosition[eye] =
++			CVector(position[0], position[1], position[2]);
++		gQuestOcclusionPreparedMask |= (uint8)(1U << eye);
++	}
++}
++#endif
++
++void
++CRenderer::SetVrOcclusionCullingMode(int32 mode)
++{
++	ms_nVrOcclusionCullingMode = Min(Max(mode,
++		(int32)VR_OCCLUSION_CULLING_OFF),
++		(int32)VR_OCCLUSION_CULLING_MODE_COUNT-1);
++}
++
++const char *
++CRenderer::GetVrOcclusionCullingModeName(void)
++{
++	static const char *const names[VR_OCCLUSION_CULLING_MODE_COUNT] = {
++		"OFF - FULL 360", "STEREO SAFE", "AUTHORED EXPERIMENTAL",
++		"AGGRESSIVE EXPERIMENTAL"
++	};
++	return names[ms_nVrOcclusionCullingMode];
++}
++
+ bool
+ CRenderer::ShouldRenderInCurrentView(CEntity *ent)
+ {
+@@ -745,31 +922,72 @@ CRenderer::ShouldRenderInCurrentView(CEntity *ent)
+ 	if(ent == nil || ent->m_rwObject == nil)
+ 		return false;
+ #ifdef RW_VULKAN
+-	// The game camera's frustum test is useless here: the headset view is
+-	// wider and rotates freely away from it. Cull with a generous cone around
+-	// the actual view direction instead -- big buildings and the near field
+-	// always draw, everything else needs to be within 105 degrees of where
+-	// the player is looking.
++	// OFF is the correctness fallback: submit the complete 360-degree safety
++	// list exactly as it was collected. It intentionally costs performance but
++	// cannot create a per-view geometry hole.
++	if(ms_nVrOcclusionCullingMode == VR_OCCLUSION_CULLING_OFF)
++		return true;
++	// ConstructRenderList intentionally scans all around the player so a head
++	// turn cannot expose an empty sector. At submission time test the entity
++	// against the exact asymmetric OpenXR matrices of both eyes. This replaces
++	// the former centre-eye cone whose 12 degree margin retained tens of metres
++	// of off-screen geometry at ordinary world distances.
+ 	{
+-		rw::float32 viewYaw;
+-		if(!rw::vulkan::getFirstPersonViewYaw(&viewYaw))
+-			return true;	// camera-anchored frames draw everything
+-		if(ent->bIsBIGBuilding)
+-			return true;
+-		// The entity position is the model origin, which for road pieces can
+-		// sit tens of metres from the mesh under the player's feet. Slack the
+-		// test by the bounding radius or the ground gets culled in patches.
++		const bool aggressive = ms_nVrOcclusionCullingMode ==
++			VR_OCCLUSION_CULLING_AGGRESSIVE;
+ 		const float radius = ent->GetBoundRadius();
+-		const CVector to = ent->GetPosition() - ms_vecCameraPosition;
+-		const float d2 = to.x*to.x + to.y*to.y;
+-		if(d2 < SQR(20.0f + radius))
++		const CVector boundCentre = ent->GetBoundCentre();
++		// Keep a generous guard around the exact stereo union. This prevents
++		// distant entities flickering at the edge during fast head rotation;
++		// wall rejection comes from occlusion below, not from shaving the FOV.
++		const float angularMarginTangent =
++			ms_nVrOcclusionCullingMode == VR_OCCLUSION_CULLING_SAFE ?
++			0.14054083f : (aggressive ? 0.05240778f : 0.08748866f);
++		bool stereoVisible = true;
++		if(ent->IsBuilding()){
++			CColModel *colModel = CModelInfo::GetModelInfo(
++				ent->GetModelIndex())->GetColModel();
++			if(colModel != nil){
++				const CVector &boxMin = colModel->boundingBox.min;
++				const CVector &boxMax = colModel->boundingBox.max;
++				float worldCorners[8][3];
++				for(int corner = 0; corner < 8; corner++){
++					const CVector local(
++						(corner & 1) ? boxMax.x : boxMin.x,
++						(corner & 2) ? boxMax.y : boxMin.y,
++						(corner & 4) ? boxMax.z : boxMin.z);
++					const CVector world = ent->GetMatrix()*local;
++					worldCorners[corner][0] = world.x;
++					worldCorners[corner][1] = world.y;
++					worldCorners[corner][2] = world.z;
++				}
++				stereoVisible = rw::vulkan::
++					isFirstPersonWorldBoxVisibleInStereo(
++						worldCorners, angularMarginTangent) != 0;
++			}else
++				stereoVisible = rw::vulkan::
++					isFirstPersonWorldSphereVisibleInStereo(
++						&boundCentre.x, radius,
++						angularMarginTangent) != 0;
++		}else
++			stereoVisible = rw::vulkan::
++				isFirstPersonWorldSphereVisibleInStereo(
++					&boundCentre.x, radius,
++					angularMarginTangent) != 0;
++		if(!stereoVisible)
++			return false;
++		if(!ent->IsBuilding() ||
++		   ms_nVrOcclusionCullingMode == VR_OCCLUSION_CULLING_SAFE)
++			return true;
++		// STEREO SAFE deliberately stops above. Authored modes use exact world
++		// volume intersections from both physical eyes instead of the original
++		// symmetric 2D silhouette rasterizer. This makes headset roll and the
++		// asymmetric OpenXR frustums irrelevant to the occlusion decision.
++		if(gQuestOcclusionPreparedFrame != CTimer::GetFrameCounter() ||
++		   gQuestOcclusionPreparedMask != 0x3)
+ 			return true;
+-		float ang = Atan2(to.y, to.x) - viewYaw;
+-		while(ang > PI) ang -= TWOPI;
+-		while(ang < -PI) ang += TWOPI;
+-		const float dist = Sqrt(d2);
+-		const float slack = Asin(Min(1.0f, radius/dist));
+-		return Abs(ang) < DEGTORAD(105.0f) + slack;
++		return !COcclusion::IsEntityOccludedByVolumeStereo(ent,
++			gQuestOcclusionEyePosition, aggressive);
+ 	}
+ #endif
+ 	// Large buildings need their full box tested. Ordinary entities use the
+@@ -915,9 +1133,21 @@ CRenderer::SetupEntityVisibility(CEntity *ent)
+ 		}
+ 
+ 		if(mi->m_alpha != 255){
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			// A full sorted list must never make the entity vanish for
++			// the frame: snap it solid and fall through to the normal
++			// render instead. Silent drop here was the deterministic
++			// "same props blink out at the same spots" bug.
++			if(CVisibilityPlugins::InsertEntityIntoSortedList(ent, dist)){
++				ent->bDistanceFade = true;
++				return VIS_INVISIBLE;
++			}
++			mi->m_alpha = 255;
++#else
+ 			CVisibilityPlugins::InsertEntityIntoSortedList(ent, dist);
+ 			ent->bDistanceFade = true;
+ 			return VIS_INVISIBLE;
++#endif
+ 		}
+ 
+ 		if(mi->m_drawLast || ent->bDrawLast){
+diff --git a/src/render/Renderer.h b/src/render/Renderer.h
+index 048416e..7794fec 100644
+--- a/src/render/Renderer.h
++++ b/src/render/Renderer.h
+@@ -30,6 +30,17 @@ extern bool gbDontRenderVehicles;
+ class CVehicle;
+ class CPtrList;
+ 
++#if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
++enum eVrOcclusionCullingMode
++{
++	VR_OCCLUSION_CULLING_OFF = 0,
++	VR_OCCLUSION_CULLING_SAFE,
++	VR_OCCLUSION_CULLING_AUTHORED,
++	VR_OCCLUSION_CULLING_AGGRESSIVE,
++	VR_OCCLUSION_CULLING_MODE_COUNT
++};
++#endif
++
+ // unused
+ struct BlockedRange
+ {
+@@ -56,6 +67,7 @@ class CRenderer
+ #if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
+ 	static bool ms_bVrOmnidirectionalScan;
+ 	static bool ms_bVrPerViewCulling;
++	static int32 ms_nVrOcclusionCullingMode;
+ #endif
+ 	static bool IsEntityOutsideCurrentView(CEntity *ent, bool complex = false);
+ 
+@@ -66,8 +78,26 @@ class CRenderer
+ public:
+ 	static float ms_lodDistScale;
+ 	static bool m_loadingPriority;
++	// Read-only diagnostics for the native Quest profiler. Keeping these behind
++	// accessors avoids exposing the renderer's internal arrays.
++	static int32 GetVisibleEntityCount(void) { return ms_nNoOfVisibleEntities; }
++	static int32 GetInvisibleEntityCount(void) { return ms_nNoOfInVisibleEntities; }
+ #if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
+ 	static void SetVrPerViewCulling(bool enabled) { ms_bVrPerViewCulling = enabled; }
++	static void SetVrViewCameraPosition(const CVector &position) { ms_vecCameraPosition = position; }
++	static void SetVrOcclusionCulling(bool enabled) {
++		SetVrOcclusionCullingMode(enabled ? VR_OCCLUSION_CULLING_SAFE :
++			VR_OCCLUSION_CULLING_OFF);
++	}
++	static void SetVrOcclusionCullingMode(int32 mode);
++	static int32 GetVrOcclusionCullingMode(void) { return ms_nVrOcclusionCullingMode; }
++	static const char *GetVrOcclusionCullingModeName(void);
++	static bool IsVrOcclusionCullingEnabled(void) {
++		return ms_nVrOcclusionCullingMode != VR_OCCLUSION_CULLING_OFF;
++	}
++#ifdef RW_VULKAN
++	static void PrepareQuestOcclusionContexts(void);
++#endif
+ 	static bool ShouldRenderInCurrentView(CEntity *ent);
+ #endif
+ 
+@@ -81,7 +111,7 @@ public:
+ 	static void RenderEverythingBarRoads(void);
+ 	static void RenderBoats(void);
+ 	static void RenderOneRoad(CEntity *);
+-	static void RenderOneNonRoad(CEntity *);
++	static void RenderOneNonRoad(CEntity *, bool fadingPath = false);
+ 	static void RenderFirstPersonVehicle(void);
+ 
+ 	static void RenderCollisionLines(void);
+diff --git a/src/rw/VisibilityPlugins.cpp b/src/rw/VisibilityPlugins.cpp
+index 82a50b9..ab9f17b 100644
+--- a/src/rw/VisibilityPlugins.cpp
++++ b/src/rw/VisibilityPlugins.cpp
+@@ -13,6 +13,12 @@
+ #include "World.h"
+ #include "custompipes.h"
+ #include "MemoryHeap.h"
++#ifdef RW_VULKAN
++#include "vulkan/rwvk.h"
++#ifdef __ANDROID__
++#include "QuestProfiler.h"
++#endif
++#endif
+ 
+ CLinkList<CVisibilityPlugins::AlphaObjectInfo> CVisibilityPlugins::m_alphaList;
+ CLinkList<CVisibilityPlugins::AlphaObjectInfo> CVisibilityPlugins::m_alphaBoatAtomicList;
+@@ -237,7 +243,13 @@ CVisibilityPlugins::RenderAtomicList(CLinkList<AlphaObjectInfo> &list)
+ void
+ CVisibilityPlugins::RenderAlphaAtomics(void)
+ {
++	#ifdef RW_VULKAN
++	rw::vulkan::setVehicleAlphaPass(TRUE);
++	#endif
+ 	RenderAtomicList(m_alphaList);
++	#ifdef RW_VULKAN
++	rw::vulkan::setVehicleAlphaPass(FALSE);
++	#endif
+ }
+ 
+ void
+@@ -270,6 +282,10 @@ CVisibilityPlugins::RenderFadingEntities(CLinkList<AlphaObjectInfo> &list)
+ 			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, FALSE);
+ 
+ 		if(e->bDistanceFade){
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++			if(e->IsBuilding())
++				androidgame::QuestProfilerCountVisibleBuilding(e);
++#endif
+ 			DeActivateDirectional();
+ 			SetAmbientColours();
+ 			e->bImBeingRendered = true;
+@@ -278,7 +294,7 @@ CVisibilityPlugins::RenderFadingEntities(CLinkList<AlphaObjectInfo> &list)
+ 			POP_RENDERGROUP();
+ 			e->bImBeingRendered = false;
+ 		}else
+-			CRenderer::RenderOneNonRoad(e);
++			CRenderer::RenderOneNonRoad(e, true);
+ 
+ 		if(mi->GetModelType() == MITYPE_SIMPLE && mi->m_noZwrite)
+ 			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+@@ -348,6 +364,13 @@ CVisibilityPlugins::RenderAlphaAtomic(RpAtomic *atomic, int alpha)
+ 	return atomic;
+ }
+ 
++RpAtomic*
++CVisibilityPlugins::RenderAtomicDefault(RpAtomic *atomic)
++{
++	RENDERCALLBACK(atomic);
++	return atomic;
++}
++
+ RpAtomic*
+ CVisibilityPlugins::RenderWeaponCB(RpAtomic *atomic)
+ {
+diff --git a/src/rw/VisibilityPlugins.h b/src/rw/VisibilityPlugins.h
+index 9cdbc0c..93589b9 100644
+--- a/src/rw/VisibilityPlugins.h
++++ b/src/rw/VisibilityPlugins.h
+@@ -52,6 +52,9 @@ public:
+ 	static RpAtomic *RenderWheelAtomicCB(RpAtomic *atomic);
+ 	static RpAtomic *RenderObjNormalAtomic(RpAtomic *atomic);
+ 	static RpAtomic *RenderAlphaAtomic(RpAtomic *atomic, int alpha);
++	// Bypass an atomic's installed LOD callback after an external policy has
++	// already selected the exact geometry to draw.
++	static RpAtomic *RenderAtomicDefault(RpAtomic *atomic);
+ 	static RpAtomic *RenderWeaponCB(RpAtomic *atomic);
+ 	static RpAtomic *RenderFadingAtomic(RpAtomic *atm, float dist);
+ 
+diff --git a/src/vehicles/Automobile.cpp b/src/vehicles/Automobile.cpp
+index 0563158..9c0e17d 100644
+--- a/src/vehicles/Automobile.cpp
++++ b/src/vehicles/Automobile.cpp
+@@ -54,6 +54,9 @@
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ #include "OculusVR.h"
+ #endif
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#include "PhysicsDirector.h"
++#endif
+ 
+ bool bAllCarCheat;
+ 
+@@ -82,6 +85,10 @@ CAutomobile::CAutomobile(int32 id, uint8 CreatedBy)
+ 	bFixedColour = false;
+ 	bBigWheels = false;
+ 	bWaterTight = false;
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	m_bVrSteeringWheelNeutralValid = false;
++	m_fVrSteeringWheelAppliedAngle = 0.0f;
++#endif
+ 
+ 	SetModelIndex(id);
+ 
+@@ -243,6 +250,10 @@ CAutomobile::CAutomobile(int32 id, uint8 CreatedBy)
+ void
+ CAutomobile::SetModelIndex(uint32 id)
+ {
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	m_bVrSteeringWheelNeutralValid = false;
++	m_fVrSteeringWheelAppliedAngle = 0.0f;
++#endif
+ 	CVehicle::SetModelIndex(id);
+ 	SetupModelNodes();
+ }
+@@ -463,8 +474,23 @@ CAutomobile::ProcessControl(void)
+ 		break;
+ 
+ 	case STATUS_SIMPLE:
+-		CCarAI::UpdateCarAI(this);
++	{
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++		const bool runVrRailAi =
++			androidgame::QuestPhysicsDirectorShouldRunRailAi(this);
++		const uint64 vrRailAiStarted = runVrRailAi ?
++			androidgame::QuestPhysicsDirectorBeginRailAi(this) : 0;
++		if(runVrRailAi)
++#endif
++			CCarAI::UpdateCarAI(this);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++		if(runVrRailAi)
++			androidgame::QuestPhysicsDirectorEndRailAi(this,
++				vrRailAiStarted);
++#endif
+ 		CPhysical::ProcessControl();
++		// Keep path progress and visual transforms at the native frame rate.
++		// V2 only schedules the policy update above and the later generic scan.
+ 		CCarCtrl::UpdateCarOnRails(this);
+ 
+ 		m_nWheelsOnGround = 4;
+@@ -483,6 +509,7 @@ CAutomobile::ProcessControl(void)
+ 		bAudioChangingGear = false;
+ 		// that's all we do for simple vehicles
+ 		return;
++	}
+ 
+ 	case STATUS_PHYSICS:
+ 		CCarAI::UpdateCarAI(this);
+@@ -710,6 +737,9 @@ CAutomobile::ProcessControl(void)
+ 		// This has to be done if ProcessEntityCollision wasn't called
+ 		if(!bVehicleColProcessed){
+ 			CMatrix mat(GetMatrix());
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			bool vrCollisionFlatScope = false;
++#endif
+ 			bIsStuck = false;
+ 			bHasContacted = false;
+ 			bIsInSafePosition = false;
+@@ -721,10 +751,24 @@ CAutomobile::ProcessControl(void)
+ 			ApplyMoveSpeed();
+ 			ApplyTurnSpeed();
+ 			for(i = 0; CheckCollision() && i < 5; i++){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				androidgame::QuestPhysicsDirectorRecordRetry(this);
++#endif
+ 				GetMatrix() = mat;
+ 				ApplyMoveSpeed();
+ 				ApplyTurnSpeed();
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				// The common no-collision case pays no cache-build cost.  Start
++				// caching only after the first collision proves a retry is needed.
++				if(!vrCollisionFlatScope){
++					vrCollisionFlatScope = BeginVrCollisionFlatCacheScope();
++				}
++#endif
+ 			}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			if(vrCollisionFlatScope)
++				EndVrCollisionFlatCacheScope();
++#endif
+ 			bIsInSafePosition = true;
+ 			bIsStuck = false;			
+ 		}
+@@ -1743,6 +1787,12 @@ CAutomobile::PreRender(void)
+ 	int i, j, n;
+ 	CVehicleModelInfo *mi = (CVehicleModelInfo*)CModelInfo::GetModelInfo(GetModelIndex());
+ 
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	// Do this before the clump is submitted. It is a no-op for the stock/baked
++	// cabin wheel and for every replacement model without a dedicated frame.
++	OculusVR::UpdateImmersiveCarModelSteeringWheel(this);
++#endif
++
+ 	if(GetModelIndex() == MI_RHINO && m_aCarNodes[CAR_WINDSCREEN]){
+ 		// Rotate Rhino turret
+ 		CMatrix m;
+@@ -2560,7 +2610,12 @@ CAutomobile::PreRender(void)
+ 		if(!CWaterLevel::GetWaterLevel(GetPosition(), &waterZ, false))
+ 			waterZ = 0.0f;
+ 		groundZ = Max(groundZ, waterZ);
+-		float rnd = (m_aWheelSpeed[1]-0.1125f)*((int)Max(16.0f-4.0f*CTimer::GetTimeStep(),2.0f))*400.0f/43.0f;
++		// Keep the authored 30 Hz emission strength; HeliDustGenerate performs
++		// the frame-rate conversion for VR instead of multiplying particles by
++		// the headset refresh rate.
++		const float authoredTimeStep = 50.0f/30.0f;
++		float rnd = (m_aWheelSpeed[1]-0.1125f)*
++			((int)Max(16.0f-4.0f*authoredTimeStep, 2.0f))*400.0f/43.0f;
+ 		float radius = 10.0f;
+ 		if(GetModelIndex() == MI_RCGOBLIN || GetModelIndex() == MI_RCRAIDER)
+ 			radius = 3.0f;
+@@ -3054,10 +3109,16 @@ CAutomobile::ProcessEntityCollision(CEntity *ent, CColPoint *colpoints)
+ 	   GetModelIndex() == MI_DODO && ent->IsVehicle())
+ 		colModel->numLines = 0;
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorBeginVehicleNarrowPhase(this);
++#endif
+ 	int numCollisions = CCollision::ProcessColModels(GetMatrix(), *colModel,
+ 		ent->GetMatrix(), *ent->GetColModel(),
+ 		colpoints,
+ 		m_aWheelColPoints, m_aSuspensionSpringRatio);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorEndVehicleNarrowPhase(this);
++#endif
+ 
+ 	// m_aSuspensionSpringRatio are now set to the point where the tyre touches ground.
+ 	// In ProcessControl these will be re-normalized to ignore the tyre radius.
+@@ -3093,6 +3154,10 @@ CAutomobile::ProcessEntityCollision(CEntity *ent, CColPoint *colpoints)
+ 			   ent->IsObject() && ((CPhysical*)ent)->bInfiniteMass)
+ 				bHasHitWall = true;
+ 	}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorRecordContactManifold(this,
++		numCollisions > 0);
++#endif
+ 
+ 	return numCollisions;
+ }
+@@ -5452,6 +5517,13 @@ CAutomobile::Fix(void)
+ 	RpClumpForAllAtomics((RpClump*)m_rwObject, CVehicleModelInfo::HideAllComponentsAtomicCB, (void*)ATOMIC_FLAG_DAM);
+ 
+ 	for(component = CAR_BUMP_FRONT; component < NUM_CAR_NODES; component++){
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++		// This optional Modern-model node has its own authored neutral basis.
++		// The generic repair reset is for detachable damage components and would
++		// flatten the steering wheel before the VR animator can restore it.
++		if(component == CAR_STEERING_WHEEL)
++			continue;
++#endif
+ 		if(m_aCarNodes[component]){
+ 			CMatrix mat(RwFrameGetMatrix(m_aCarNodes[component]));
+ 			mat.SetTranslate(mat.GetPosition());
+@@ -5782,6 +5854,38 @@ CAutomobile::SetupModelNodes(void)
+ 	for(i = 0; i < NUM_CAR_NODES; i++)
+ 		m_aCarNodes[i] = nil;
+ 	CClumpModelInfo::FillFrameArray(GetClump(), m_aCarNodes);
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	// These are the independently-authored steering frames present in the
++	// current Modern model archive. Never fall back to interior/chassis frames:
++	// rotating either would turn the dashboard or the whole body with the wheel.
++	static const char *steeringFrameNames[] = {
++		"swheel_hi", "movsteer_1.0", "movsteer"
++	};
++	for(i = 0; i < (int)ARRAY_SIZE(steeringFrameNames) &&
++	   !m_aCarNodes[CAR_STEERING_WHEEL]; i++){
++		RwObjectNameAssociation association;
++		association.name = steeringFrameNames[i];
++		association.frame = nil;
++		RwFrameForAllChildren(RpClumpGetFrame(GetClump()),
++			CClumpModelInfo::FindFrameFromNameCB, &association);
++		// Empty steerwheel_dummy markers in Bfinject/Bobcat have no visual child,
++		// so accepting a frame without its own atomic would promise movement while
++		// still rotating nothing. Only isolated, actually rendered wheel atomics
++		// qualify for model-wheel animation.
++		RwObject *object = association.frame ?
++			GetFirstObject(association.frame) : nil;
++		if(object && RwObjectGetType(object) == rpATOMIC)
++			m_aCarNodes[CAR_STEERING_WHEEL] = association.frame;
++	}
++	m_bVrSteeringWheelNeutralValid =
++		m_aCarNodes[CAR_STEERING_WHEEL] != nil;
++	m_fVrSteeringWheelAppliedAngle = 0.0f;
++	if(m_bVrSteeringWheelNeutralValid){
++		CMatrix neutral(RwFrameGetMatrix(
++			m_aCarNodes[CAR_STEERING_WHEEL]), false);
++		m_vrSteeringWheelNeutralMatrix.CopyOnlyMatrix(neutral);
++	}
++#endif
+ }
+ 
+ void
+diff --git a/src/vehicles/Automobile.h b/src/vehicles/Automobile.h
+index 16d8691..da3889c 100644
+--- a/src/vehicles/Automobile.h
++++ b/src/vehicles/Automobile.h
+@@ -77,6 +77,14 @@ public:
+ 	uint8 m_nDriveWheelsOnGroundPrev;
+ 	float m_fGasPedalAudio;
+ 	tWheelState m_aWheelState[4];
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	// Per-instance neutral pose for an optional, independently-authored cabin
++	// steering wheel. Keeping it on the vehicle avoids a stale global frame
++	// pointer when cars are deleted or pool slots are reused.
++	CMatrix m_vrSteeringWheelNeutralMatrix;
++	bool m_bVrSteeringWheelNeutralValid;
++	float m_fVrSteeringWheelAppliedAngle;
++#endif
+ 
+ 	static bool m_sAllTaxiLights;
+ 
+@@ -172,4 +180,4 @@ public:
+ };
+ 
+ extern CVector vecHunterGunPos;
+-extern bool bAllCarCheat;
+\ No newline at end of file
++extern bool bAllCarCheat;
+diff --git a/src/vehicles/Bike.cpp b/src/vehicles/Bike.cpp
+index 048ce56..9cd8a2c 100644
+--- a/src/vehicles/Bike.cpp
++++ b/src/vehicles/Bike.cpp
+@@ -39,6 +39,9 @@
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ #include "OculusVR.h"
+ #endif
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#include "PhysicsDirector.h"
++#endif
+ 
+ const uint32 CBike::nSaveStructSize =
+ #ifdef COMPATIBLE_SAVES
+@@ -554,6 +557,9 @@ CBike::ProcessControl(void)
+ 			ApplyMoveSpeed();
+ 			ApplyTurnSpeed();
+ 			for(i = 0; CheckCollision() && i < 5; i++){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				androidgame::QuestPhysicsDirectorRecordRetry(this);
++#endif
+ 				GetMatrix() = mat;
+ 				ApplyMoveSpeed();
+ 				ApplyTurnSpeed();
+@@ -1780,10 +1786,16 @@ CBike::ProcessEntityCollision(CEntity *ent, CColPoint *colpoints)
+ 	   GetModelIndex() == MI_DODO && ent->IsVehicle())
+ 		colModel->numLines = 0;
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorBeginVehicleNarrowPhase(this);
++#endif
+ 	int numCollisions = CCollision::ProcessColModels(GetMatrix(), *colModel,
+ 		ent->GetMatrix(), *ent->GetColModel(),
+ 		colpoints,
+ 		m_aWheelColPoints, m_aSuspensionSpringRatio);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorEndVehicleNarrowPhase(this);
++#endif
+ 
+ 	// m_aSuspensionSpringRatio are now set to the point where the tyre touches ground.
+ 	// In ProcessControl these will be re-normalized to ignore the tyre radius.
+@@ -1819,6 +1831,10 @@ CBike::ProcessEntityCollision(CEntity *ent, CColPoint *colpoints)
+ 			   ent->IsObject() && ((CPhysical*)ent)->bInfiniteMass)
+ 				bHasHitWall = true;
+ 	}
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	androidgame::QuestPhysicsDirectorRecordContactManifold(this,
++		numCollisions > 0);
++#endif
+ 
+ 	return numCollisions;
+ }
+diff --git a/src/vehicles/Vehicle.h b/src/vehicles/Vehicle.h
+index 2fb2caf..8f2cb87 100644
+--- a/src/vehicles/Vehicle.h
++++ b/src/vehicles/Vehicle.h
+@@ -41,6 +41,11 @@ enum eCarNodes
+ 	CAR_BONNET,
+ 	CAR_BOOT,
+ 	CAR_WINDSCREEN,
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	// Optional interior steering-wheel frame. Stock models generally bake the
++	// wheel into chassis_hi; replacement DFFs may expose a dedicated node.
++	CAR_STEERING_WHEEL,
++#endif
+ 	NUM_CAR_NODES,
+ };
+ 
+@@ -379,7 +384,9 @@ public:
+ 	void SetComponentAtomicAlpha(RpAtomic *atomic, int32 alpha);
+ 	void UpdateClumpAlpha(void);
+ 
+-	static void HeliDustGenerate(CEntity *heli, float radius, float ground, int rnd);
++	// particlesAt30Hz is the authored emission count for one 30 Hz frame.
++	// HeliDustGenerate converts it to a real-time rate for high-refresh VR.
++	static void HeliDustGenerate(CEntity *heli, float radius, float ground, float particlesAt30Hz);
+ 	void DoSunGlare(void);
+ 
+ 	bool IsAlarmOn(void) { return m_nAlarmState != 0 && m_nAlarmState != -1 && GetStatus() != STATUS_WRECKED; }

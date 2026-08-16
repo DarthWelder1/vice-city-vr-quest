@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
+#include <unordered_map>
 
 #include "../rwbase.h"
 #include "../rwerror.h"
@@ -22,6 +24,100 @@
 
 namespace rw {
 namespace vulkan {
+
+static bool32 vehicleAlphaPass;
+static bool32 dynamicObjectPass;
+
+struct AtomicMotionRecord
+{
+	float32 model[16];
+	float32 motion[4];
+	uint64 serial;
+	bool32 initialized;
+};
+
+static std::unordered_map<Atomic*, AtomicMotionRecord> atomicMotionHistory;
+
+void
+resetAtomicMotionHistory(void)
+{
+	atomicMotionHistory.clear();
+}
+
+static void
+packAtomicRootMotion(Atomic *atomic, bool32 potentiallyDynamic,
+                     PushConstants &push)
+{
+	// Affine matrices always have (0,0,0,1) in this row. The shaders restore
+	// those constants before use, so the four slots are safe debug-only
+	// transport for previous-current root translation and validity.
+	float32 motion[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	if(gvk.sgsrMode != SGSR_OFF && potentiallyDynamic){
+		AtomicMotionRecord &record = atomicMotionHistory[atomic];
+		if(record.serial == gvk.motionFrameSerial){
+			memcpy(motion, record.motion, sizeof(motion));
+		}else{
+			if(record.initialized && record.serial+1 == gvk.motionFrameSerial){
+				const SceneData *scene = getSceneData();
+				for(int32 eye = 0; eye < 2; eye++){
+					// SGSR2 receives projection jitter separately. Root velocity is
+					// therefore measured between unjittered frames, matching the
+					// reference dynamic-motion contract.
+					const float32 *currentVp =
+						gvk.stereoViewProjectionUnjittered[eye];
+					const float32 *previousVp = scene->previousViewProj[eye];
+					const float32 *currentModel = push.model;
+					const float32 *previousModel = record.model;
+					float32 currentClip[4], previousClip[4];
+					for(int32 row = 0; row < 4; row++){
+						currentClip[row] =
+							currentVp[row]*currentModel[12] +
+							currentVp[4+row]*currentModel[13] +
+							currentVp[8+row]*currentModel[14] +
+							currentVp[12+row];
+						previousClip[row] =
+							previousVp[row]*previousModel[12] +
+							previousVp[4+row]*previousModel[13] +
+							previousVp[8+row]*previousModel[14] +
+							previousVp[12+row];
+					}
+					if(isfinite(currentClip[3]) && isfinite(previousClip[3]) &&
+					   fabsf(currentClip[3]) > 1.0e-6f &&
+					   fabsf(previousClip[3]) > 1.0e-6f){
+						const float32 x = currentClip[0]/currentClip[3] -
+						                  previousClip[0]/previousClip[3];
+						const float32 y = currentClip[1]/currentClip[3] -
+						                  previousClip[1]/previousClip[3];
+						if(isfinite(x) && isfinite(y) && x*x+y*y <= 4.0f){
+							motion[eye*2+0] = x;
+							motion[eye*2+1] = y;
+						}
+					}
+				}
+			}
+			memcpy(record.model, push.model, sizeof(record.model));
+			memcpy(record.motion, motion, sizeof(record.motion));
+			record.serial = gvk.motionFrameSerial;
+			record.initialized = 1;
+		}
+	}
+	push.model[3] = motion[0];
+	push.model[7] = motion[1];
+	push.model[11] = motion[2];
+	push.model[15] = motion[3];
+}
+
+void
+setVehicleAlphaPass(bool32 enabled)
+{
+	vehicleAlphaPass = enabled;
+}
+
+void
+setDynamicObjectPass(bool32 enabled)
+{
+	dynamicObjectPass = enabled;
+}
 
 void
 destroyStaticBuffer(VkBuffer &buffer, VkDeviceMemory &memory)
@@ -336,6 +432,18 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	// matrix is all that is left to apply. Done here rather than in the scene
 	// block because the camera can change again before the frame is submitted.
 	multiplyMatrix(push.model, gvk.worldToPlay, objectToWorld);
+	Geometry *geometry = atomic->geometry;
+	// Vice City's static world is prelit and has LIGHT unset. Peds, vehicles,
+	// held weapons and their moving parts use dynamic lighting, which gives us
+	// a conservative backend-level dynamic-object classifier without exposing
+	// game entity types to librw.
+	// Do not infer motion from Geometry::LIGHT: some static road/building
+	// sectors carry that flag and produced alternating diagnostic triangles.
+	// Game entities mark their synchronous clump explicitly; deferred vehicle
+	// glass/body alpha atomics use the dedicated vehicle pass; skinned peds are
+	// always persistent dynamic geometry.
+	packAtomicRootMotion(atomic,
+		dynamicObjectPass || vehicleAlphaPass || shader == SHADER_SKIN, push);
 
 	// Lighting, resolved per atomic exactly as gl3's lightingCB does: world
 	// geometry is unlit (prelight only), peds and vehicles take the world's
@@ -346,7 +454,6 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	push.lightDirColour[1] = 0.0f;
 	push.lightDirColour[2] = 1.0f;
 	push.lightDirColour[3] = 0.0f;	// packed RGBA8 black: no directional
-	Geometry *geometry = atomic->geometry;
 	if((geometry->flags & Geometry::LIGHT) && engine->currentWorld != nil){
 		Light *directionals[8];
 		WorldLights lights;
@@ -380,22 +487,6 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		}
 	}
 
-	// Diagnostic: what lighting skinned models actually receive. Cutscene
-	// characters render black while gameplay peds are lit; this says whether
-	// the difference is in the game's light data or in this backend. Prints
-	// the values as the shader will see them, so a missing LIGHT flag shows
-	// up as zero ambient here rather than silence.
-	if(shader == SHADER_SKIN){
-		static int32 lightProbe = 0;
-		if((lightProbe++ % 600) == 0)
-			printf("[probe] skin light: amb %.2f %.2f %.2f dirw 0x%08x "
-			       "flags 0x%x world %p\n",
-			       push.ambientLight[0], push.ambientLight[1],
-			       push.ambientLight[2],
-			       *(uint32*)&push.lightDirColour[3],
-			       geometry->flags, (void*)atomic->world);
-	}
-
 	const VkDeviceSize vertexOffset = 0;
 	vkCmdBindVertexBuffers(commandBuffer, 0, 1, &header->vbo, &vertexOffset);
 	vkCmdBindIndexBuffer(commandBuffer, header->ibo, 0, VK_INDEX_TYPE_UINT16);
@@ -410,7 +501,9 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	// Opaque meshes first, blended meshes second. File order interleaves them,
 	// and a blended triangle drawn before the opaque mesh behind it has only
 	// the background to blend against -- the classic see-through-body artifact.
-	// Depth writes stay on for the blended pass, matching the D3D12 backend.
+	// Vehicle alpha atomics frequently mix opaque bodywork and transparent side
+	// glass.  Keep depth writes for the opaque pass, but do not let that glass
+	// hide VR hands, held weapons and tracers rendered later in the frame.
 	for(int32 blendPass = 0; blendPass < 2; blendPass++){
 	InstanceData *inst = header->inst;
 	for(uint32 i = 0; i < header->numMeshes; i++, inst++){
@@ -435,8 +528,12 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 			(material && material->color.alpha != 0xFF) ||
 			textureAlpha ? 1 : 0);
 
+		const uint32 savedZWrite = gstate.zWriteEnabled;
+		if(vehicleAlphaPass && wantsBlend)
+			gstate.zWriteEnabled = 0;
 		VkPipeline pipeline = getPipeline(shader,
 		                                  (VkPrimitiveTopology)header->primType);
+		gstate.zWriteEnabled = savedZWrite;
 		if(pipeline == VK_NULL_HANDLE)
 			continue;
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);

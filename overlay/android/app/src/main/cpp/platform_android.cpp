@@ -243,6 +243,26 @@ releasePlayer(JNIEnv *env, jobject player)
 	env->DeleteGlobalRef(player);
 }
 
+static void
+releasePlayerAsync(jobject player, std::string cachePath)
+{
+	if(player == nullptr && cachePath.empty())
+		return;
+	std::thread([player, cachePath]() {
+		bool attached = false;
+		if(player != nullptr){
+			JNIEnv *env = getEnv(&attached);
+			if(env != nullptr)
+				releasePlayer(env, player);
+			else
+				LOGE("could not attach MediaPlayer release worker");
+		}
+		if(!cachePath.empty())
+			unlink(cachePath.c_str());
+		releaseEnv(attached);
+	}).detach();
+}
+
 static bool
 isAdf(const std::string &path)
 {
@@ -510,27 +530,20 @@ audioLoadStream(int stream, const char *absolutePath, int positionMs,
 
 	MediaStreamState &state = gMediaStreams[stream];
 	const uint32_t generation = state.generation.fetch_add(1) + 1;
-	bool attached = false;
-	JNIEnv *env = getEnv(&attached);
-	if(env == nullptr)
-		return false;
+	jobject retiredPlayer = nullptr;
+	std::string retiredCachePath;
 	{
 		std::lock_guard<std::mutex> lock(state.mutex);
-		if(state.player != nullptr){
-			releasePlayer(env, state.player);
-			state.player = nullptr;
-		}
-		if(!state.cachePath.empty()){
-			unlink(state.cachePath.c_str());
-			state.cachePath.clear();
-		}
+		retiredPlayer = state.player;
+		state.player = nullptr;
+		retiredCachePath.swap(state.cachePath);
 		state.requestedPlaying = autoStart;
 		state.preparing = true;
 		state.loop = loop;
 		state.positionMs = positionMs < 0 ? 0 : positionMs;
 		state.durationMs = 0;
 	}
-	releaseEnv(attached);
+	releasePlayerAsync(retiredPlayer, retiredCachePath);
 
 	const std::string source = absolutePath;
 	std::thread([stream, generation, source]() {
@@ -666,19 +679,17 @@ void audioStopStream(int stream)
 	if(stream < 0 || stream >= 3) return;
 	MediaStreamState &state = gMediaStreams[stream];
 	state.generation.fetch_add(1);
-	bool attached = false; JNIEnv *env = getEnv(&attached);
-	if(env){
+	jobject retiredPlayer = nullptr;
+	std::string retiredCachePath;
+	{
 		std::lock_guard<std::mutex> lock(state.mutex);
 		state.requestedPlaying = false;
 		state.preparing = false;
-		releasePlayer(env, state.player);
+		retiredPlayer = state.player;
 		state.player = nullptr;
-		if(!state.cachePath.empty()){
-			unlink(state.cachePath.c_str());
-			state.cachePath.clear();
-		}
+		retiredCachePath.swap(state.cachePath);
 	}
-	releaseEnv(attached);
+	releasePlayerAsync(retiredPlayer, retiredCachePath);
 }
 
 void audioSetStreamVolume(int stream, float left, float right)

@@ -14,21 +14,48 @@
 #include "platform_android.h"
 #include "OculusVR.h"
 #include "QuestProfiler.h"
+#include "PhysicsDirector.h"
+#include "VehicleVisualDirector.h"
+#include "xr_vulkan_session.h"
 #include "WeaponType.h"
+#include "IniFile.h"
+#include "Population.h"
+#include "ModelSets.h"
+#include "CarCtrl.h"
 #include "vulkan/rwvk.h"
+#include "Pools.h"
+#include "Game.h"
+#include "Frontend.h"
+#include "Renderer.h"
+#include "Shadows.h"
+#include "ParticleObject.h"
+#include "CutsceneMgr.h"
+#include "PlayerInfo.h"
+#include "PlayerPed.h"
+#include "Timer.h"
+#include "crossplatform.h"
+#include <android/log.h>
 
 extern int GetVrCheatCount(void);
 extern const char *GetVrCheatName(int index);
 extern bool ActivateVrCheat(int index);
+extern bool CycleVrCheatSelection(int index, int direction);
+extern bool GetVrCheatToggleState(int index, bool *enabled);
+extern int GetVrMissionCategoryCount(void);
+extern const char *GetVrMissionCategoryName(int category);
+extern int GetVrMissionCount(int category);
+extern const char *GetVrMissionName(int category, int item);
+extern bool ActivateVrMission(int category, int item);
 extern int GetVrWeaponTypeForSlot(int slot);
 extern const char *GetVrWeaponName(int weaponType);
 
 enum {
 	VR_DEBUG_WIDTH = 512,
-	VR_DEBUG_HEIGHT = 128,
+	VR_DEBUG_HEIGHT = 437,
+	VR_FPS_HEIGHT = 128,
 	VR_MENU_WIDTH = 1024,
 	VR_MENU_HEIGHT = 768,
-	VR_CHEAT_ITEMS_PER_PAGE = 10,
+	VR_CHEAT_ITEMS_PER_PAGE = 14,
 };
 
 // --- verbatim from OpenXRVR.cpp -------------------------------------------
@@ -37,6 +64,7 @@ static const DebugGlyph gDebugGlyphs[] = {
 	{' ',{0x00,0x00,0x00,0x00,0x00,0x00,0x00}}, {'%',{0x11,0x12,0x02,0x04,0x08,0x09,0x11}},
 	{'+',{0x00,0x04,0x04,0x1F,0x04,0x04,0x00}},
 	{'.',{0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}},
+	{'/',{0x01,0x02,0x02,0x04,0x08,0x08,0x10}},
 	{'-',{0x00,0x00,0x00,0x1F,0x00,0x00,0x00}}, {'<',{0x02,0x04,0x08,0x10,0x08,0x04,0x02}},
 	{'>',{0x08,0x04,0x02,0x01,0x02,0x04,0x08}},
 	{'[',{0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}},
@@ -69,7 +97,6 @@ static uint8 gVrMenuPixels[VR_MENU_WIDTH*VR_MENU_HEIGHT*4];
 static int gDebugFps;
 static double gDebugPreviousFrameMs;
 static float gDebugSmoothedFrameMs;
-static bool gTouchDebugShortcutDown;
 static bool gTouchProfilerShortcutDown;
 static bool gTouchRecenterShortcutDown;
 static bool gVrMenuVisible;
@@ -77,27 +104,48 @@ static bool gVrMenuShortcutDown;
 static bool gVrCheatShortcutDown;
 static bool gVrMenuSelectDown;
 static bool gVrMenuBackDown;
-static bool gVrMenuNavigateDown;
+static int gVrMenuNavigateDirection;
+static double gVrMenuNavigateRepeatAt;
 static bool gVrMenuIncreaseDown;
 static bool gVrMenuDecreaseDown;
+static bool gVrCheatCycleDown;
 static double gVrMenuIncreaseRepeatAt;
 static double gVrMenuDecreaseRepeatAt;
+static double gVrMenuIncreaseHoldStart;
+static double gVrMenuDecreaseHoldStart;
 static bool gVrSettingsLoaded;
 static bool gViceCityColorEnabled = true;
-static bool gFxaaEnabled = true;
+// Stable single-frame FXAA. The stronger 3x3 experiment produced no visible
+// headset improvement over this path, so do not expose duplicate choices.
+static int gSpatialAaMode = 1;
+static bool gQuestQuickTestStart;
+static int gQuestRenderScalePercent = 125;
+static int gQuestSgsrMode = rw::vulkan::SGSR_OFF;
+static int gQuestMsaaSamples = 1;
+static int gOcclusionCullingMode = VR_OCCLUSION_CULLING_SAFE;
 static bool gGameplayHudEnabled = true;
 static int gHudWidthPercent = 100;
 static int gHudScalePercent = 130;
 static int gHudOffsetXCm;
 static int gHudOffsetYCm;
 static int gQuestMovementOrientation = 1;
+// 0.4.1 PC parity: walking head bob is off by default; the anchor holds a
+// stable eye height while the legs animate.
+static int gQuestHeadBobbing = 0;
+// 72 is the safe default; the Quest 3 display also offers 80/90/120 and the
+// game holds 90 with headroom after the traffic director work.
+static int gQuestRefreshRateHz = 72;
 static int gQuestTurnMode;
 static int gQuestTurnSensitivityPercent = 100;
 static int gQuestHeadSteeringSensitivityPercent = 50;
 static int gQuestSnapTurnAngleDegrees = 30;
 static int gVrMenuPage;
 static int gVrMenuSelection;
+static int gVrGraphicsSelection;
+static int gVrWeaponsSelection;
 static int gVrHudSelection;
+static int gVrTrafficSelection;
+static int gVrModelAssetsSelection;
 static int gVrCheatSelection;
 static int gVrVehicleSelection;
 static int gVrVehicleCalibrationSelection;
@@ -106,18 +154,49 @@ static int gVrLocomotionSelection;
 static int gVrCalibrationSelection;
 static int gVrCalibrationHand = 1;
 static int gVrHolsterSelection;
+static bool gVrWelcomePending;
+static bool gVrWelcomeFirstRun;
+static bool gVrAboutDismissArmed;
+static bool gVrAboutReleaseGate;
+static bool gVrWelcomeBaselineValid;
+static CVector gVrWelcomeBaseline;
 static int gVrCheatStatusFrames;
 static char gVrCheatStatus[48];
+static int gVrMissionCategory = -1;
+static int gVrMissionCategorySelection;
+static int gVrMissionSelection;
+static int gTrafficPedPercent = 135;
+static int gTrafficCarPercent = 135;
+static int gQuestCpuPerformanceMode;
+static int gQuestCpuPerformanceSavedMode;
+static int gQuestGpuPerformanceMode = 1; // SUSTAINED; enum is declared below.
 
 enum {
 	VR_MENU_PAGE_SETTINGS,
+	VR_MENU_PAGE_GRAPHICS,
+	VR_MENU_PAGE_WEAPONS,
 	VR_MENU_PAGE_HUD,
+	VR_MENU_PAGE_TRAFFIC,
+	VR_MENU_PAGE_MODEL_ASSETS,
 	VR_MENU_PAGE_VEHICLE,
 	VR_MENU_PAGE_VEHICLE_CALIBRATION,
 	VR_MENU_PAGE_LOCOMOTION,
 	VR_MENU_PAGE_CALIBRATION,
 	VR_MENU_PAGE_HOLSTERS,
 	VR_MENU_PAGE_CHEATS,
+	VR_MENU_PAGE_MISSIONS,
+	VR_MENU_PAGE_ABOUT,
+};
+
+enum eVrTrafficMenuItem {
+	VR_TRAFFIC_PEDESTRIANS = 0,
+	VR_TRAFFIC_VEHICLES,
+	VR_TRAFFIC_PHYSICS_DIRECTOR,
+	VR_TRAFFIC_PHYSICS_PRESET,
+	VR_TRAFFIC_VISUAL_BUDGET,
+	VR_TRAFFIC_DEFAULTS,
+	VR_TRAFFIC_BACK,
+	VR_TRAFFIC_ITEM_COUNT
 };
 
 enum eVrHudMenuItem {
@@ -134,29 +213,78 @@ enum eVrHudMenuItem {
 // Desktop-only D3D12 features are deliberately omitted so every visible row
 // is actionable on the headset.
 enum eVrMainMenuItem {
-	VR_MAIN_FXAA = 0,
-	VR_MAIN_COLOR,
+	VR_MAIN_GRAPHICS = 0,
+	VR_MAIN_TRAFFIC_SETTINGS,
 	VR_MAIN_HUD,
-	VR_MAIN_HANDS,
-	VR_MAIN_LASER,
-	VR_MAIN_HOLSTER_HIGHLIGHTS,
-	VR_MAIN_MANUAL_RELOAD,
-	VR_MAIN_SCOPE_AIM,
+	VR_MAIN_MODEL_ASSETS,
 	VR_MAIN_VEHICLE_SETTINGS,
 	VR_MAIN_LOCOMOTION_SETTINGS,
-	VR_MAIN_DEBUG,
-	VR_MAIN_GRIP_LOCK,
-	VR_MAIN_CALIBRATION,
+	VR_MAIN_WEAPONS,
 	VR_MAIN_HOLSTERS,
 	VR_MAIN_CHEATS,
+	VR_MAIN_ABOUT,
 	VR_MAIN_ITEM_COUNT
 };
 
+enum eVrGraphicsMenuItem {
+	VR_GRAPHICS_RENDER_SCALE = 0,
+	VR_GRAPHICS_SGSR,
+	VR_GRAPHICS_MSAA,
+	VR_GRAPHICS_FXAA,
+	VR_GRAPHICS_COLOR,
+	VR_GRAPHICS_PROFILER,
+	VR_GRAPHICS_CPU_PERFORMANCE,
+	VR_GRAPHICS_GPU_PERFORMANCE,
+	VR_GRAPHICS_SHADOWS,
+	VR_GRAPHICS_OCCLUSION,
+	VR_GRAPHICS_FOUNTAIN,
+	VR_GRAPHICS_QUICK_START,
+	VR_GRAPHICS_BACK,
+	VR_GRAPHICS_ITEM_COUNT
+};
+
+enum eVrWeaponsMenuItem {
+	VR_WEAPONS_HANDS = 0,
+	VR_WEAPONS_LASER,
+	VR_WEAPONS_HOLSTER_HIGHLIGHTS,
+	VR_WEAPONS_MANUAL_RELOAD,
+	VR_WEAPONS_SCOPE_AIM,
+	VR_WEAPONS_GRIP_LOCK,
+	VR_WEAPONS_CALIBRATION,
+	VR_WEAPONS_BACK,
+	VR_WEAPONS_ITEM_COUNT
+};
+
+enum eVrModelAssetsMenuItem {
+	VR_MODEL_ASSETS_PRESET = 0,
+	VR_MODEL_ASSETS_WORLD,
+	VR_MODEL_ASSETS_VEGETATION,
+	VR_MODEL_ASSETS_VEHICLES,
+	VR_MODEL_ASSETS_PEDS,
+	VR_MODEL_ASSETS_WEAPONS,
+	VR_MODEL_ASSETS_BACK,
+	VR_MODEL_ASSETS_ITEM_COUNT
+};
+
+enum eQuestCpuPerformanceMode {
+	QUEST_CPU_PERFORMANCE_AUTO = 0,
+	QUEST_CPU_PERFORMANCE_SUSTAINED,
+	QUEST_CPU_PERFORMANCE_BOOST,
+	QUEST_CPU_PERFORMANCE_COUNT
+};
+
 enum eVrVehicleMenuItem {
-	VR_VEHICLE_DRIVING_TYPE = 0,
-	VR_VEHICLE_DRIVING_Y,
-	VR_VEHICLE_SEAT_DISTANCE,
+	VR_VEHICLE_CAR_DRIVING_TYPE = 0,
+	VR_VEHICLE_BIKE_DRIVING_TYPE,
+	VR_VEHICLE_DEFAULT_SEAT_HEIGHT,
+	VR_VEHICLE_DEFAULT_SEAT_FORWARD,
+	VR_VEHICLE_GLOBAL_SEAT_HEIGHT,
+	VR_VEHICLE_GLOBAL_SEAT_FORWARD,
+	VR_VEHICLE_MODEL_SEAT_HEIGHT,
+	VR_VEHICLE_MODEL_SEAT_FORWARD,
 	VR_VEHICLE_MOTION_HAND,
+	VR_VEHICLE_WHEEL_VISIBLE,
+	VR_VEHICLE_MODEL_WHEEL_VISIBLE,
 	VR_VEHICLE_HANDLE_HIGHLIGHTS,
 	VR_VEHICLE_BIKE_LOCK_HORIZON,
 	VR_VEHICLE_CALIBRATION,
@@ -164,25 +292,13 @@ enum eVrVehicleMenuItem {
 	VR_VEHICLE_ITEM_COUNT
 };
 
-enum eVrVehicleCalibrationMenuItem {
-	VR_VEHICLE_CAL_HAND = 0,
-	VR_VEHICLE_CAL_OFFSET_X,
-	VR_VEHICLE_CAL_OFFSET_Y,
-	VR_VEHICLE_CAL_OFFSET_Z,
-	VR_VEHICLE_CAL_ROT_X,
-	VR_VEHICLE_CAL_ROT_Y,
-	VR_VEHICLE_CAL_ROT_Z,
-	VR_VEHICLE_CAL_WHEELIE_HEIGHT,
-	VR_VEHICLE_CAL_STAND_HEIGHT,
-	VR_VEHICLE_CAL_BACK,
-	VR_VEHICLE_CAL_ITEM_COUNT
-};
-
 enum eVrLocomotionMenuItem {
 	VR_LOCOMOTION_MOVEMENT_ORIENTATION = 0,
 	VR_LOCOMOTION_TURN_MODE,
 	VR_LOCOMOTION_TURN_SENSITIVITY,
 	VR_LOCOMOTION_SNAP_ANGLE,
+	VR_LOCOMOTION_HEAD_BOBBING,
+	VR_LOCOMOTION_REFRESH_RATE,
 	VR_LOCOMOTION_BACK,
 	VR_LOCOMOTION_ITEM_COUNT
 };
@@ -199,6 +315,16 @@ enum eQuestTurnMode {
 	QUEST_TURN_SNAP,
 	QUEST_TURN_MODE_COUNT
 };
+
+static const char *
+QuestCpuPerformanceModeName(int mode)
+{
+	static const char *const names[QUEST_CPU_PERFORMANCE_COUNT] = {
+		"AUTO", "SUSTAINED", "BOOST (TEST)"
+	};
+	return mode >= 0 && mode < QUEST_CPU_PERFORMANCE_COUNT ?
+		names[mode] : "UNKNOWN";
+}
 
 static const uint8 *
 FindDebugGlyph(char character)
@@ -284,6 +410,21 @@ DrawVrMenuText(const char *value, int centreX, int y, int scale,
 
 namespace androidgame {
 
+static void SaveVrInteger(const char *key, int value);
+
+static void
+ApplyTrafficSettings(void)
+{
+	CIniFile::PedNumberMultiplier = gTrafficPedPercent/100.0f;
+	CIniFile::CarNumberMultiplier = gTrafficCarPercent/100.0f;
+	CPopulation::MaxNumberOfPedsInUse =
+		(int32)(25.0f*CIniFile::PedNumberMultiplier);
+	CPopulation::MaxNumberOfPedsInUseInterior =
+		(int32)(40.0f*CIniFile::PedNumberMultiplier);
+	CCarCtrl::MaxNumberOfCarsInUse =
+		(int32)(12.0f*CIniFile::CarNumberMultiplier);
+}
+
 static void
 LoadVrSettings(void)
 {
@@ -292,9 +433,48 @@ LoadVrSettings(void)
 	gViceCityColorEnabled =
 		GetPrivateProfileIntA("VR", "ViceCityColor", 1,
 			".\\vr_settings.ini") != 0;
-	gFxaaEnabled =
-		GetPrivateProfileIntA("VR", "AntiAliasing", 1,
+	gSpatialAaMode = GetPrivateProfileIntA("VR", "AntiAliasing", 1,
+		".\\vr_settings.ini") != 0;
+	gQuestQuickTestStart =
+		GetPrivateProfileIntA("VR", "QuickTestStart", 0,
 			".\\vr_settings.ini") != 0;
+	{
+		static const int scales[] = { 100, 125, 150, 175 };
+		const int savedScale = GetPrivateProfileIntA("VR", "RenderScalePercent",
+			125, ".\\vr_settings.ini");
+		int best = 0;
+		for(int i = 1; i < (int)ARRAY_SIZE(scales); i++)
+			if(Abs(scales[i]-savedScale) < Abs(scales[best]-savedScale))
+				best = i;
+	gQuestRenderScalePercent = scales[best];
+	}
+	// Temporal AA is intentionally unavailable until its stereo instability is
+	// solved. Preserve an exact native fallback instead of letting an old INI
+	// silently reactivate an eye-straining mode.
+	gQuestSgsrMode = rw::vulkan::SGSR_OFF;
+	SaveVrInteger("Sgsr2Mode", gQuestSgsrMode);
+	gQuestMsaaSamples = 1;
+	SaveVrInteger("MsaaSamples", gQuestMsaaSamples);
+	CParticleObject::SetVrFountainQuality(Min(Max(GetPrivateProfileIntA("VR",
+		"FountainQuality", VR_FOUNTAIN_OPTIMIZED, ".\\vr_settings.ini"),
+		(int)VR_FOUNTAIN_OFF), (int)VR_FOUNTAIN_QUALITY_COUNT-1));
+	{
+		// Migrate the old boolean without rewriting it. OFF remains the exact
+		// original full-360 render path; SAFE is the former enabled behaviour.
+		const int legacyOcclusion = GetPrivateProfileIntA("VR",
+			"OcclusionCulling", 1, ".\\vr_settings.ini") != 0 ?
+			VR_OCCLUSION_CULLING_SAFE : VR_OCCLUSION_CULLING_OFF;
+		// V2 adds a correctness-first STEREO SAFE mode before the two authored
+		// experimental modes. Do not reinterpret the old value 2 (AGGRESSIVE) as
+		// a new experimental mode after an update; migrate everyone to SAFE/OFF.
+		gOcclusionCullingMode = Min(Max(GetPrivateProfileIntA("VR",
+			"OcclusionCullingModeV2", legacyOcclusion, ".\\vr_settings.ini"),
+			(int)VR_OCCLUSION_CULLING_OFF),
+			(int)VR_OCCLUSION_CULLING_MODE_COUNT-1);
+		CRenderer::SetVrOcclusionCullingMode(gOcclusionCullingMode);
+	}
+	CShadows::SetRenderEnabled(GetPrivateProfileIntA("VR", "ShadowsEnabled",
+		1, ".\\vr_settings.ini") != 0);
 	gGameplayHudEnabled =
 		GetPrivateProfileIntA("VR", "GameplayHud", 1,
 			".\\vr_settings.ini") != 0;
@@ -313,6 +493,27 @@ LoadVrSettings(void)
 		".\\vr_settings.ini"),
 		(int)QUEST_MOVEMENT_ORIENTATION_BODY),
 		(int)QUEST_MOVEMENT_ORIENTATION_COUNT-1);
+	gQuestHeadBobbing = GetPrivateProfileIntA("VR", "HeadBobbing", 0,
+		".\\vr_settings.ini") != 0;
+	gQuestRefreshRateHz = Min(Max(GetPrivateProfileIntA("VR",
+		"RefreshRate", 72, ".\\vr_settings.ini"), 72), 120);
+	androidgame::SetPreferredRefreshRate(gQuestRefreshRateHz);
+	const int persistedCpuPerformanceMode = GetPrivateProfileIntA("VR",
+		"CpuPerformanceMode", QUEST_CPU_PERFORMANCE_SUSTAINED,
+		".\\vr_settings.ini");
+	// Boost is deliberately session-only. Old test builds may have persisted
+	// value 2; treat that as Auto rather than re-entering Boost on startup.
+	gQuestCpuPerformanceSavedMode =
+		persistedCpuPerformanceMode >= QUEST_CPU_PERFORMANCE_AUTO &&
+		persistedCpuPerformanceMode <= QUEST_CPU_PERFORMANCE_SUSTAINED ?
+		persistedCpuPerformanceMode : QUEST_CPU_PERFORMANCE_SUSTAINED;
+	gQuestCpuPerformanceMode = gQuestCpuPerformanceSavedMode;
+	xrvk::setPerformanceMode(gQuestCpuPerformanceMode);
+	gQuestGpuPerformanceMode = Min(Max(GetPrivateProfileIntA("VR",
+		"GpuPerformanceMode", QUEST_CPU_PERFORMANCE_SUSTAINED,
+		".\\vr_settings.ini"), (int)QUEST_CPU_PERFORMANCE_AUTO),
+		(int)QUEST_CPU_PERFORMANCE_BOOST);
+	xrvk::setGpuPerformanceMode(gQuestGpuPerformanceMode);
 	gQuestTurnMode = Min(Max(GetPrivateProfileIntA("VR", "TurnMode",
 		QUEST_TURN_SMOOTH, ".\\vr_settings.ini"),
 		(int)QUEST_TURN_SMOOTH), (int)QUEST_TURN_MODE_COUNT-1);
@@ -323,6 +524,35 @@ LoadVrSettings(void)
 			50, ".\\vr_settings.ini"), 25), 300);
 	gQuestSnapTurnAngleDegrees = Min(Max(GetPrivateProfileIntA("VR",
 		"SnapTurnAngleDegrees", 30, ".\\vr_settings.ini"), 15), 90);
+	const int defaultPedPercent = Min(Max(
+		(int)(CIniFile::PedNumberMultiplier*100.0f+0.5f), 50), 300);
+	const int defaultCarPercent = Min(Max(
+		(int)(CIniFile::CarNumberMultiplier*100.0f+0.5f), 50), 300);
+	gTrafficPedPercent = Min(Max(GetPrivateProfileIntA("VR",
+		"PedTrafficPercent", defaultPedPercent,
+		".\\vr_settings.ini"), 50), 300);
+	gTrafficCarPercent = Min(Max(GetPrivateProfileIntA("VR",
+		"CarTrafficPercent", defaultCarPercent,
+		".\\vr_settings.ini"), 50), 300);
+	QuestPhysicsDirectorSetMode(Min(Max(GetPrivateProfileIntA("VR",
+		"PhysicsDirectorMode", QUEST_PHYSICS_DIRECTOR_ADAPTIVE,
+		".\\vr_settings.ini"),
+		(int)QUEST_PHYSICS_DIRECTOR_OFF),
+		(int)QUEST_PHYSICS_DIRECTOR_MODE_COUNT-1));
+	QuestPhysicsDirectorSetPreset(Min(Max(GetPrivateProfileIntA("VR",
+		"PhysicsDirectorPreset", QUEST_PHYSICS_PRESET_QUALITY,
+		".\\vr_settings.ini"),
+		(int)QUEST_PHYSICS_PRESET_QUALITY),
+		(int)QUEST_PHYSICS_PRESET_COUNT-1));
+	QuestVehicleVisualBudgetSetMode(Min(Max(GetPrivateProfileIntA("VR",
+		"VehicleVisualBudgetMode", QUEST_VEHICLE_VISUAL_STOCK,
+		".\\vr_settings.ini"),
+		(int)QUEST_VEHICLE_VISUAL_STOCK),
+		(int)QUEST_VEHICLE_VISUAL_MODE_COUNT-1));
+	gVrWelcomePending = GetPrivateProfileIntA("VR", "WelcomeShown", 0,
+		".\\vr_settings.ini") == 0;
+	gVrWelcomeFirstRun = gVrWelcomePending;
+	ApplyTrafficSettings();
 	gVrSettingsLoaded = true;
 }
 
@@ -336,8 +566,10 @@ SaveViceCityColor(void)
 static void
 SaveFxaa(void)
 {
-	WritePrivateProfileStringA("VR", "AntiAliasing",
-		gFxaaEnabled ? "1" : "0", ".\\vr_settings.ini");
+	char value[8];
+	snprintf(value, sizeof(value), "%d", gSpatialAaMode);
+	WritePrivateProfileStringA("VR", "AntiAliasing", value,
+	                         ".\\vr_settings.ini");
 }
 
 static void
@@ -385,16 +617,19 @@ MonotonicMilliseconds(void)
 }
 
 static bool
-MenuRepeatPulse(bool down, bool &wasDown, double &repeatAt, double now,
+MenuRepeatPulse(bool down, bool &wasDown, double &repeatAt,
+	double &holdStart, double now,
                 bool allowRepeat)
 {
 	if(!down){
 		wasDown = false;
 		repeatAt = 0.0;
+		holdStart = 0.0;
 		return false;
 	}
 	if(!wasDown){
 		wasDown = true;
+		holdStart = now;
 		repeatAt = now+420.0;
 		return true;
 	}
@@ -408,15 +643,71 @@ MenuRepeatPulse(bool down, bool &wasDown, double &repeatAt, double now,
 }
 
 static int
-QuestWeaponSettingForMainItem(int item)
+MenuRepeatMagnitude(bool down, double holdStart, double now)
+{
+	if(!down || holdStart <= 0.0)
+		return 1;
+	const double held = now-holdStart;
+	return held >= 3500.0 ? 10 : (held >= 1500.0 ? 3 : 1);
+}
+
+// Navigation needs two things at once: a deliberate tap must always move one
+// row, while a held stick must eventually scroll long lists such as CHEATS.
+// Separate engage/release thresholds prevent Touch-stick noise around a single
+// threshold from manufacturing extra taps.
+static int
+MenuNavigationPulse(float axis, double now)
+{
+	const float engage = 0.68f;
+	const float release = 0.34f;
+	int requested = axis >= engage ? -1 : (axis <= -engage ? 1 : 0);
+
+	if(gVrMenuNavigateDirection == 0){
+		if(requested == 0)
+			return 0;
+		gVrMenuNavigateDirection = requested;
+		gVrMenuNavigateRepeatAt = now+430.0;
+		return requested;
+	}
+
+	if(Abs(axis) <= release){
+		gVrMenuNavigateDirection = 0;
+		gVrMenuNavigateRepeatAt = 0.0;
+		return 0;
+	}
+
+	// A deliberate reversal is a new navigation edge even if the stick crossed
+	// the centre too quickly for a rendered frame to observe the release band.
+	if(requested != 0 && requested != gVrMenuNavigateDirection){
+		gVrMenuNavigateDirection = requested;
+		gVrMenuNavigateRepeatAt = now+430.0;
+		return requested;
+	}
+
+	if(now >= gVrMenuNavigateRepeatAt){
+		gVrMenuNavigateRepeatAt = now+110.0;
+		return gVrMenuNavigateDirection;
+	}
+	return 0;
+}
+
+static void
+ResetMenuNavigationRepeat(void)
+{
+	gVrMenuNavigateDirection = 0;
+	gVrMenuNavigateRepeatAt = 0.0;
+}
+
+static int
+QuestWeaponSettingForWeaponItem(int item)
 {
 	switch(item){
-	case VR_MAIN_HANDS: return 0;
-	case VR_MAIN_LASER: return 1;
-	case VR_MAIN_HOLSTER_HIGHLIGHTS: return 2;
-	case VR_MAIN_MANUAL_RELOAD: return 3;
-	case VR_MAIN_SCOPE_AIM: return 4;
-	case VR_MAIN_GRIP_LOCK: return 5;
+	case VR_WEAPONS_HANDS: return 0;
+	case VR_WEAPONS_LASER: return 1;
+	case VR_WEAPONS_HOLSTER_HIGHLIGHTS: return 2;
+	case VR_WEAPONS_MANUAL_RELOAD: return 3;
+	case VR_WEAPONS_SCOPE_AIM: return 4;
+	case VR_WEAPONS_GRIP_LOCK: return 5;
 	default: return -1;
 	}
 }
@@ -425,7 +716,11 @@ static int *
 CurrentMenuSelection(void)
 {
 	switch(gVrMenuPage){
+	case VR_MENU_PAGE_GRAPHICS: return &gVrGraphicsSelection;
+	case VR_MENU_PAGE_WEAPONS: return &gVrWeaponsSelection;
 	case VR_MENU_PAGE_HUD: return &gVrHudSelection;
+	case VR_MENU_PAGE_TRAFFIC: return &gVrTrafficSelection;
+	case VR_MENU_PAGE_MODEL_ASSETS: return &gVrModelAssetsSelection;
 	case VR_MENU_PAGE_VEHICLE: return &gVrVehicleSelection;
 	case VR_MENU_PAGE_VEHICLE_CALIBRATION:
 		return &gVrVehicleCalibrationSelection;
@@ -433,6 +728,9 @@ CurrentMenuSelection(void)
 	case VR_MENU_PAGE_CALIBRATION: return &gVrCalibrationSelection;
 	case VR_MENU_PAGE_HOLSTERS: return &gVrHolsterSelection;
 	case VR_MENU_PAGE_CHEATS: return &gVrCheatSelection;
+	case VR_MENU_PAGE_MISSIONS:
+		return gVrMissionCategory < 0 ?
+			&gVrMissionCategorySelection : &gVrMissionSelection;
 	default: return &gVrMenuSelection;
 	}
 }
@@ -442,16 +740,24 @@ CurrentMenuItemCount(void)
 {
 	switch(gVrMenuPage){
 	case VR_MENU_PAGE_SETTINGS: return VR_MAIN_ITEM_COUNT;
+	case VR_MENU_PAGE_GRAPHICS: return VR_GRAPHICS_ITEM_COUNT;
+	case VR_MENU_PAGE_WEAPONS: return VR_WEAPONS_ITEM_COUNT;
 	case VR_MENU_PAGE_HUD: return VR_HUD_ITEM_COUNT;
+	case VR_MENU_PAGE_TRAFFIC: return VR_TRAFFIC_ITEM_COUNT;
+	case VR_MENU_PAGE_MODEL_ASSETS: return VR_MODEL_ASSETS_ITEM_COUNT;
 	case VR_MENU_PAGE_VEHICLE: return VR_VEHICLE_ITEM_COUNT;
 	case VR_MENU_PAGE_VEHICLE_CALIBRATION:
 		return Max(1,
 			OculusVR::GetQuestVehicleCalibrationItemCount()+1);
 	case VR_MENU_PAGE_LOCOMOTION: return VR_LOCOMOTION_ITEM_COUNT;
-	case VR_MENU_PAGE_CALIBRATION: return 17;
+	case VR_MENU_PAGE_CALIBRATION: return 21;
 	case VR_MENU_PAGE_HOLSTERS:
 		return OculusVR::GetQuestHolsterPointCount()+1;
-	case VR_MENU_PAGE_CHEATS: return Max(1, GetVrCheatCount());
+	case VR_MENU_PAGE_CHEATS: return Max(1, GetVrCheatCount()+1);
+	case VR_MENU_PAGE_MISSIONS:
+		return Max(1, gVrMissionCategory < 0 ?
+			GetVrMissionCategoryCount() :
+			GetVrMissionCount(gVrMissionCategory));
 	default: return 1;
 	}
 }
@@ -461,18 +767,22 @@ CurrentMenuValueRepeats(void)
 {
 	if(gVrMenuPage == VR_MENU_PAGE_CALIBRATION)
 		return gVrCalibrationSelection >= 1 &&
-			gVrCalibrationSelection <= 15;
+			gVrCalibrationSelection <= 18;
 	if(gVrMenuPage == VR_MENU_PAGE_HUD)
 		return gVrHudSelection >= VR_HUD_HORIZONTAL_SCALE &&
 			gVrHudSelection <= VR_HUD_OFFSET_Y;
+	if(gVrMenuPage == VR_MENU_PAGE_TRAFFIC)
+		return gVrTrafficSelection == VR_TRAFFIC_PEDESTRIANS ||
+			gVrTrafficSelection == VR_TRAFFIC_VEHICLES;
 	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE)
-		return gVrVehicleSelection == VR_VEHICLE_DRIVING_Y ||
-			gVrVehicleSelection == VR_VEHICLE_SEAT_DISTANCE;
-	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION)
-		return gVrVehicleCalibrationSelection >=
-				VR_VEHICLE_CAL_OFFSET_X &&
-			gVrVehicleCalibrationSelection <
-				OculusVR::GetQuestVehicleCalibrationItemCount();
+		return gVrVehicleSelection >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
+			gVrVehicleSelection <= VR_VEHICLE_MODEL_SEAT_FORWARD;
+	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION){
+		const int row = gVrVehicleCalibrationSelection;
+		const int item = OculusVR::GetQuestVehicleCalibrationItemForRow(row);
+		return row < OculusVR::GetQuestVehicleCalibrationItemCount() &&
+			item != OculusVR::QUEST_VEHICLE_CAL_HAND;
+	}
 	if(gVrMenuPage == VR_MENU_PAGE_LOCOMOTION)
 		return gVrLocomotionSelection ==
 			VR_LOCOMOTION_TURN_SENSITIVITY;
@@ -486,6 +796,13 @@ ReturnFromCurrentMenuPage(void)
 		gVrMenuVisible = false;
 		return;
 	}
+	if(gVrMenuPage == VR_MENU_PAGE_MISSIONS){
+		if(gVrMissionCategory >= 0)
+			gVrMissionCategory = -1;
+		else
+			gVrMenuPage = VR_MENU_PAGE_CHEATS;
+		return;
+	}
 	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION){
 		OculusVR::SetQuestVehicleCalibrationPreview(false);
 		gVrMenuPage = VR_MENU_PAGE_VEHICLE;
@@ -495,6 +812,37 @@ ReturnFromCurrentMenuPage(void)
 	gVrCheatStatusFrames = 0;
 }
 
+static bool
+AnyVrAboutButtonDown(const PadInput &in)
+{
+	return in.a || in.b || in.x || in.y || in.menu ||
+		in.leftStickClick || in.rightStickClick ||
+		in.leftTrigger >= 0.55f || in.rightTrigger >= 0.55f ||
+		in.leftGrip >= 0.65f || in.rightGrip >= 0.65f;
+}
+
+static bool
+DidPlayerTakeWelcomeStep(const PadInput &in)
+{
+	CPlayerPed *player = FindPlayerPed();
+	if(!player || gGameState != GS_PLAYING_GAME ||
+	   FrontEndMenuManager.m_bMenuActive || CCutsceneMgr::IsRunning() ||
+	   FindPlayerVehicle()){
+		gVrWelcomeBaselineValid = false;
+		return false;
+	}
+	const CVector position = player->GetPosition();
+	if(!gVrWelcomeBaselineValid){
+		gVrWelcomeBaseline = position;
+		gVrWelcomeBaselineValid = true;
+		return false;
+	}
+	const bool movementInput = Abs(in.leftStickX) >= 0.20f ||
+		Abs(in.leftStickY) >= 0.20f;
+	const CVector moved = position-gVrWelcomeBaseline;
+	return movementInput && moved.x*moved.x+moved.y*moved.y >= 0.0025f;
+}
+
 // Runs once per rendered frame from the pad path. All menu state changes are
 // edge/repeat driven so a tap remains one exact step while a held trigger can
 // traverse large calibration ranges without hundreds of clicks.
@@ -502,7 +850,43 @@ void
 VrDebugUpdate(const PadInput &in)
 {
 	LoadVrSettings();
+	gQuestCpuPerformanceMode = Min(Max(xrvk::getPerformanceMode(),
+		(int)QUEST_CPU_PERFORMANCE_AUTO),
+		(int)QUEST_CPU_PERFORMANCE_COUNT-1);
+	// The VR menu is available before CGame::Initialise loads gta3.ini. Keep
+	// the persisted headset values authoritative after that later load too.
+	ApplyTrafficSettings();
 	const double now = MonotonicMilliseconds();
+	if(gVrWelcomePending && DidPlayerTakeWelcomeStep(in)){
+		gVrWelcomePending = false;
+		gVrMenuVisible = true;
+		gVrMenuPage = VR_MENU_PAGE_ABOUT;
+		gVrWelcomeFirstRun = true;
+		gVrAboutDismissArmed = false;
+		gVrAboutReleaseGate = false;
+	}
+	if(gVrMenuVisible && gVrMenuPage == VR_MENU_PAGE_ABOUT){
+		const bool button = AnyVrAboutButtonDown(in);
+		if(!button)
+			gVrAboutDismissArmed = true;
+		else if(gVrAboutDismissArmed){
+			gVrMenuVisible = false;
+			gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+			gVrAboutDismissArmed = false;
+			gVrAboutReleaseGate = true;
+			if(gVrWelcomeFirstRun){
+				WritePrivateProfileStringA("VR", "WelcomeShown", "1",
+					".\\vr_settings.ini");
+				gVrWelcomeFirstRun = false;
+			}
+		}
+		return;
+	}
+	if(gVrAboutReleaseGate){
+		if(!AnyVrAboutButtonDown(in))
+			gVrAboutReleaseGate = false;
+		return;
+	}
 	const bool bothGrips =
 		in.leftGrip >= 0.75f && in.rightGrip >= 0.75f;
 	// As on desktop, service shortcuts other than the settings panel must not
@@ -529,7 +913,7 @@ VrDebugUpdate(const PadInput &in)
 		gVrMenuSelection = 0;
 		gVrMenuSelectDown = false;
 		gVrMenuBackDown = in.b || in.leftStickClick;
-		gVrMenuNavigateDown = false;
+		ResetMenuNavigationRepeat();
 		// The fallback chord holds both triggers.  Seed their latches so
 		// opening the panel cannot also change its first value.
 		gVrMenuIncreaseDown = in.rightTrigger >= 0.55f;
@@ -555,7 +939,7 @@ VrDebugUpdate(const PadInput &in)
 		gVrCheatStatusFrames = 0;
 		gVrMenuSelectDown = false;
 		gVrMenuBackDown = in.b || in.leftStickClick;
-		gVrMenuNavigateDown = false;
+		ResetMenuNavigationRepeat();
 		gVrMenuIncreaseDown = false;
 		gVrMenuDecreaseDown = false;
 		gVrMenuIncreaseRepeatAt = 0.0;
@@ -594,14 +978,22 @@ VrDebugUpdate(const PadInput &in)
 			gVrMenuPage = VR_MENU_PAGE_VEHICLE;
 		}
 		const int itemCount = CurrentMenuItemCount();
-		const bool navigate =
-			in.leftStickY >= 0.65f || in.leftStickY <= -0.65f;
-		if(navigate && !gVrMenuNavigateDown){
-			const int direction = in.leftStickY >= 0.65f ? -1 : 1;
+		const int navigationPulse = MenuNavigationPulse(in.leftStickY, now);
+		if(navigationPulse != 0){
 			int *selection = CurrentMenuSelection();
-			*selection = (*selection+direction+itemCount)%itemCount;
+			*selection = (*selection+navigationPulse+itemCount)%itemCount;
 		}
-		gVrMenuNavigateDown = navigate;
+		const bool cheatCycle = gVrMenuPage == VR_MENU_PAGE_CHEATS &&
+			(Abs(in.leftStickX) >= 0.65f);
+		if(cheatCycle && !gVrCheatCycleDown && gVrCheatSelection > 0){
+			const int direction = in.leftStickX > 0.0f ? 1 : -1;
+			if(CycleVrCheatSelection(gVrCheatSelection-1, direction)){
+				snprintf(gVrCheatStatus, sizeof(gVrCheatStatus),
+					"MODEL SELECTED");
+				gVrCheatStatusFrames = 60;
+			}
+		}
+		gVrCheatCycleDown = cheatCycle;
 
 		const bool select = in.a || in.rightStickClick;
 		const bool selectPulse = select && !gVrMenuSelectDown;
@@ -609,47 +1001,242 @@ VrDebugUpdate(const PadInput &in)
 		const bool repeatValue = CurrentMenuValueRepeats();
 		const bool increasePulse = MenuRepeatPulse(
 			in.rightTrigger >= 0.55f, gVrMenuIncreaseDown,
-			gVrMenuIncreaseRepeatAt, now, repeatValue);
+			gVrMenuIncreaseRepeatAt, gVrMenuIncreaseHoldStart,
+			now, repeatValue);
 		const bool decreasePulse = MenuRepeatPulse(
 			in.leftTrigger >= 0.55f, gVrMenuDecreaseDown,
-			gVrMenuDecreaseRepeatAt, now, repeatValue);
+			gVrMenuDecreaseRepeatAt, gVrMenuDecreaseHoldStart,
+			now, repeatValue);
+		const int repeatMagnitude = decreasePulse ?
+			MenuRepeatMagnitude(in.leftTrigger >= 0.55f,
+				gVrMenuDecreaseHoldStart, now) :
+			MenuRepeatMagnitude(in.rightTrigger >= 0.55f,
+				gVrMenuIncreaseHoldStart, now);
 		const bool positivePulse = selectPulse || increasePulse;
 
 		if(gVrMenuPage == VR_MENU_PAGE_SETTINGS &&
 		   (positivePulse || decreasePulse)){
-			const int weaponSetting =
-				QuestWeaponSettingForMainItem(gVrMenuSelection);
-			if(gVrMenuSelection == VR_MAIN_FXAA){
-				gFxaaEnabled = !gFxaaEnabled;
-				SaveFxaa();
-			}else if(gVrMenuSelection == VR_MAIN_COLOR){
-				gViceCityColorEnabled = !gViceCityColorEnabled;
-				SaveViceCityColor();
+			if(gVrMenuSelection == VR_MAIN_GRAPHICS){
+				gVrMenuPage = VR_MENU_PAGE_GRAPHICS;
+				gVrGraphicsSelection = 0;
 			}else if(gVrMenuSelection == VR_MAIN_HUD){
 				gVrMenuPage = VR_MENU_PAGE_HUD;
 				gVrHudSelection = 0;
-			}else if(weaponSetting >= 0 &&
-			         weaponSetting <
-			         	OculusVR::GetQuestWeaponSettingCount()){
-				OculusVR::ToggleQuestWeaponSetting(weaponSetting);
+			}else if(gVrMenuSelection == VR_MAIN_TRAFFIC_SETTINGS){
+				gVrMenuPage = VR_MENU_PAGE_TRAFFIC;
+				gVrTrafficSelection = 0;
+			}else if(gVrMenuSelection == VR_MAIN_MODEL_ASSETS){
+				gVrMenuPage = VR_MENU_PAGE_MODEL_ASSETS;
+				gVrModelAssetsSelection = 0;
 			}else if(gVrMenuSelection == VR_MAIN_VEHICLE_SETTINGS){
 				gVrMenuPage = VR_MENU_PAGE_VEHICLE;
 				gVrVehicleSelection = 0;
-			}else if(gVrMenuSelection ==
-			         VR_MAIN_LOCOMOTION_SETTINGS){
+			}else if(gVrMenuSelection == VR_MAIN_LOCOMOTION_SETTINGS){
 				gVrMenuPage = VR_MENU_PAGE_LOCOMOTION;
 				gVrLocomotionSelection = 0;
-			}else if(gVrMenuSelection == VR_MAIN_DEBUG){
-				gDebugVisible = !gDebugVisible;
-			}else if(gVrMenuSelection == VR_MAIN_CALIBRATION){
-				gVrMenuPage = VR_MENU_PAGE_CALIBRATION;
-				gVrCalibrationSelection = 0;
+			}else if(gVrMenuSelection == VR_MAIN_WEAPONS){
+				gVrMenuPage = VR_MENU_PAGE_WEAPONS;
+				gVrWeaponsSelection = 0;
 			}else if(gVrMenuSelection == VR_MAIN_HOLSTERS){
 				gVrMenuPage = VR_MENU_PAGE_HOLSTERS;
 				gVrHolsterSelection = 0;
 			}else if(gVrMenuSelection == VR_MAIN_CHEATS){
 				gVrMenuPage = VR_MENU_PAGE_CHEATS;
 				gVrCheatStatusFrames = 0;
+			}else if(gVrMenuSelection == VR_MAIN_ABOUT){
+				gVrMenuPage = VR_MENU_PAGE_ABOUT;
+				gVrWelcomeFirstRun = false;
+				gVrWelcomePending = false;
+				gVrAboutDismissArmed = false;
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_GRAPHICS &&
+		         (positivePulse || decreasePulse)){
+			if(gVrGraphicsSelection == VR_GRAPHICS_RENDER_SCALE){
+				static const int scales[] = { 100, 125, 150, 175 };
+				int index = 0;
+				for(int i = 0; i < (int)ARRAY_SIZE(scales); i++)
+					if(scales[i] == gQuestRenderScalePercent)
+						index = i;
+				const int direction = decreasePulse ? -1 : 1;
+				index = (index+direction+(int)ARRAY_SIZE(scales)) %
+					(int)ARRAY_SIZE(scales);
+				gQuestRenderScalePercent = scales[index];
+				SaveVrInteger("RenderScalePercent", gQuestRenderScalePercent);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_SGSR){
+				// Reserved for a future stereo-stable temporal AA path.
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_MSAA){
+				gQuestMsaaSamples = 1;
+				SaveVrInteger("MsaaSamples", gQuestMsaaSamples);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_FXAA){
+				gSpatialAaMode = !gSpatialAaMode;
+				SaveFxaa();
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_COLOR){
+				gViceCityColorEnabled = !gViceCityColorEnabled;
+				SaveViceCityColor();
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_PROFILER){
+				QuestProfilerSetEnabled(!QuestProfilerIsEnabled());
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_CPU_PERFORMANCE){
+				if(xrvk::isPerformanceModeSupported()){
+					const int direction = decreasePulse ? -1 : 1;
+					gQuestCpuPerformanceMode =
+						(gQuestCpuPerformanceMode+direction+
+						 QUEST_CPU_PERFORMANCE_COUNT)%
+						QUEST_CPU_PERFORMANCE_COUNT;
+					if(gQuestCpuPerformanceMode <=
+					   QUEST_CPU_PERFORMANCE_SUSTAINED){
+						gQuestCpuPerformanceSavedMode =
+							gQuestCpuPerformanceMode;
+						SaveVrInteger("CpuPerformanceMode",
+							gQuestCpuPerformanceSavedMode);
+					}
+					xrvk::setPerformanceMode(gQuestCpuPerformanceMode);
+				}
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_GPU_PERFORMANCE){
+				if(xrvk::isPerformanceModeSupported()){
+					const int direction = decreasePulse ? -1 : 1;
+					gQuestGpuPerformanceMode =
+						(gQuestGpuPerformanceMode+direction+
+						 QUEST_CPU_PERFORMANCE_COUNT)%
+						QUEST_CPU_PERFORMANCE_COUNT;
+					SaveVrInteger("GpuPerformanceMode",
+					              gQuestGpuPerformanceMode);
+					xrvk::setGpuPerformanceMode(gQuestGpuPerformanceMode);
+				}
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_SHADOWS){
+				CShadows::SetRenderEnabled(!CShadows::IsRenderEnabled());
+				SaveVrInteger("ShadowsEnabled",
+					CShadows::IsRenderEnabled() ? 1 : 0);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_OCCLUSION){
+				const int direction = decreasePulse ? -1 : 1;
+				gOcclusionCullingMode =
+					(gOcclusionCullingMode+direction+
+					 VR_OCCLUSION_CULLING_MODE_COUNT)%
+					VR_OCCLUSION_CULLING_MODE_COUNT;
+				CRenderer::SetVrOcclusionCullingMode(gOcclusionCullingMode);
+				SaveVrInteger("OcclusionCullingModeV2", gOcclusionCullingMode);
+				// Keep older builds able to honour the explicit OFF fallback.
+				SaveVrInteger("OcclusionCulling",
+					gOcclusionCullingMode != VR_OCCLUSION_CULLING_OFF ? 1 : 0);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_FOUNTAIN){
+				const int direction = decreasePulse ? -1 : 1;
+				const int quality =
+					(CParticleObject::GetVrFountainQuality()+direction+
+					 VR_FOUNTAIN_QUALITY_COUNT)%VR_FOUNTAIN_QUALITY_COUNT;
+				CParticleObject::SetVrFountainQuality(quality);
+				SaveVrInteger("FountainQuality", quality);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_QUICK_START){
+				gQuestQuickTestStart = !gQuestQuickTestStart;
+				SaveVrInteger("QuickTestStart",
+					gQuestQuickTestStart ? 1 : 0);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_BACK){
+				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_WEAPONS &&
+		         (positivePulse || decreasePulse)){
+			const int weaponSetting =
+				QuestWeaponSettingForWeaponItem(gVrWeaponsSelection);
+			if(weaponSetting >= 0 && weaponSetting <
+			   OculusVR::GetQuestWeaponSettingCount())
+				OculusVR::ToggleQuestWeaponSetting(weaponSetting);
+			else if(gVrWeaponsSelection == VR_WEAPONS_CALIBRATION){
+				gVrMenuPage = VR_MENU_PAGE_CALIBRATION;
+				gVrCalibrationSelection = 0;
+			}else if(gVrWeaponsSelection == VR_WEAPONS_BACK){
+				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_MODEL_ASSETS &&
+		         (positivePulse || decreasePulse)){
+			const int direction = decreasePulse ? -1 : 1;
+			if(gVrModelAssetsSelection == VR_MODEL_ASSETS_PRESET){
+				ModelSets::CycleRequested(direction);
+				const ModelSets::eModelSet preset = ModelSets::GetRequested();
+				for(int category = 0; category < ModelSets::MODEL_CATEGORY_COUNT;
+				    category++){
+					const ModelSets::eModelSet requested =
+						preset == ModelSets::MODEL_SET_MODERN &&
+						(category == ModelSets::MODEL_CATEGORY_WORLD ||
+						 category == ModelSets::MODEL_CATEGORY_WEAPONS) ?
+						ModelSets::MODEL_SET_MODERN : ModelSets::MODEL_SET_CLASSIC;
+					ModelSets::SetRequestedForCategory(
+						(ModelSets::eModelCategory)category, requested);
+				}
+			}else if(gVrModelAssetsSelection >= VR_MODEL_ASSETS_WORLD &&
+			         gVrModelAssetsSelection <= VR_MODEL_ASSETS_WEAPONS){
+				ModelSets::CycleRequestedCategory(
+					(ModelSets::eModelCategory)(gVrModelAssetsSelection-1),
+					direction);
+			}else if(gVrModelAssetsSelection == VR_MODEL_ASSETS_BACK &&
+			         positivePulse)
+				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+		}else if(gVrMenuPage == VR_MENU_PAGE_TRAFFIC &&
+		         (positivePulse || decreasePulse)){
+			const int direction = decreasePulse ? -1 : 1;
+			switch(gVrTrafficSelection){
+			case VR_TRAFFIC_PEDESTRIANS:
+				gTrafficPedPercent = Min(Max(
+					gTrafficPedPercent+direction*5, 50), 300);
+				SaveVrInteger("PedTrafficPercent",
+					gTrafficPedPercent);
+				ApplyTrafficSettings();
+				break;
+			case VR_TRAFFIC_VEHICLES:
+				gTrafficCarPercent = Min(Max(
+					gTrafficCarPercent+direction*5, 50), 300);
+				SaveVrInteger("CarTrafficPercent",
+					gTrafficCarPercent);
+				ApplyTrafficSettings();
+				break;
+			case VR_TRAFFIC_PHYSICS_DIRECTOR: {
+				const int mode =
+					(QuestPhysicsDirectorGetMode()+direction+
+					 QUEST_PHYSICS_DIRECTOR_MODE_COUNT)%
+					QUEST_PHYSICS_DIRECTOR_MODE_COUNT;
+				QuestPhysicsDirectorSetMode(mode);
+				SaveVrInteger("PhysicsDirectorMode", mode);
+				break;
+			}
+			case VR_TRAFFIC_PHYSICS_PRESET: {
+				const int preset =
+					(QuestPhysicsDirectorGetPreset()+direction+
+					 QUEST_PHYSICS_PRESET_COUNT)%
+					QUEST_PHYSICS_PRESET_COUNT;
+				QuestPhysicsDirectorSetPreset(preset);
+				SaveVrInteger("PhysicsDirectorPreset", preset);
+				break;
+			}
+			case VR_TRAFFIC_VISUAL_BUDGET: {
+				const int mode =
+					(QuestVehicleVisualBudgetGetMode()+direction+
+					 QUEST_VEHICLE_VISUAL_MODE_COUNT)%
+					QUEST_VEHICLE_VISUAL_MODE_COUNT;
+				QuestVehicleVisualBudgetSetMode(mode);
+				SaveVrInteger("VehicleVisualBudgetMode", mode);
+				break;
+			}
+			case VR_TRAFFIC_DEFAULTS:
+				gTrafficPedPercent = 135;
+				gTrafficCarPercent = 135;
+				QuestPhysicsDirectorSetMode(
+					QUEST_PHYSICS_DIRECTOR_ADAPTIVE);
+				QuestPhysicsDirectorSetPreset(
+					QUEST_PHYSICS_PRESET_QUALITY);
+				QuestVehicleVisualBudgetSetMode(
+					QUEST_VEHICLE_VISUAL_STOCK);
+				SaveVrInteger("PedTrafficPercent",
+					gTrafficPedPercent);
+				SaveVrInteger("CarTrafficPercent",
+					gTrafficCarPercent);
+				SaveVrInteger("PhysicsDirectorMode",
+					QUEST_PHYSICS_DIRECTOR_ADAPTIVE);
+				SaveVrInteger("PhysicsDirectorPreset",
+					QUEST_PHYSICS_PRESET_QUALITY);
+				SaveVrInteger("VehicleVisualBudgetMode",
+					QUEST_VEHICLE_VISUAL_STOCK);
+				ApplyTrafficSettings();
+				break;
+			case VR_TRAFFIC_BACK:
+				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+				break;
 			}
 		}else if(gVrMenuPage == VR_MENU_PAGE_HUD &&
 		         (positivePulse || decreasePulse)){
@@ -687,18 +1274,48 @@ VrDebugUpdate(const PadInput &in)
 		         (positivePulse || decreasePulse)){
 			const int direction = decreasePulse ? -1 : 1;
 			switch(gVrVehicleSelection){
-			case VR_VEHICLE_DRIVING_TYPE:
-				OculusVR::CycleQuestDrivingType(direction);
+			case VR_VEHICLE_CAR_DRIVING_TYPE:
+				OculusVR::CycleQuestCarDrivingType(direction);
 				break;
-			case VR_VEHICLE_DRIVING_Y:
-				OculusVR::AdjustQuestDrivingYOffsetCm(direction);
+			case VR_VEHICLE_BIKE_DRIVING_TYPE:
+				OculusVR::CycleQuestBikeDrivingType(direction);
 				break;
-			case VR_VEHICLE_SEAT_DISTANCE:
-				OculusVR::AdjustQuestVehicleSeatDistanceCm(
-					direction);
+			case VR_VEHICLE_DEFAULT_SEAT_HEIGHT:
+				OculusVR::AdjustQuestDefaultVehicleSeatHeightCm(
+					direction*repeatMagnitude);
+				break;
+			case VR_VEHICLE_DEFAULT_SEAT_FORWARD:
+				OculusVR::AdjustQuestDefaultVehicleSeatDistanceCm(
+					direction*repeatMagnitude);
+				break;
+			case VR_VEHICLE_GLOBAL_SEAT_HEIGHT:
+				if(!OculusVR::HasQuestDefaultVehicleViewOffsetTarget())
+					OculusVR::AdjustQuestVehicleGlobalSeatHeightCm(
+						direction*repeatMagnitude);
+				break;
+			case VR_VEHICLE_GLOBAL_SEAT_FORWARD:
+				if(!OculusVR::HasQuestDefaultVehicleViewOffsetTarget())
+					OculusVR::AdjustQuestVehicleGlobalSeatDistanceCm(
+						direction*repeatMagnitude);
+				break;
+			case VR_VEHICLE_MODEL_SEAT_HEIGHT:
+				if(!OculusVR::HasQuestDefaultVehicleViewOffsetTarget())
+					OculusVR::AdjustQuestVehicleModelSeatHeightCm(
+						direction*repeatMagnitude);
+				break;
+			case VR_VEHICLE_MODEL_SEAT_FORWARD:
+				if(!OculusVR::HasQuestDefaultVehicleViewOffsetTarget())
+					OculusVR::AdjustQuestVehicleModelSeatDistanceCm(
+						direction*repeatMagnitude);
 				break;
 			case VR_VEHICLE_MOTION_HAND:
 				OculusVR::ToggleQuestMotionSteeringHand();
+				break;
+			case VR_VEHICLE_WHEEL_VISIBLE:
+				OculusVR::ToggleQuestImmersiveCarWheelVisible();
+				break;
+			case VR_VEHICLE_MODEL_WHEEL_VISIBLE:
+				OculusVR::ToggleQuestVehicleModelWheelVisibility();
 				break;
 			case VR_VEHICLE_HANDLE_HIGHLIGHTS:
 				OculusVR::ToggleQuestVehicleHandleHighlights();
@@ -726,14 +1343,16 @@ VrDebugUpdate(const PadInput &in)
 			const int valueCount =
 				OculusVR::GetQuestVehicleCalibrationItemCount();
 			const int direction = decreasePulse ? -1 : 1;
-			if(gVrVehicleCalibrationSelection == 0)
+			const int item = OculusVR::GetQuestVehicleCalibrationItemForRow(
+				gVrVehicleCalibrationSelection);
+			if(item == OculusVR::QUEST_VEHICLE_CAL_HAND)
 				gVrVehicleCalibrationHand =
 					1-gVrVehicleCalibrationHand;
 			else if(gVrVehicleCalibrationSelection < valueCount)
 				OculusVR::AdjustQuestVehicleCalibrationValue(
 					gVrVehicleCalibrationHand,
-					gVrVehicleCalibrationSelection,
-					direction);
+					item,
+					direction*repeatMagnitude);
 			else{
 				OculusVR::SetQuestVehicleCalibrationPreview(
 					false);
@@ -773,6 +1392,25 @@ VrDebugUpdate(const PadInput &in)
 						gQuestTurnSensitivityPercent);
 				}
 				break;
+			case VR_LOCOMOTION_HEAD_BOBBING:
+				gQuestHeadBobbing = !gQuestHeadBobbing;
+				SaveVrInteger("HeadBobbing", gQuestHeadBobbing);
+				break;
+			case VR_LOCOMOTION_REFRESH_RATE: {
+				static const int rates[] = { 72, 80, 90, 120 };
+				const int count =
+					(int)(sizeof(rates)/sizeof(rates[0]));
+				int index = 0;
+				for(int i = 0; i < count; i++)
+					if(rates[i] == gQuestRefreshRateHz)
+						index = i;
+				index = (index + direction + count) % count;
+				gQuestRefreshRateHz = rates[index];
+				SaveVrInteger("RefreshRate", gQuestRefreshRateHz);
+				androidgame::SetPreferredRefreshRate(
+					gQuestRefreshRateHz);
+				break;
+			}
 			case VR_LOCOMOTION_SNAP_ANGLE:
 				gQuestSnapTurnAngleDegrees += direction*15;
 				if(gQuestSnapTurnAngleDegrees < 15)
@@ -791,7 +1429,7 @@ VrDebugUpdate(const PadInput &in)
 			   (positivePulse || decreasePulse))
 				gVrCalibrationHand = 1-gVrCalibrationHand;
 			else if(gVrCalibrationSelection >= 1 &&
-			        gVrCalibrationSelection <= 15 &&
+			        gVrCalibrationSelection <= 19 &&
 			        (positivePulse || decreasePulse)){
 				const int weaponType =
 					OculusVR::GetQuestCalibrationWeaponType(
@@ -799,8 +1437,8 @@ VrDebugUpdate(const PadInput &in)
 				OculusVR::AdjustQuestCalibrationValue(
 					gVrCalibrationHand, weaponType,
 					gVrCalibrationSelection-1,
-					decreasePulse ? -1 : 1);
-			}else if(gVrCalibrationSelection == 16 &&
+					(decreasePulse ? -1 : 1)*repeatMagnitude);
+			}else if(gVrCalibrationSelection == 20 &&
 			         positivePulse)
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
 		}else if(gVrMenuPage == VR_MENU_PAGE_HOLSTERS){
@@ -812,14 +1450,39 @@ VrDebugUpdate(const PadInput &in)
 					decreasePulse ? -1 : 1);
 			else if(gVrHolsterSelection == points && positivePulse)
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
-		}else if(gVrMenuPage == VR_MENU_PAGE_CHEATS &&
-		         positivePulse){
-			const bool activated =
-				ActivateVrCheat(gVrCheatSelection);
-			snprintf(gVrCheatStatus, sizeof(gVrCheatStatus),
-				"%s", activated ? "CHEAT ACTIVATED" :
-				"UNAVAILABLE RIGHT NOW");
-			gVrCheatStatusFrames = 120;
+		}else if(gVrMenuPage == VR_MENU_PAGE_CHEATS){
+			if((increasePulse || decreasePulse) && !selectPulse &&
+			   gVrCheatSelection > 0)
+				CycleVrCheatSelection(gVrCheatSelection-1,
+					decreasePulse ? -1 : 1);
+			else if(selectPulse){
+				if(gVrCheatSelection == 0){
+					gVrMenuPage = VR_MENU_PAGE_MISSIONS;
+					gVrMissionCategory = -1;
+					gVrMissionCategorySelection = 0;
+					gVrMissionSelection = 0;
+				}else{
+					const bool activated = ActivateVrCheat(
+						gVrCheatSelection-1);
+					snprintf(gVrCheatStatus, sizeof(gVrCheatStatus),
+						"%s", activated ? "CHEAT ACTIVATED" :
+						"UNAVAILABLE RIGHT NOW");
+					gVrCheatStatusFrames = 120;
+				}
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_MISSIONS && selectPulse){
+			if(gVrMissionCategory < 0){
+				gVrMissionCategory = gVrMissionCategorySelection;
+				gVrMissionSelection = 0;
+			}else if(ActivateVrMission(gVrMissionCategory,
+			          gVrMissionSelection)){
+				gVrMenuVisible = false;
+				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+			}else{
+				snprintf(gVrCheatStatus, sizeof(gVrCheatStatus),
+					"MISSION NOT SAFE RIGHT NOW");
+				gVrCheatStatusFrames = 120;
+			}
 		}
 
 		const bool back = in.b || in.leftStickClick;
@@ -829,12 +1492,9 @@ VrDebugUpdate(const PadInput &in)
 		if(gVrCheatStatusFrames > 0)
 			gVrCheatStatusFrames--;
 	}else{
-		const bool debugShortcut = modifier && in.a;
-		if(debugShortcut && !gTouchDebugShortcutDown)
-			gDebugVisible = !gDebugVisible;
-		gTouchDebugShortcutDown = debugShortcut;
 		gVrMenuIncreaseDown = false;
 		gVrMenuDecreaseDown = false;
+		gVrCheatCycleDown = false;
 	}
 
 	if(gDebugPreviousFrameMs > 0.0){
@@ -865,88 +1525,328 @@ BeginFullVrMenuPage(const char *heading, const char *subtitle = nil)
 
 static void
 DrawFullVrMenuRow(const char *text, int y, int scale, bool selected,
-                  bool available = true)
+                  bool available = true, bool warning = false,
+                  bool positive = false)
 {
 	if(selected)
 		FillVrMenuRect(85, y-5, VR_MENU_WIDTH-85,
 			y+scale*7+4,
-			available ? 25 : 55,
-			available ? 95 : 62,
-			available ? 135 : 72, 245);
+			warning ? 125 : (positive ? 20 : (available ? 25 : 55)),
+			warning ? 35 : (positive ? 105 : (available ? 95 : 62)),
+			warning ? 30 : (positive ? 60 : (available ? 135 : 72)), 245);
 	DrawVrMenuText(text, VR_MENU_WIDTH/2, y, scale,
-		selected ? 255 : (available ? 205 : 120),
-		selected ? (available ? 245 : 180) :
-			(available ? 215 : 135),
-		selected ? (available ? 110 : 130) :
-			(available ? 225 : 145));
+		warning ? 255 : (positive ? (selected ? 210 : 105) :
+			(selected ? 255 : (available ? 205 : 120))),
+		warning ? (selected ? 225 : 105) :
+			(positive ? 245 : (selected ? (available ? 245 : 180) :
+			 (available ? 215 : 135))),
+		warning ? (selected ? 120 : 95) :
+			(positive ? 145 : (selected ? (available ? 110 : 130) :
+			 (available ? 225 : 145))));
 }
 
-static bool
-IsQuestMainItemAvailable(int item)
+static void
+QuestMainCategoryColour(int item, uint8 *red, uint8 *green, uint8 *blue)
 {
-	return item == VR_MAIN_COLOR ||
-		item == VR_MAIN_FXAA ||
-		item == VR_MAIN_HUD ||
-		item == VR_MAIN_HANDS ||
-		item == VR_MAIN_LASER ||
-		item == VR_MAIN_HOLSTER_HIGHLIGHTS ||
-		item == VR_MAIN_MANUAL_RELOAD ||
-		item == VR_MAIN_SCOPE_AIM ||
-		item == VR_MAIN_VEHICLE_SETTINGS ||
-		item == VR_MAIN_LOCOMOTION_SETTINGS ||
-		item == VR_MAIN_DEBUG ||
-		item == VR_MAIN_GRIP_LOCK ||
-		item == VR_MAIN_CALIBRATION ||
-		item == VR_MAIN_HOLSTERS ||
-		item == VR_MAIN_CHEATS;
+	static const uint8 colours[VR_MAIN_ITEM_COUNT][3] = {
+		{100,225,255}, {125,255,145}, {255,205,90},
+		{190,145,255}, {255,155,90}, {90,220,210},
+		{255,120,205}, {240,180,105}, {255,105,105},
+		{170,190,210}
+	};
+	*red = colours[item][0]; *green = colours[item][1];
+	*blue = colours[item][2];
 }
 
 static void
 DrawQuestSettingsPage(void)
 {
+	gQuestCpuPerformanceMode = Min(Max(xrvk::getPerformanceMode(),
+		(int)QUEST_CPU_PERFORMANCE_AUTO),
+		(int)QUEST_CPU_PERFORMANCE_COUNT-1);
 	BeginFullVrMenuPage("SETTINGS");
 	char rows[VR_MAIN_ITEM_COUNT][112];
-	snprintf(rows[VR_MAIN_FXAA], sizeof(rows[0]),
-		"FXAA  < %s >", gFxaaEnabled ? "ON" : "OFF");
-	snprintf(rows[VR_MAIN_COLOR], sizeof(rows[0]),
-		"COLOR FILTER  < %s >",
-		gViceCityColorEnabled ? "ON" : "OFF");
-	strcpy(rows[VR_MAIN_HUD], "HUD SETTINGS  < OPEN >");
-	for(int item = VR_MAIN_HANDS;
-	    item <= VR_MAIN_SCOPE_AIM; item++){
-		const int setting = QuestWeaponSettingForMainItem(item);
-		snprintf(rows[item], sizeof(rows[item]), "%s  < %s >",
-			OculusVR::GetQuestWeaponSettingName(setting),
-			OculusVR::GetQuestWeaponSetting(setting) ?
-				"ON" : "OFF");
-	}
+	strcpy(rows[VR_MAIN_GRAPHICS], "GRAPHICS  < OPEN >");
+	strcpy(rows[VR_MAIN_TRAFFIC_SETTINGS],
+		"TRAFFIC  < OPEN >");
+	strcpy(rows[VR_MAIN_HUD], "HUD  < OPEN >");
+	strcpy(rows[VR_MAIN_MODEL_ASSETS],
+		"MODEL ASSETS  < OPEN >");
 	strcpy(rows[VR_MAIN_VEHICLE_SETTINGS],
-		"VEHICLE SETTINGS  < OPEN >");
+		"VEHICLE  < OPEN >");
 	strcpy(rows[VR_MAIN_LOCOMOTION_SETTINGS],
-		"LOCOMOTION SETTINGS  < OPEN >");
-	snprintf(rows[VR_MAIN_DEBUG], sizeof(rows[0]),
-		"DEBUG OVERLAY  < %s >", gDebugVisible ? "ON" : "OFF");
-	{
-		const int setting =
-			QuestWeaponSettingForMainItem(VR_MAIN_GRIP_LOCK);
-		snprintf(rows[VR_MAIN_GRIP_LOCK], sizeof(rows[0]),
-			"%s  < %s >",
-			OculusVR::GetQuestWeaponSettingName(setting),
-			OculusVR::GetQuestWeaponSetting(setting) ?
-				"ON" : "OFF");
-	}
-	strcpy(rows[VR_MAIN_CALIBRATION],
-		"WEAPON CALIBRATION  < OPEN >");
+		"LOCOMOTION  < OPEN >");
+	strcpy(rows[VR_MAIN_WEAPONS], "WEAPONS  < OPEN >");
 	strcpy(rows[VR_MAIN_HOLSTERS], "HOLSTER LOADOUT  < OPEN >");
 	strcpy(rows[VR_MAIN_CHEATS], "CHEAT MENU  < OPEN >");
+	strcpy(rows[VR_MAIN_ABOUT], "ABOUT VICE CITY VR  < OPEN >");
 
-	for(int item = 0; item < VR_MAIN_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 145+item*22, 2,
-			item == gVrMenuSelection,
-			IsQuestMainItemAvailable(item));
+	for(int item = 0; item < VR_MAIN_ITEM_COUNT; item++){
+		DrawFullVrMenuRow(rows[item], 160+item*50, 3,
+			item == gVrMenuSelection, true);
+		uint8 red, green, blue;
+		QuestMainCategoryColour(item, &red, &green, &blue);
+		if(item != gVrMenuSelection)
+			DrawVrMenuText(rows[item], VR_MENU_WIDTH/2,
+				160+item*50, 3, red, green, blue);
+	}
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 PREVIOUS   R2 OR A NEXT   B CLOSE",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
+}
+
+static void
+DrawQuestGraphicsPage(void)
+{
+	BeginFullVrMenuPage("GRAPHICS", "QUEST RENDERING AND PERFORMANCE");
+	xrvk::RenderScaleStatus scaleStatus = {};
+	const bool scaleStatusValid = xrvk::getRenderScaleStatus(&scaleStatus);
+	char rows[VR_GRAPHICS_ITEM_COUNT][112];
+	if(scaleStatusValid)
+		snprintf(rows[VR_GRAPHICS_RENDER_SCALE], sizeof(rows[0]),
+			"OUTPUT REQUEST < %d%% >  ACTIVE %.0f%% - RESTART",
+			gQuestRenderScalePercent, scaleStatus.effectivePercent);
+	else
+		snprintf(rows[VR_GRAPHICS_RENDER_SCALE], sizeof(rows[0]),
+			"OUTPUT REQUEST  < %d%% - RESTART >",
+			gQuestRenderScalePercent);
+	snprintf(rows[VR_GRAPHICS_SGSR], sizeof(rows[0]),
+		"TEMPORAL AA < DISABLED - UNSTABLE >");
+	snprintf(rows[VR_GRAPHICS_MSAA], sizeof(rows[0]),
+		"STEREO MSAA  < DISABLED - NO VISIBLE GAIN >");
+	snprintf(rows[VR_GRAPHICS_FXAA], sizeof(rows[0]),
+		"SPATIAL AA  < %s >", gSpatialAaMode ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_COLOR], sizeof(rows[0]),
+		"COLOR FILTER  < %s >", gViceCityColorEnabled ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_PROFILER], sizeof(rows[0]),
+		"PERFORMANCE PROFILER  < %s >",
+		QuestProfilerIsEnabled() ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_CPU_PERFORMANCE], sizeof(rows[0]),
+		"CPU PERFORMANCE < %s > ACTIVE %s",
+		QuestCpuPerformanceModeName(gQuestCpuPerformanceMode),
+		xrvk::getActivePerformanceMode() >= 0 ?
+			QuestCpuPerformanceModeName(xrvk::getActivePerformanceMode()) :
+			"PENDING");
+	snprintf(rows[VR_GRAPHICS_GPU_PERFORMANCE], sizeof(rows[0]),
+		"GPU PERFORMANCE < %s > ACTIVE %s",
+		QuestCpuPerformanceModeName(gQuestGpuPerformanceMode),
+		xrvk::getActiveGpuPerformanceMode() >= 0 ?
+			QuestCpuPerformanceModeName(xrvk::getActiveGpuPerformanceMode()) :
+			"PENDING");
+	snprintf(rows[VR_GRAPHICS_SHADOWS], sizeof(rows[0]),
+		"WORLD SHADOWS  < %s >",
+		CShadows::IsRenderEnabled() ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_OCCLUSION], sizeof(rows[0]),
+		"OCCLUSION CULLING  < %s >",
+		CRenderer::GetVrOcclusionCullingModeName());
+	snprintf(rows[VR_GRAPHICS_FOUNTAIN], sizeof(rows[0]),
+		"FOUNTAIN PARTICLES  < %s >",
+		CParticleObject::GetVrFountainQualityName());
+	snprintf(rows[VR_GRAPHICS_QUICK_START], sizeof(rows[0]),
+		"QUICK TEST START  < %s - NEXT LAUNCH >",
+		gQuestQuickTestStart ? "ON" : "OFF");
+	strcpy(rows[VR_GRAPHICS_BACK], "BACK TO SETTINGS");
+	for(int item = 0; item < VR_GRAPHICS_ITEM_COUNT; item++)
+		DrawFullVrMenuRow(rows[item], 142+item*33, 3,
+			item == gVrGraphicsSelection);
+	if(scaleStatusValid){
+		char activeScale[192];
+		snprintf(activeScale, sizeof(activeScale),
+			"OUTPUT ACTIVE %.0f%%  %u X %u  BASE %u X %u%s%s",
+			scaleStatus.effectivePercent,
+			scaleStatus.actualWidth, scaleStatus.actualHeight,
+			scaleStatus.recommendedWidth, scaleStatus.recommendedHeight,
+			scaleStatus.fallbackReason !=
+				xrvk::RENDER_SCALE_FALLBACK_NONE ? "  FALLBACK: " : "",
+			scaleStatus.fallbackReason !=
+				xrvk::RENDER_SCALE_FALLBACK_NONE ?
+				xrvk::getRenderScaleFallbackReasonName(
+					scaleStatus.fallbackReason) : "");
+		const bool fallback = scaleStatus.fallbackReason !=
+			xrvk::RENDER_SCALE_FALLBACK_NONE;
+		DrawVrMenuText(activeScale, VR_MENU_WIDTH/2, 608, 2,
+			fallback ? 255 : 120, fallback ? 95 : 220,
+			fallback ? 85 : 255);
+		DrawVrMenuText("NATIVE SCENE  SPATIAL AA SINGLE-FRAME",
+			VR_MENU_WIDTH/2, 630, 2, 170, 190, 210);
+		if(scaleStatus.previousFallbackReason !=
+		   xrvk::RENDER_SCALE_FALLBACK_NONE){
+			char recoveredScale[192];
+			snprintf(recoveredScale, sizeof(recoveredScale),
+				"LAST FALLBACK %d%% TO %d%%: %s",
+				scaleStatus.previousFallbackRequestedPercent,
+				scaleStatus.previousFallbackPercent,
+				xrvk::getRenderScaleFallbackReasonName(
+					scaleStatus.previousFallbackReason));
+			DrawVrMenuText(recoveredScale, VR_MENU_WIDTH/2, 652, 2,
+				255, 105, 85);
+		}
+	}
+	if(gOcclusionCullingMode >= VR_OCCLUSION_CULLING_AUTHORED)
+		DrawVrMenuText("AUTHORED CULLING IS EXPERIMENTAL: USE STEREO SAFE IF EYES DISAGREE",
+			VR_MENU_WIDTH/2, 690, 2, 255, 105, 95);
+	else if(gQuestRenderScalePercent >= 150)
+		DrawVrMenuText("150/175% IS EXPERIMENTAL: HIGH GPU AND MEMORY LOAD",
+			VR_MENU_WIDTH/2, 690, 2, 255, 120, 95);
+	else if(gQuestRenderScalePercent > 100)
+		DrawVrMenuText("HIGHER SCALE SHARPENS THE IMAGE BUT INCREASES GPU LOAD",
+			VR_MENU_WIDTH/2, 690, 2, 255, 175, 95);
+}
+
+static void
+DrawQuestWeaponsPage(void)
+{
+	BeginFullVrMenuPage("WEAPONS", "PHYSICAL HANDS, GRIPS AND CALIBRATION");
+	char rows[VR_WEAPONS_ITEM_COUNT][112];
+	for(int item = VR_WEAPONS_HANDS; item <= VR_WEAPONS_GRIP_LOCK; item++){
+		const int setting = QuestWeaponSettingForWeaponItem(item);
+		snprintf(rows[item], sizeof(rows[item]), "%s  < %s >",
+			OculusVR::GetQuestWeaponSettingName(setting),
+			OculusVR::GetQuestWeaponSetting(setting) ? "ON" : "OFF");
+	}
+	strcpy(rows[VR_WEAPONS_CALIBRATION], "WEAPON CALIBRATION  < OPEN >");
+	strcpy(rows[VR_WEAPONS_BACK], "BACK TO SETTINGS");
+	for(int item = 0; item < VR_WEAPONS_ITEM_COUNT; item++)
+		DrawFullVrMenuRow(rows[item], 170+item*55, 3,
+			item == gVrWeaponsSelection);
+}
+
+static void
+DrawQuestTrafficPage(void)
+{
+	BeginFullVrMenuPage("TRAFFIC SETTINGS",
+		"LIVE DENSITY - SAFE ENTITIES CONVERGE WITHOUT HARD DELETION");
+	char rows[VR_TRAFFIC_ITEM_COUNT][112];
+	snprintf(rows[VR_TRAFFIC_PEDESTRIANS], sizeof(rows[0]),
+		"PEDESTRIANS  < %d%% >", gTrafficPedPercent);
+	snprintf(rows[VR_TRAFFIC_VEHICLES], sizeof(rows[0]),
+		"VEHICLES  < %d%% >", gTrafficCarPercent);
+	snprintf(rows[VR_TRAFFIC_PHYSICS_DIRECTOR], sizeof(rows[0]),
+		"PHYSICS DIRECTOR  < %s >",
+		QuestPhysicsDirectorGetModeName());
+	snprintf(rows[VR_TRAFFIC_PHYSICS_PRESET], sizeof(rows[0]),
+		"PHYSICS PRESET  < %s >",
+		QuestPhysicsDirectorGetPresetName());
+	snprintf(rows[VR_TRAFFIC_VISUAL_BUDGET], sizeof(rows[0]),
+		"MODERN CAR VISUALS  < %s >",
+		QuestVehicleVisualBudgetGetModeName());
+	strcpy(rows[VR_TRAFFIC_DEFAULTS],
+		"RESTORE DEFAULTS  < 135% / MEASURE / BALANCED / STOCK >");
+	strcpy(rows[VR_TRAFFIC_BACK], "BACK TO SETTINGS");
+	const bool modernVehicles = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN;
+	for(int item = 0; item < VR_TRAFFIC_ITEM_COUNT; item++){
+		const bool gpuWarning = modernVehicles &&
+			(item == VR_TRAFFIC_VEHICLES ||
+			 item == VR_TRAFFIC_VISUAL_BUDGET);
+		DrawFullVrMenuRow(rows[item], 166+item*40, 2,
+			item == gVrTrafficSelection, true, gpuWarning);
+	}
+
+	char status[112];
+	const QuestPhysicsDirectorSnapshot physics =
+		QuestPhysicsDirectorGetSnapshot();
+	if(QuestPhysicsDirectorGetMode() == QUEST_PHYSICS_DIRECTOR_MEASURE &&
+	   !QuestProfilerIsEnabled())
+		strcpy(status, "ENABLE PROFILER FOR PHYSICS TIERS");
+	else
+		snprintf(status, sizeof(status),
+			"%s  F/R/R/P %d/%d/%d/%d  %.2f/%.2fMS",
+			QuestPhysicsDirectorGetStatusName(),
+			physics.tierCount[QUEST_VEHICLE_PHYSICS_FULL],
+			physics.tierCount[QUEST_VEHICLE_PHYSICS_REDUCED],
+			physics.tierCount[QUEST_VEHICLE_PHYSICS_RAIL],
+			physics.tierCount[QUEST_VEHICLE_PHYSICS_PROXY],
+			physics.managedAverageMs, physics.budgetMs);
+	DrawVrMenuText(status, VR_MENU_WIDTH/2, 455, 2,
+		125, 210, 255);
+	const QuestVehicleVisualBudgetSnapshot visual =
+		QuestVehicleVisualBudgetGetSnapshot();
+	if(visual.mode != QUEST_VEHICLE_VISUAL_STOCK)
+		DrawVrMenuText("FORCED VLO CAN POP IN VR - STOCK IS RECOMMENDED",
+			VR_MENU_WIDTH/2, 680, 2, 255, 105, 95);
+	snprintf(status, sizeof(status),
+		"VIS VHI/VLO %llu / %llu   SKIP/OCC %llu / %llu",
+		(unsigned long long)visual.highVehicleSubmissions,
+		(unsigned long long)visual.vloVehicleSubmissions,
+		(unsigned long long)visual.atomicsSkipped,
+		(unsigned long long)visual.occupantsSkipped);
+	DrawVrMenuText(status, VR_MENU_WIDTH/2, 485, 2,
+		255, 190, 115);
+	snprintf(status, sizeof(status),
+		"WALKERS %u / %.1f   CAP %d",
+		CPopulation::ms_nTotalPeds, CPopulation::VrTargetAmbientPeds,
+		CGame::IsInInterior() ?
+			CPopulation::MaxNumberOfPedsInUseInterior :
+			CPopulation::MaxNumberOfPedsInUse);
+	DrawVrMenuText(status, VR_MENU_WIDTH/2, 520, 3,
+		125, 255, 145);
+	CPedPool *pedPool = CPools::GetPedPool();
+	snprintf(status, sizeof(status), "PED POOL %d / %d",
+		pedPool != nil ? pedPool->GetNoOfUsedSpaces() : 0,
+		pedPool != nil ? pedPool->GetSize() : 0);
+	DrawVrMenuText(status, VR_MENU_WIDTH/2, 560, 3,
+		125, 255, 145);
+	snprintf(status, sizeof(status),
+		"CARS %d + %d PROXY   LOCAL %.1f / %.1f",
+		CCarCtrl::NumVrEffectiveAmbient,
+		CCarCtrl::NumVrActiveProxies,
+		CCarCtrl::VrLocalServed, CCarCtrl::VrLocalDesired);
+	DrawVrMenuText(status, VR_MENU_WIDTH/2, 600, 3,
+		125, 255, 145);
+	DrawVrMenuText("RANGES 50-300%   STEP 5%",
+		VR_MENU_WIDTH/2, 645, 2, 255, 180, 225);
+	DrawVrMenuText(
+		"LEFT STICK SELECT   L2 MINUS   R2 OR A PLUS   B BACK",
+		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
+}
+
+static void
+DrawQuestModelAssetsPage(void)
+{
+	BeginFullVrMenuPage("MODEL ASSETS",
+		"MIX CLASSIC AND MODERN CONTENT - FULL APP RESTART REQUIRED");
+	char rows[VR_MODEL_ASSETS_ITEM_COUNT][112];
+	snprintf(rows[VR_MODEL_ASSETS_PRESET], sizeof(rows[0]),
+		"RECOMMENDED PRESET  < %s >",
+		ModelSets::GetSourceName(ModelSets::GetRequested()));
+	for(int category = 0; category < ModelSets::MODEL_CATEGORY_COUNT;
+	    category++){
+		const bool available = ModelSets::IsCategoryAvailable(
+			(ModelSets::eModelCategory)category);
+		snprintf(rows[category+1], sizeof(rows[0]), "%s  < %s >%s%s",
+			ModelSets::GetCategoryName((ModelSets::eModelCategory)category),
+			ModelSets::GetSourceName(ModelSets::GetRequestedForCategory(
+				(ModelSets::eModelCategory)category)),
+			available ? "" : "  UNAVAILABLE",
+			ModelSets::IsCategoryRestartRequired(
+				(ModelSets::eModelCategory)category) ? "  RESTART" : "");
+	}
+	strcpy(rows[VR_MODEL_ASSETS_BACK], "BACK TO SETTINGS");
+	for(int item = 0; item < VR_MODEL_ASSETS_ITEM_COUNT; item++){
+		const bool available = item == VR_MODEL_ASSETS_PRESET ||
+			item == VR_MODEL_ASSETS_BACK ||
+			ModelSets::IsCategoryAvailable(
+				(ModelSets::eModelCategory)(item-1));
+		const bool modernVehicleWarning =
+			item == VR_MODEL_ASSETS_VEHICLES &&
+			ModelSets::GetRequestedForCategory(
+				ModelSets::MODEL_CATEGORY_VEHICLES) ==
+				ModelSets::MODEL_SET_MODERN;
+		DrawFullVrMenuRow(rows[item], 210+item*42, 2,
+			item == gVrModelAssetsSelection, available,
+			modernVehicleWarning);
+	}
+	if(ModelSets::GetRequestedForCategory(
+	   ModelSets::MODEL_CATEGORY_VEHICLES) ==
+	   ModelSets::MODEL_SET_MODERN){
+		DrawVrMenuText("WARNING: MODERN VEHICLES ARE VERY GPU HEAVY",
+			VR_MENU_WIDTH/2, 630, 2, 255, 95, 85);
+		DrawVrMenuText("USE CLASSIC VEHICLES OR REDUCE 300% TRAFFIC IF FPS DROPS",
+			VR_MENU_WIDTH/2, 660, 2, 255, 155, 105);
+	}else
+		DrawVrMenuText("CLASSIC VEGETATION IS DEFAULT FOR QUEST PERFORMANCE",
+			VR_MENU_WIDTH/2, 650, 2, 245, 205, 90);
 }
 
 static void
@@ -980,23 +1880,62 @@ DrawQuestVehiclePage(void)
 	BeginFullVrMenuPage("VEHICLE SETTINGS",
 		"DRIVING CONTROLS AND PER-VEHICLE CALIBRATION");
 	char rows[VR_VEHICLE_ITEM_COUNT][112];
-	snprintf(rows[VR_VEHICLE_DRIVING_TYPE], sizeof(rows[0]),
-		"DRIVING TYPE  < %s >",
-		OculusVR::GetQuestDrivingTypeName());
-	snprintf(rows[VR_VEHICLE_DRIVING_Y], sizeof(rows[0]),
-		"DRIVING Y OFFSET  < %+d CM >",
-		OculusVR::GetQuestDrivingYOffsetCm());
-	if(OculusVR::HasQuestVehicleSeatCalibrationTarget())
-		snprintf(rows[VR_VEHICLE_SEAT_DISTANCE], sizeof(rows[0]),
-			"SEAT DISTANCE  < %+d CM >",
-			OculusVR::GetQuestVehicleSeatDistanceCm());
-	else
-		strcpy(rows[VR_VEHICLE_SEAT_DISTANCE],
-			"SEAT DISTANCE  < ENTER VEHICLE >");
+	snprintf(rows[VR_VEHICLE_CAR_DRIVING_TYPE], sizeof(rows[0]),
+		"CAR DRIVING TYPE  < %s >", OculusVR::GetQuestCarDrivingTypeName());
+	snprintf(rows[VR_VEHICLE_BIKE_DRIVING_TYPE], sizeof(rows[0]),
+		"BIKE DRIVING TYPE  < %s >", OculusVR::GetQuestBikeDrivingTypeName());
+	if(OculusVR::HasQuestDefaultVehicleViewOffsetTarget()){
+		snprintf(rows[VR_VEHICLE_DEFAULT_SEAT_HEIGHT], sizeof(rows[0]),
+			"DEFAULT %s HEIGHT  < %+d CM >",
+			OculusVR::GetQuestDefaultVehicleViewOffsetName(),
+			OculusVR::GetQuestDefaultVehicleSeatHeightCm());
+		snprintf(rows[VR_VEHICLE_DEFAULT_SEAT_FORWARD], sizeof(rows[0]),
+			"DEFAULT %s FORWARD  < %+d CM >",
+			OculusVR::GetQuestDefaultVehicleViewOffsetName(),
+			OculusVR::GetQuestDefaultVehicleSeatDistanceCm());
+	}else{
+		strcpy(rows[VR_VEHICLE_DEFAULT_SEAT_HEIGHT],
+			"DEFAULT VIEW HEIGHT  < ENTER DEFAULT CAR / BIKE >");
+		strcpy(rows[VR_VEHICLE_DEFAULT_SEAT_FORWARD],
+			"DEFAULT VIEW FORWARD  < ENTER DEFAULT CAR / BIKE >");
+	}
+	if(OculusVR::HasQuestVehicleSeatCalibrationTarget() &&
+	   !OculusVR::HasQuestDefaultVehicleViewOffsetTarget()){
+		snprintf(rows[VR_VEHICLE_GLOBAL_SEAT_HEIGHT], sizeof(rows[0]),
+			"%s GLOBAL HEIGHT  < %+d CM >", OculusVR::GetQuestVehicleCategoryName(),
+			OculusVR::GetQuestVehicleGlobalSeatHeightCm());
+		snprintf(rows[VR_VEHICLE_GLOBAL_SEAT_FORWARD], sizeof(rows[0]),
+			"%s GLOBAL FORWARD  < %+d CM >", OculusVR::GetQuestVehicleCategoryName(),
+			OculusVR::GetQuestVehicleGlobalSeatDistanceCm());
+		snprintf(rows[VR_VEHICLE_MODEL_SEAT_HEIGHT], sizeof(rows[0]),
+			"MODEL HEIGHT  < %+d CM >", OculusVR::GetQuestVehicleModelSeatHeightCm());
+		snprintf(rows[VR_VEHICLE_MODEL_SEAT_FORWARD], sizeof(rows[0]),
+			"MODEL FORWARD  < %+d CM >", OculusVR::GetQuestVehicleModelSeatDistanceCm());
+	}else if(OculusVR::HasQuestDefaultVehicleViewOffsetTarget()){
+		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_HEIGHT],
+			"GLOBAL HEIGHT  < IMMERSIVE / MOTION ONLY >");
+		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_FORWARD],
+			"GLOBAL FORWARD  < IMMERSIVE / MOTION ONLY >");
+		strcpy(rows[VR_VEHICLE_MODEL_SEAT_HEIGHT],
+			"MODEL HEIGHT  < IMMERSIVE / MOTION ONLY >");
+		strcpy(rows[VR_VEHICLE_MODEL_SEAT_FORWARD],
+			"MODEL FORWARD  < IMMERSIVE / MOTION ONLY >");
+	}else{
+		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_HEIGHT], "GLOBAL HEIGHT  < ENTER VEHICLE >");
+		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_FORWARD], "GLOBAL FORWARD  < ENTER VEHICLE >");
+		strcpy(rows[VR_VEHICLE_MODEL_SEAT_HEIGHT], "MODEL HEIGHT  < ENTER VEHICLE >");
+		strcpy(rows[VR_VEHICLE_MODEL_SEAT_FORWARD], "MODEL FORWARD  < ENTER VEHICLE >");
+	}
 	snprintf(rows[VR_VEHICLE_MOTION_HAND], sizeof(rows[0]),
 		"MOTION STEERING HAND  < %s >",
 		OculusVR::GetQuestMotionSteeringHand() == 0 ?
 			"LEFT" : "RIGHT");
+	snprintf(rows[VR_VEHICLE_WHEEL_VISIBLE], sizeof(rows[0]),
+		"ALL CARS VIRTUAL WHEEL  < %s >",
+		OculusVR::IsQuestImmersiveCarWheelVisible() ? "VISIBLE" : "HIDDEN");
+	snprintf(rows[VR_VEHICLE_MODEL_WHEEL_VISIBLE], sizeof(rows[0]),
+		"THIS MODEL VIRTUAL WHEEL  < %s >",
+		OculusVR::GetQuestVehicleModelWheelVisibilityName());
 	snprintf(rows[VR_VEHICLE_HANDLE_HIGHLIGHTS], sizeof(rows[0]),
 		"VEHICLE GRIP HIGHLIGHTS  < %s >",
 		OculusVR::AreQuestVehicleHandleHighlightsEnabled() ?
@@ -1009,13 +1948,20 @@ DrawQuestVehiclePage(void)
 		OculusVR::IsQuestVehicleCalibrationAvailable() ?
 			"OPEN" : "ENTER VEHICLE");
 	strcpy(rows[VR_VEHICLE_BACK], "BACK TO SETTINGS");
-	for(int item = 0; item < VR_VEHICLE_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 170+item*49, 3,
-			item == gVrVehicleSelection,
-			item != VR_VEHICLE_SEAT_DISTANCE ||
-				OculusVR::HasQuestVehicleSeatCalibrationTarget());
+	for(int item = 0; item < VR_VEHICLE_ITEM_COUNT; item++){
+		bool available = true;
+		if(item >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
+		   item <= VR_VEHICLE_DEFAULT_SEAT_FORWARD)
+			available = OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
+		else if(item >= VR_VEHICLE_GLOBAL_SEAT_HEIGHT &&
+		        item <= VR_VEHICLE_MODEL_SEAT_FORWARD)
+			available = OculusVR::HasQuestVehicleSeatCalibrationTarget() &&
+				!OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
+		DrawFullVrMenuRow(rows[item], 166+item*34, 2,
+			item == gVrVehicleSelection, available);
+	}
 	DrawVrMenuText("VALUES ARE SAVED IN VR SETTINGS",
-		VR_MENU_WIDTH/2, 660, 2, 125, 255, 145);
+		VR_MENU_WIDTH/2, 675, 2, 125, 255, 145);
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 PREVIOUS   R2 OR A NEXT   B BACK",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
@@ -1029,40 +1975,35 @@ DrawQuestVehicleCalibrationPage(void)
 		OculusVR::GetQuestActiveVehicleName());
 	BeginFullVrMenuPage(heading,
 		"VALUES ARE SAVED FOR THIS VEHICLE MODEL");
-	static const char *labels[VR_VEHICLE_CAL_ITEM_COUNT] = {
-		"EDIT HANDLE", "LOCAL X OFFSET", "LOCAL Y OFFSET",
-		"LOCAL Z OFFSET", "LOCAL ROT X", "LOCAL ROT Y",
-		"LOCAL ROT Z", "WHEELIE HAND HEIGHT", "STAND HAND DROP"
-	};
 	const int valueCount =
 		OculusVR::GetQuestVehicleCalibrationItemCount();
-	for(int item = 0; item <= valueCount; item++){
+	for(int rowIndex = 0; rowIndex <= valueCount; rowIndex++){
 		char row[112];
-		if(item == 0)
-			snprintf(row, sizeof(row), "%s  < %s >", labels[item],
+		const int item = OculusVR::GetQuestVehicleCalibrationItemForRow(rowIndex);
+		const char *label = OculusVR::GetQuestVehicleCalibrationItemName(item);
+		if(item == OculusVR::QUEST_VEHICLE_CAL_HAND)
+			snprintf(row, sizeof(row), "%s  < %s >", label,
 				gVrVehicleCalibrationHand == 0 ?
 					"LEFT" : "RIGHT");
-		else if(item < valueCount){
+		else if(rowIndex < valueCount){
 			const int value =
 				OculusVR::GetQuestVehicleCalibrationValue(
 					gVrVehicleCalibrationHand, item);
-			if(item >= VR_VEHICLE_CAL_ROT_X &&
-			   item <= VR_VEHICLE_CAL_ROT_Z)
+			if(OculusVR::IsQuestVehicleCalibrationRotation(item))
 				snprintf(row, sizeof(row),
-					"%s  < %+.1f DEG >", labels[item],
+					"%s  < %+.1f DEG >", label,
 					(float)value/2.0f);
-			else if(item == VR_VEHICLE_CAL_WHEELIE_HEIGHT ||
-			        item == VR_VEHICLE_CAL_STAND_HEIGHT)
+			else if(OculusVR::IsQuestVehicleCalibrationWholeCentimeters(item))
 				snprintf(row, sizeof(row), "%s  < %d CM >",
-					labels[item], value);
+					label, value);
 			else
 				snprintf(row, sizeof(row),
-					"%s  < %+.1f CM >", labels[item],
+					"%s  < %+.1f CM >", label,
 					(float)value/2.0f);
 		}else
 			strcpy(row, "BACK TO VEHICLE SETTINGS");
-		DrawFullVrMenuRow(row, 174+item*48, 3,
-			item == gVrVehicleCalibrationSelection,
+		DrawFullVrMenuRow(row, 166+rowIndex*29, 2,
+			rowIndex == gVrVehicleCalibrationSelection,
 			true);
 	}
 	DrawVrMenuText(
@@ -1097,6 +2038,10 @@ DrawQuestLocomotionPage(void)
 			gQuestTurnSensitivityPercent);
 	snprintf(rows[VR_LOCOMOTION_SNAP_ANGLE], sizeof(rows[0]),
 		"SNAP TURN ANGLE  < %d DEG >", gQuestSnapTurnAngleDegrees);
+	snprintf(rows[VR_LOCOMOTION_HEAD_BOBBING], sizeof(rows[0]),
+		"WALKING HEAD BOB  < %s >", gQuestHeadBobbing ? "ON" : "OFF");
+	snprintf(rows[VR_LOCOMOTION_REFRESH_RATE], sizeof(rows[0]),
+		"REFRESH RATE  < %d HZ >", gQuestRefreshRateHz);
 	strcpy(rows[VR_LOCOMOTION_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_LOCOMOTION_ITEM_COUNT; item++)
 		DrawFullVrMenuRow(rows[item], 190+item*68, 3,
@@ -1119,31 +2064,39 @@ DrawQuestWeaponCalibrationPage(void)
 		gVrCalibrationHand == 0 ? "LEFT" : "RIGHT");
 	BeginFullVrMenuPage(heading,
 		"VALUES ARE SAVED PER WEAPON AND PER HAND");
-	static const char *labels[15] = {
+	static const char *labels[19] = {
 		"AIM X OFFSET", "AIM Y OFFSET", "AIM Z OFFSET",
 		"AIM LOCAL ROT X", "AIM LOCAL ROT Y", "AIM LOCAL ROT Z",
 		"WEAPON X OFFSET", "WEAPON Y OFFSET", "WEAPON Z OFFSET",
 		"WEAPON LOCAL ROT X", "WEAPON LOCAL ROT Y",
 		"WEAPON LOCAL ROT Z", "SUPPORT GRIP X",
-		"SUPPORT GRIP Y", "SUPPORT GRIP Z"
+		"SUPPORT GRIP Y", "SUPPORT GRIP Z",
+		"SUPPORT GRIP ROT X", "SUPPORT GRIP ROT Y",
+		"SUPPORT GRIP ROT Z", "SUPPORT GRIP STYLE"
 	};
-	for(int item = 0; item < 17; item++){
+	for(int item = 0; item < 21; item++){
 		char row[112];
 		if(item == 0)
 			snprintf(row, sizeof(row), "EDIT HAND  < %s >",
 				gVrCalibrationHand == 0 ? "LEFT" : "RIGHT");
-		else if(item <= 15){
+		else if(item <= 19){
 			const int value =
 				OculusVR::GetQuestCalibrationValue(
 					gVrCalibrationHand, weaponType, item-1);
-			snprintf(row, sizeof(row), "%s  < %+.1f %s >",
-				labels[item-1], (float)value/2.0f,
-				(item >= 4 && item <= 6) ||
-				(item >= 10 && item <= 12) ?
-					"DEG" : "CM");
+			if(item == 19)
+				snprintf(row, sizeof(row), "%s  < %s >",
+					labels[item-1], value == 1 ?
+						"FROM BELOW" : "MAGAZINE");
+			else
+				snprintf(row, sizeof(row), "%s  < %+.1f %s >",
+					labels[item-1], (float)value/2.0f,
+					((item >= 4 && item <= 6) ||
+					 (item >= 10 && item <= 12) ||
+					 (item >= 16 && item <= 18)) ?
+						"DEG" : "CM");
 		}else
 			strcpy(row, "BACK TO SETTINGS");
-		DrawFullVrMenuRow(row, 158+item*28, 2,
+		DrawFullVrMenuRow(row, 154+item*25, 2,
 			item == gVrCalibrationSelection);
 	}
 	DrawVrMenuText(
@@ -1185,7 +2138,7 @@ static void
 DrawQuestCheatPage(void)
 {
 	BeginFullVrMenuPage("CHEATS");
-	const int count = GetVrCheatCount();
+	const int count = GetVrCheatCount()+1;
 	const int first = count > 0 ?
 		(gVrCheatSelection/VR_CHEAT_ITEMS_PER_PAGE)*
 			VR_CHEAT_ITEMS_PER_PAGE : 0;
@@ -1193,40 +2146,145 @@ DrawQuestCheatPage(void)
 	    row < VR_CHEAT_ITEMS_PER_PAGE && first+row < count;
 	    row++){
 		const int item = first+row;
-		DrawFullVrMenuRow(GetVrCheatName(item), 158+row*50, 3,
-			item == gVrCheatSelection);
+		const char *name = item == 0 ?
+			"MISSION SELECTOR  < OPEN >" : GetVrCheatName(item-1);
+		bool toggleEnabled = false;
+		const bool isToggle = item > 0 &&
+			GetVrCheatToggleState(item-1, &toggleEnabled);
+		DrawFullVrMenuRow(name, 158+row*37, 2,
+			item == gVrCheatSelection, true,
+			isToggle && !toggleEnabled, isToggle && toggleEnabled);
 	}
 	char page[48];
 	const int pageCount = Max(1,
 		(count+VR_CHEAT_ITEMS_PER_PAGE-1)/VR_CHEAT_ITEMS_PER_PAGE);
 	snprintf(page, sizeof(page), "PAGE %d OF %d",
 		first/VR_CHEAT_ITEMS_PER_PAGE+1, pageCount);
-	DrawVrMenuText(page, VR_MENU_WIDTH/2, 680, 3,
+	DrawVrMenuText(page, VR_MENU_WIDTH/2, 680, 2,
 		120, 220, 255);
 	DrawVrMenuText(
 		gVrCheatStatusFrames > 0 ? gVrCheatStatus :
-			"LEFT STICK SELECT   A OR R2 ACTIVATE   B BACK",
-		VR_MENU_WIDTH/2, 718, 3,
+			"STICK UP/DOWN SELECT   LEFT/RIGHT MODEL   A ACTIVATE   B BACK",
+		VR_MENU_WIDTH/2, 718, 2,
 		gVrCheatStatusFrames > 0 ? 255 : 170,
 		gVrCheatStatusFrames > 0 ? 220 : 190,
 		gVrCheatStatusFrames > 0 ? 80 : 210);
 }
 
-// Fills the same 1024x768 menu surface as desktop. The compact 512x128 layer
-// is now reserved exclusively for the FPS/debug overlay.
+static void
+DrawQuestMissionPage(void)
+{
+	BeginFullVrMenuPage("CHEATS / MISSIONS",
+		"TEST TOOL - STARTS IN THE CURRENT SAVE STATE");
+	if(gVrMissionCategory < 0){
+		const int count = GetVrMissionCategoryCount();
+		for(int item = 0; item < count; item++){
+			char row[112];
+			snprintf(row, sizeof(row), "%s  < OPEN >",
+				GetVrMissionCategoryName(item));
+			DrawFullVrMenuRow(row, 235+item*90, 3,
+				item == gVrMissionCategorySelection);
+		}
+		DrawVrMenuText("MISSION NUMBERS COME FROM THE ACTIVE MAIN.SCM TABLE",
+			VR_MENU_WIDTH/2, 610, 2, 255, 180, 225);
+		DrawVrMenuText(gVrCheatStatusFrames > 0 ? gVrCheatStatus :
+			"UP/DOWN SELECT   A OPEN   B BACK TO CHEATS",
+			VR_MENU_WIDTH/2, 718, 2,
+			gVrCheatStatusFrames > 0 ? 255 : 170,
+			gVrCheatStatusFrames > 0 ? 220 : 190,
+			gVrCheatStatusFrames > 0 ? 80 : 210);
+		return;
+	}
+
+	DrawVrMenuText(GetVrMissionCategoryName(gVrMissionCategory),
+		VR_MENU_WIDTH/2, 132, 2, 255, 180, 225);
+	const int count = GetVrMissionCount(gVrMissionCategory);
+	const int first = (gVrMissionSelection/VR_CHEAT_ITEMS_PER_PAGE)*
+		VR_CHEAT_ITEMS_PER_PAGE;
+	for(int row = 0; row < VR_CHEAT_ITEMS_PER_PAGE && first+row < count;
+	    row++){
+		const int item = first+row;
+		DrawFullVrMenuRow(GetVrMissionName(gVrMissionCategory, item),
+			154+row*34, 2, item == gVrMissionSelection);
+	}
+	char page[48];
+	const int pageCount = Max(1,
+		(count+VR_CHEAT_ITEMS_PER_PAGE-1)/VR_CHEAT_ITEMS_PER_PAGE);
+	snprintf(page, sizeof(page), "PAGE %d OF %d",
+		first/VR_CHEAT_ITEMS_PER_PAGE+1, pageCount);
+	DrawVrMenuText(page, VR_MENU_WIDTH/2, 650, 2, 120, 220, 255);
+	DrawVrMenuText(gVrCheatStatusFrames > 0 ? gVrCheatStatus :
+		"A STARTS THE MISSION   B RETURNS TO CATEGORIES",
+		VR_MENU_WIDTH/2, 718, 2,
+		gVrCheatStatusFrames > 0 ? 255 : 170,
+		gVrCheatStatusFrames > 0 ? 220 : 190,
+		gVrCheatStatusFrames > 0 ? 80 : 210);
+}
+
+static void
+DrawQuestAboutPage(void)
+{
+	BeginFullVrMenuPage(gVrWelcomeFirstRun ?
+		"WELCOME TO VICE CITY VR" : "ABOUT VICE CITY VR",
+		"VERSION 0.5.0 ALPHA - NOT FOR SALE");
+	static const char *lines[] = {
+		"OPEN THE VR MENU: HOLD BOTH GRIPS + MENU",
+		"CHEATS: HOLD BOTH GRIPS + B",
+		"CHOOSE IMMERSIVE DRIVING IN VEHICLE SETTINGS",
+		"CALIBRATE WEAPONS IF A MODEL OR GRIP IS MISALIGNED",
+		"MODEL ASSETS CAN MIX CLASSIC AND MODERN CONTENT",
+		"CLASSIC VEGETATION IS RECOMMENDED FOR QUEST PERFORMANCE",
+		"THE FULL CAMPAIGN IS PLAYABLE, BUT THE MOD IS STILL IN DEVELOPMENT",
+		"DISCUSSION: FLAT2VR DISCORD",
+		"discord.com/channels/747967102895390741/1529621098751197365",
+		"PRESS ANY BUTTON TO CLOSE"
+	};
+	for(int index = 0; index < (int)ARRAY_SIZE(lines); index++)
+		DrawVrMenuText(lines[index], VR_MENU_WIDTH/2, 220+index*40,
+			2, index == (int)ARRAY_SIZE(lines)-1 ? 255 : 215,
+			index == (int)ARRAY_SIZE(lines)-1 ? 205 : 225,
+			index == (int)ARRAY_SIZE(lines)-1 ? 80 : 235);
+}
+
+static const char *
+SpawnDenyReasonName(int reason)
+{
+	static const char *const names[16] = {
+		"MODEL", "COORS", "DICE", "COLLIDE", "CLOSE", "LANES",
+		"NOWHERE", "GROUND", "FAR", "VIEW", "APPROACH", "COPS",
+		"OK", "CELL", "POOL", "DEMAND"
+	};
+	return reason >= 0 && reason < 16 ? names[reason] : "NONE";
+}
+
+// Fills the same 1024x768 menu surface as desktop. Compact diagnostics use
+// 512x128 for the FPS line and 512x437 for the full profiler.
 const unsigned char *
 VrDebugPixels(int *width, int *height)
 {
-	*width = gVrMenuVisible ? VR_MENU_WIDTH : VR_DEBUG_WIDTH;
-	*height = gVrMenuVisible ? VR_MENU_HEIGHT : VR_DEBUG_HEIGHT;
 	const bool profilerVisible = QuestProfilerIsEnabled();
+	*width = gVrMenuVisible ? VR_MENU_WIDTH : VR_DEBUG_WIDTH;
+	*height = gVrMenuVisible ? VR_MENU_HEIGHT :
+		(profilerVisible ? VR_DEBUG_HEIGHT : VR_FPS_HEIGHT);
 	if(!gDebugVisible && !gVrMenuVisible && !profilerVisible)
 		return nil;
 
 	if(gVrMenuVisible){
 		switch(gVrMenuPage){
+		case VR_MENU_PAGE_GRAPHICS:
+			DrawQuestGraphicsPage();
+			break;
+		case VR_MENU_PAGE_WEAPONS:
+			DrawQuestWeaponsPage();
+			break;
 		case VR_MENU_PAGE_HUD:
 			DrawQuestHudPage();
+			break;
+		case VR_MENU_PAGE_TRAFFIC:
+			DrawQuestTrafficPage();
+			break;
+		case VR_MENU_PAGE_MODEL_ASSETS:
+			DrawQuestModelAssetsPage();
 			break;
 		case VR_MENU_PAGE_VEHICLE:
 			DrawQuestVehiclePage();
@@ -1246,6 +2304,12 @@ VrDebugPixels(int *width, int *height)
 		case VR_MENU_PAGE_CHEATS:
 			DrawQuestCheatPage();
 			break;
+		case VR_MENU_PAGE_MISSIONS:
+			DrawQuestMissionPage();
+			break;
+		case VR_MENU_PAGE_ABOUT:
+			DrawQuestAboutPage();
+			break;
 		default:
 			DrawQuestSettingsPage();
 			break;
@@ -1253,12 +2317,12 @@ VrDebugPixels(int *width, int *height)
 		return gVrMenuPixels;
 	}
 
-	for(int pixel = 0; pixel < VR_DEBUG_WIDTH*VR_DEBUG_HEIGHT; pixel++){
+	for(int pixel = 0; pixel < VR_DEBUG_WIDTH*(*height); pixel++){
 		gDebugPixels[pixel*4+0] = 5; gDebugPixels[pixel*4+1] = 4;
 		gDebugPixels[pixel*4+2] = 12; gDebugPixels[pixel*4+3] = 225;
 	}
 
-	char value[96];
+	char value[128];
 	if(!profilerVisible){
 		sprintf(value, "OPENXR FPS:%d", gDebugFps);
 		DrawDebugText(value, VR_DEBUG_WIDTH/2, 10, 3,
@@ -1267,53 +2331,77 @@ VrDebugPixels(int *width, int *height)
 	}
 
 	const QuestProfilerSnapshot perf = QuestProfilerGetSnapshot();
-	sprintf(value, "FPS:%d CPU:%.2f/%.2f STEP:%.2f",
-		gDebugFps, perf.cpuAppMs, perf.cpuAppMaxMs,
-		perf.cpuStepMs);
+	sprintf(value, "FPS:%.1f FRAME:%.2f BUDGET:%.2f",
+		perf.appFps > 0.0f ? perf.appFps : (float)gDebugFps,
+		perf.cpuAppMs, perf.frameBudgetMs);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 1, 2,
 		perf.cpuAppMs > perf.frameBudgetMs ? 255 : 100,
 		perf.cpuAppMs > perf.frameBudgetMs ? 90 : 230, 120);
-	sprintf(value, "PRE:%.2f VKB:%.2f POST:%.2f VKE:%.2f",
-		perf.cpuPreMs, perf.cpuVkBeginMs, perf.cpuPostMs,
-		perf.cpuVkEndMs);
+	sprintf(value, "CPU APP:%.2f MAX:%.2f STEP:%.2f",
+		perf.cpuAppMs, perf.cpuAppMaxMs, perf.cpuStepMs);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 16, 2,
-		perf.cpuVkBeginMs > perf.frameBudgetMs ? 255 : 100,
-		perf.cpuVkBeginMs > perf.frameBudgetMs ? 90 : 230, 120);
-	sprintf(value, "GAME:%.2f/%.2f SIM:%.2f STR:%.2f/%.2f",
+		perf.cpuAppMs > perf.frameBudgetMs ? 255 : 100,
+		perf.cpuAppMs > perf.frameBudgetMs ? 90 : 230, 120);
+	sprintf(value, "GAME:%.2f/%.2f RES:%.2f/%.2f STR:%.2f",
 		perf.cpuGameMs, perf.cpuGameMaxMs,
-		perf.cpuSimOtherMs, perf.cpuStreamingMs,
-		perf.cpuStreamingMaxMs);
+		perf.cpuSimOtherMs, perf.cpuSimOtherMaxMs,
+		perf.cpuStreamingMs);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 31, 2,
 		perf.cpuGameMs > perf.frameBudgetMs ? 255 : 100,
 		perf.cpuGameMs > perf.frameBudgetMs ? 90 : 230, 120);
-	sprintf(value, "AUDIO:%.2f/%.2f LIST:%.2f/%.2f",
-		perf.cpuAudioMs, perf.cpuAudioMaxMs,
-		perf.cpuWorldListMs, perf.cpuWorldListMaxMs);
+	sprintf(value, "SCR:%.2f PRE:%.2f WRLD:%.2f POST:%.2f",
+		perf.cpuScriptMs, perf.cpuPreWorldMiscMs,
+		perf.cpuWorldProcessMs, perf.cpuPostWorldCameraFxMs);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 46, 2,
 		120, 210, 255);
-	sprintf(value, "PRER:%.2f/%.2f SETUP:%.2f/%.2f",
-		perf.cpuPreRenderMs, perf.cpuPreRenderMaxMs,
-		perf.cpuSceneSetupMs, perf.cpuSceneSetupMaxMs);
+	sprintf(value, "PED A/C/P/COL/S/X:%.2f/%.2f/%.2f/%.2f/%.2f/%.2f",
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_PED]
+			[QUEST_WORLD_SIM_PHASE_ANIMATION],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_PED]
+			[QUEST_WORLD_SIM_PHASE_CONTROL],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_PED]
+			[QUEST_WORLD_SIM_PHASE_POSTPONED_CONTROL],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_PED]
+			[QUEST_WORLD_SIM_PHASE_COLLISION],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_PED]
+			[QUEST_WORLD_SIM_PHASE_SHIFT],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_PED]
+			[QUEST_WORLD_SIM_PHASE_TRANSFORM]);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 61, 2,
 		120, 210, 255);
-	sprintf(value, "WORLD:%.2f/%.2f UI:%.2f/%.2f",
-		perf.cpuWorldRenderMs, perf.cpuWorldRenderMaxMs,
-		perf.cpuUiMs, perf.cpuUiMaxMs);
+	sprintf(value, "VEH A/C/P/COL/S/X:%.2f/%.2f/%.2f/%.2f/%.2f/%.2f",
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_ANIMATION],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_CONTROL],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_POSTPONED_CONTROL],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_COLLISION],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_SHIFT],
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_TRANSFORM]);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 76, 2,
 		120, 210, 255);
-	if(perf.gpuFrameValid)
-		sprintf(value, "GPU:%.2f [%s] GPU VK:%.2f",
-			perf.gpuFrameMs,
-			perf.gpuFrameRuntime ? "META" : "VK",
-			perf.gpuVulkanValid ? perf.gpuVulkanMs : -1.0f);
-	else
-		sprintf(value, "GPU:N A GPU VK:%.2f",
-			perf.gpuVulkanValid ? perf.gpuVulkanMs : -1.0f);
+	sprintf(value, "MGR P:%.2f C:%.2f RENDER:%.2f UI:%.2f",
+		perf.cpuPopulationMs, perf.cpuCarMs,
+		perf.cpuWorldRenderMs, perf.cpuUiMs);
 	DrawDebugText(value, VR_DEBUG_WIDTH/2, 91, 2,
-		perf.gpuFrameValid &&
-		 perf.gpuFrameMs > perf.frameBudgetMs ? 255 : 100,
-		perf.gpuFrameValid &&
-		 perf.gpuFrameMs > perf.frameBudgetMs ? 90 : 210, 255);
+		120, 210, 255);
+	const float limitingGpuMs = perf.gpuFrameRuntime && perf.gpuVulkanValid ?
+		Max(perf.gpuFrameMs, perf.gpuVulkanMs) : perf.gpuFrameMs;
+	if(perf.gpuFrameRuntime && perf.gpuVulkanValid)
+		sprintf(value, "GPU META:%.2f VK:%.2f LIMIT:%.2f",
+			perf.gpuFrameMs, perf.gpuVulkanMs, limitingGpuMs);
+	else if(perf.gpuFrameValid)
+		sprintf(value, "GPU:%.2f [%s]", perf.gpuFrameMs,
+			perf.gpuFrameRuntime ? "META" : "VK");
+	else
+		sprintf(value, "GPU:N/A VK:N/A");
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 106, 2,
+		perf.gpuFrameValid && limitingGpuMs > perf.frameBudgetMs ? 255 : 100,
+		perf.gpuFrameValid && limitingGpuMs > perf.frameBudgetMs ? 90 : 210, 255);
 
 	// The local APP bracket includes beginFrame's previous-GPU fence wait.
 	// Do not call that a CPU bottleneck when META is unavailable; CPU STEP is
@@ -1323,21 +2411,177 @@ VrDebugPixels(int *width, int *height)
 	const char *bottleneck = "UNKNOWN";
 	if(perf.gpuFrameValid){
 		if(cpuMs < perf.frameBudgetMs*0.8f &&
-		   perf.gpuFrameMs < perf.frameBudgetMs*0.8f)
+		   limitingGpuMs < perf.frameBudgetMs*0.8f)
 			bottleneck = "HEADROOM";
-		else if(cpuMs > perf.gpuFrameMs+0.5f)
+		else if(cpuMs > limitingGpuMs+0.5f)
 			bottleneck = "CPU";
-		else if(perf.gpuFrameMs > cpuMs+0.5f)
+		else if(limitingGpuMs > cpuMs+0.5f)
 			bottleneck = "GPU";
 		else
 			bottleneck = "BALANCED";
 	}
-	sprintf(value, "BUDGET:%.2f GAP:%.2f LIMIT:%s",
-		perf.frameBudgetMs > 0.0f ? perf.frameBudgetMs : 13.89f,
-		perf.cpuUnaccountedMs,
-		bottleneck);
-	DrawDebugText(value, VR_DEBUG_WIDTH/2, 106, 2,
-		220, 180, 255);
+	sprintf(value, "PART U:%.2f R:%.2f N:%d H:%d",
+		perf.cpuParticleUpdateMs, perf.cpuParticleRenderMs,
+		perf.particleActive, perf.heliDustActive);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 121, 2,
+		180, 190, 200);
+	sprintf(value, "STREAM Q:%d P:%d MEM:%llu/%lluM",
+		perf.streamingRequested, perf.streamingPriority,
+		(unsigned long long)(perf.streamingMemoryUsed/(1024*1024)),
+		(unsigned long long)(perf.streamingMemoryAvailable/(1024*1024)));
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 136, 2,
+		120, 210, 255);
+	sprintf(value, "PED:%d/%.1f CAP:%d POOL:%d/%d",
+		perf.ambientPeds, perf.targetAmbientPeds,
+		perf.ambientPedCap, perf.pedPoolUsed, perf.pedPoolSize);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 151, 2,
+		120, 210, 255);
+	sprintf(value, "POOL V:%d/%d O:%d/%d E:%d/%d",
+		perf.vehiclePoolUsed, perf.vehiclePoolSize,
+		perf.objectPoolUsed, perf.objectPoolSize,
+		perf.entryInfoPoolUsed, perf.entryInfoPoolSize);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 166, 2,
+		120, 210, 255);
+	sprintf(value, "CFG:%d/%d WANT:%.1f SERV:%.1f",
+		perf.pedTrafficPercent, perf.carTrafficPercent,
+		perf.trafficDesired, perf.trafficServed);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 181, 2,
+		255, 220, 100);
+	sprintf(value, "AMB:%d COP:%d PROXY:%d PEND:%d",
+		perf.trafficAmbient, perf.trafficPursuit,
+		perf.trafficProxies, perf.trafficPending);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 196, 2,
+		255, 220, 100);
+	sprintf(value, "DEB:%d STL:%d BLK:%d DIR:%.2f/%.2f",
+		perf.trafficDebris, perf.trafficStalled,
+		perf.trafficPoolReserveBlocks,
+		perf.trafficDirectorMs, perf.trafficDirectorMaxMs);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 211, 2,
+		255, 180, 100);
+	sprintf(value, "SPAWN:%d OK:%d DENY:%d TOP:%s:%d",
+		perf.spawnAttemptsPerSecond, perf.spawnSuccessPerSecond,
+		perf.spawnDeniedPerSecond,
+		SpawnDenyReasonName(perf.spawnTopDenyReason),
+		perf.spawnTopDenyCount);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 226, 2,
+		perf.spawnDeniedPerSecond > perf.spawnSuccessPerSecond ? 255 : 220,
+		perf.spawnDeniedPerSecond > perf.spawnSuccessPerSecond ? 90 : 180,
+		120);
+	sprintf(value, "JOB D:%d S:%d H:%d M:%d",
+		perf.trafficJobDispatchesPerSecond,
+		perf.trafficJobSkipsPerSecond,
+		perf.trafficJobHitsPerSecond, perf.trafficJobMissesPerSecond);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 241, 2,
+		perf.trafficJobHitsPerSecond > perf.trafficJobMissesPerSecond ? 100 : 255,
+		perf.trafficJobHitsPerSecond > perf.trafficJobMissesPerSecond ? 230 : 120,
+		160);
+	sprintf(value, "JOB W:%.2f/%.2f B:%.2f/%.2f",
+		perf.trafficJobMs, perf.trafficJobMaxMs,
+		perf.trafficJobBuildMs, perf.trafficJobBuildMaxMs);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 256, 2,
+		140, 215, 255);
+	sprintf(value, "FLAT S/B/R:%d/%d/%d F:%d I:%d SAVE:%d",
+		perf.collisionFlatScopesPerSecond,
+		perf.collisionFlatBuildsPerSecond,
+		perf.collisionFlatReusesPerSecond,
+		perf.collisionFlatStalePerSecond+
+			perf.collisionFlatOverflowsPerSecond,
+		perf.collisionFlatItemsPerSecond,
+		perf.collisionFlatSavedNodeVisitsPerSecond);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 271, 2,
+		perf.collisionFlatStalePerSecond == 0 &&
+			perf.collisionFlatOverflowsPerSecond == 0 ? 100 : 255,
+		perf.collisionFlatStalePerSecond == 0 &&
+			perf.collisionFlatOverflowsPerSecond == 0 ? 230 : 120,
+		160);
+	sprintf(value, "R SKY:%.2f RD:%.2f WRLD:%.2f WTR:%.2f",
+		perf.cpuRenderSkyMs, perf.cpuRenderRoadsMs,
+		perf.cpuRenderWorldMs, perf.cpuRenderWaterMs);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 286, 2,
+		140, 215, 255);
+	sprintf(value, "R REF:%.2f FAD:%.2f WTH:%.2f FX:%.2f",
+		perf.cpuRenderReflectionsMs, perf.cpuRenderFadingMs,
+		perf.cpuRenderWeatherMs, perf.cpuRenderEffectsMs);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 301, 2,
+		140, 215, 255);
+	sprintf(value, "R OTHER:%.2f/%.2f TOTAL:%.2f/%.2f",
+		perf.cpuRenderOtherMs, perf.cpuRenderOtherMaxMs,
+		perf.cpuWorldRenderMs, perf.cpuWorldRenderMaxMs);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 316, 2,
+		140, 215, 255);
+	sprintf(value, "STATIC:%d RD:%d OCC:%d D:%d/%d/%d",
+		perf.visibleBuildings, perf.visibleRoads,
+		perf.activeOccluders,
+		perf.renderEntityCalls[QUEST_RENDER_ENTITY_VEHICLE],
+		perf.renderEntityCalls[QUEST_RENDER_ENTITY_PED],
+		perf.renderEntityCalls[QUEST_RENDER_ENTITY_STATIC]);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 331, 2,
+		140, 215, 255);
+	sprintf(value, "RFAD V:%.2f/%d P:%.2f/%d S:%.2f/%d",
+		perf.cpuRenderFadingEntityMs[QUEST_RENDER_ENTITY_VEHICLE],
+		perf.renderFadingEntityCalls[QUEST_RENDER_ENTITY_VEHICLE],
+		perf.cpuRenderFadingEntityMs[QUEST_RENDER_ENTITY_PED],
+		perf.renderFadingEntityCalls[QUEST_RENDER_ENTITY_PED],
+		perf.cpuRenderFadingEntityMs[QUEST_RENDER_ENTITY_STATIC],
+		perf.renderFadingEntityCalls[QUEST_RENDER_ENTITY_STATIC]);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 346, 2,
+		140, 215, 255);
+	sprintf(value, "RV %.2f/%.2f/%.2f/%.2f V:%d/%d S:%d O:%d",
+		perf.cpuVehicleRenderPhaseMs[QUEST_VEHICLE_RENDER_PHASE_LIGHTING],
+		perf.cpuVehicleRenderPhaseMs[QUEST_VEHICLE_RENDER_PHASE_OCCUPANTS],
+		perf.cpuVehicleRenderPhaseMs[QUEST_VEHICLE_RENDER_PHASE_BODY_SUBMIT],
+		perf.cpuVehicleRenderPhaseMs[QUEST_VEHICLE_RENDER_PHASE_ALPHA_ATOMICS],
+		perf.vehicleVisualHighPerSecond,
+		perf.vehicleVisualVloPerSecond,
+		perf.vehicleVisualAtomicsSkippedPerSecond,
+		perf.vehicleVisualOccupantsSkippedPerSecond);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 361, 2,
+		140, 215, 255);
+	gQuestCpuPerformanceMode = Min(Max(xrvk::getPerformanceMode(),
+		(int)QUEST_CPU_PERFORMANCE_AUTO),
+		(int)QUEST_CPU_PERFORMANCE_COUNT-1);
+	if(!xrvk::isPerformanceModeSupported())
+		sprintf(value, "CPU PERF:%s UNSUPPORTED",
+			QuestCpuPerformanceModeName(gQuestCpuPerformanceMode));
+	else if(xrvk::isPerformanceBoostBlocked())
+		sprintf(value, "CPU PERF:%s THERMAL BLOCKED",
+			QuestCpuPerformanceModeName(gQuestCpuPerformanceMode));
+	else if(xrvk::getActivePerformanceMode() < 0)
+		sprintf(value, "CPU PERF REQ:%s ACTIVE:PENDING",
+			QuestCpuPerformanceModeName(gQuestCpuPerformanceMode));
+	else
+		sprintf(value, "CPU PERF REQ:%s ACTIVE:%s",
+			QuestCpuPerformanceModeName(gQuestCpuPerformanceMode),
+			QuestCpuPerformanceModeName(
+				xrvk::getActivePerformanceMode()));
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 376, 2,
+		180, 205, 120);
+	sprintf(value, "PHY M:%d F/RD/RL/P:%d/%d/%d/%d COL:%.2f",
+		perf.physicsDirectorMode, perf.physicsFull,
+		perf.physicsReduced, perf.physicsRail, perf.physicsProxy,
+		perf.cpuWorldEntityPhaseMs[QUEST_WORLD_ENTITY_VEHICLE]
+			[QUEST_WORLD_SIM_PHASE_COLLISION]);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 391, 2,
+		120, 230, 185);
+	sprintf(value, "PHY C/S/K:%d/%d/%d N/P:%d/%d",
+		perf.physicsCheckCollisionPerSecond,
+		perf.physicsCheckSimplePerSecond,
+		perf.physicsSimpleSkippedPerSecond,
+		perf.physicsSectorNodesPerSecond,
+		perf.physicsPairsAfterFilteringPerSecond);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 406, 2,
+		120, 230, 185);
+	sprintf(value, "PHY CM/W/T:%d/%d/%d ST/R:%d/%d",
+		perf.physicsProcessColModelsPerSecond,
+		perf.physicsWheelLineTestsPerSecond,
+		perf.physicsTriangleTestsPerSecond,
+		perf.physicsExtraSubstepsPerSecond,
+		perf.physicsRetryPassesPerSecond);
+	DrawDebugText(value, VR_DEBUG_WIDTH/2, 421, 2,
+		120, 230, 185);
+	(void)bottleneck;
+	/* LIMIT remains available in the CSV through CPU/GPU/budget columns; the
+	 * compact screen spends its last lines on actionable traffic diagnostics. */
 	return gDebugPixels;
 }
 
@@ -1360,7 +2604,14 @@ bool
 VrFxaaEnabled(void)
 {
 	LoadVrSettings();
-	return gFxaaEnabled;
+	return gSpatialAaMode != 0;
+}
+
+int
+VrSpatialAaMode(void)
+{
+	LoadVrSettings();
+	return gSpatialAaMode;
 }
 
 bool
@@ -1379,6 +2630,13 @@ VrGetGameplayHudSettings(int *widthPercent, int *scalePercent,
 	if(scalePercent) *scalePercent = gHudScalePercent;
 	if(offsetXCm) *offsetXCm = gHudOffsetXCm;
 	if(offsetYCm) *offsetYCm = gHudOffsetYCm;
+}
+
+bool
+VrHeadBobbingEnabled(void)
+{
+	LoadVrSettings();
+	return gQuestHeadBobbing != 0;
 }
 
 bool

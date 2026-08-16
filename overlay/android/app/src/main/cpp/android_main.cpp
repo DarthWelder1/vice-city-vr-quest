@@ -4,6 +4,7 @@
 #include <android_native_app_glue.h>
 #include <android/log.h>
 #include <math.h>
+#include <stdio.h>
 #include <time.h>
 
 #include <atomic>
@@ -33,6 +34,58 @@ struct AppState
 };
 
 #ifndef MIAMIVR_BRINGUP
+// A high-resolution OpenXR colour swapchain can succeed before librw allocates
+// its two full-resolution scene/depth frame contexts. If that later Vulkan
+// allocation fails, this process cannot safely resize the live swapchain and
+// restart partially initialised RenderWare. Persist a conservative value so
+// the user's next explicit launch is recoverable instead of boot-looping at
+// the same oversized request.
+void
+autoResetRenderScaleAfterGameInitialiseFailure(void)
+{
+	const char *dataRoot = platform::gameDataRoot();
+	if(dataRoot == nullptr || dataRoot[0] == '\0'){
+		LOGE("render-scale recovery unavailable: game data root is empty");
+		return;
+	}
+	char settingsPath[512];
+	const int pathLength = snprintf(settingsPath, sizeof(settingsPath),
+		"%s/vr_settings.ini", dataRoot);
+	if(pathLength < 0 || pathLength >= (int)sizeof(settingsPath)){
+		LOGE("render-scale recovery unavailable: settings path is too long");
+		return;
+	}
+
+	const int persistedScale = (int)GetPrivateProfileIntA(
+		"VR", "RenderScalePercent", 125, settingsPath);
+	if(persistedScale <= 100)
+		return;
+
+	char failedRequest[16];
+	snprintf(failedRequest, sizeof(failedRequest), "%d", persistedScale);
+	char failureReason[16];
+	snprintf(failureReason, sizeof(failureReason), "%d",
+		xrvk::RENDER_SCALE_FALLBACK_GAME_RENDERER_ALLOCATION);
+	const bool historyWritten =
+		WritePrivateProfileStringA("VR", "RenderScaleLastFallbackRequest",
+			failedRequest, settingsPath) &&
+		WritePrivateProfileStringA("VR", "RenderScaleLastFallbackPercent",
+			"100", settingsPath) &&
+		WritePrivateProfileStringA("VR", "RenderScaleLastFallbackReason",
+			failureReason, settingsPath);
+	if(WritePrivateProfileStringA(
+	     "VR", "RenderScalePercent", "100", settingsPath)){
+		LOGE("game initialisation failed with persisted render scale %d%%; "
+		     "auto-reset to 100%% for next launch (%s, history %s)",
+		     persistedScale, settingsPath,
+		     historyWritten ? "saved" : "FAILED");
+	}else{
+		LOGE("game initialisation failed with persisted render scale %d%%; "
+		     "AUTO-RESET TO 100%% FAILED (%s)",
+		     persistedScale, settingsPath);
+	}
+}
+
 // The headset swapchain is portrait per eye, but theatre content is shown on
 // a 16:9 physical quad. Build a conventional mono camera for that physical
 // aspect so the picture does not inherit head pose, eye separation or lens
@@ -74,6 +127,148 @@ makeTheaterMatrices(float viewProj[16], float im2dWorld[16],
 	*distanceOut = distance;
 }
 
+struct MenuTransitionTraceState
+{
+	bool initialized;
+	uint64 frame;
+	int theaterBefore;
+	int theaterAfter;
+	int gameState;
+	int gameNotLoaded;
+	int menuActive;
+	int wantRestart;
+	int wantLoad;
+	int playingIntro;
+	int cutsceneProcessing;
+	int cutsceneRunning;
+	int widescreen;
+	int playerPresent;
+	int currentScreen;
+	uint32 colourMode;
+};
+
+MenuTransitionTraceState gMenuTransitionTrace = {};
+
+int64_t
+monotonicNowNs(void)
+{
+	timespec now = {};
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (int64_t)now.tv_sec*1000000000LL + now.tv_nsec;
+}
+
+// The startup artifact is only visible for a fraction of a second, so log the
+// first few seconds and every later state transition to a small persistent
+// file.  This is intentionally outside logcat: the user can reproduce once,
+// quit, and we can pull the exact transition without keeping adb attached.
+void
+traceMenuTransition(bool theaterBefore, bool theaterAfter,
+	bool theaterSubmitted, uint32 colourMode,
+	int64_t frameStartNs, int64_t beginStartNs, int64_t beginEndNs,
+	int64_t stepEndNs, int64_t endFrameEndNs)
+{
+	MenuTransitionTraceState current = {};
+	current.initialized = true;
+	current.frame = gMenuTransitionTrace.frame;
+	current.theaterBefore = theaterBefore;
+	current.theaterAfter = theaterAfter;
+	current.gameState = (int)gGameState;
+	current.gameNotLoaded = FrontEndMenuManager.m_bGameNotLoaded;
+	current.menuActive = FrontEndMenuManager.m_bMenuActive;
+	current.wantRestart = FrontEndMenuManager.m_bWantToRestart;
+	current.wantLoad = FrontEndMenuManager.m_bWantToLoad;
+	current.playingIntro = CGame::playingIntro;
+	current.cutsceneProcessing = CCutsceneMgr::IsCutsceneProcessing();
+	current.cutsceneRunning = CCutsceneMgr::IsRunning();
+	current.widescreen = TheCamera.m_WideScreenOn;
+	current.playerPresent = FindPlayerPed() != nil;
+	current.currentScreen = FrontEndMenuManager.m_nCurrScreen;
+	current.colourMode = colourMode;
+
+	const MenuTransitionTraceState &previous = gMenuTransitionTrace;
+	const bool changed = !previous.initialized ||
+		current.theaterBefore != previous.theaterBefore ||
+		current.theaterAfter != previous.theaterAfter ||
+		current.gameState != previous.gameState ||
+		current.gameNotLoaded != previous.gameNotLoaded ||
+		current.menuActive != previous.menuActive ||
+		current.wantRestart != previous.wantRestart ||
+		current.wantLoad != previous.wantLoad ||
+		current.playingIntro != previous.playingIntro ||
+		current.cutsceneProcessing != previous.cutsceneProcessing ||
+		current.cutsceneRunning != previous.cutsceneRunning ||
+		current.widescreen != previous.widescreen ||
+		current.playerPresent != previous.playerPresent ||
+		current.currentScreen != previous.currentScreen ||
+		current.colourMode != previous.colourMode;
+	const bool earlyFrame = current.frame < 288; // Four seconds at 72 Hz.
+
+	if(earlyFrame || changed){
+		static FILE *traceFile = nullptr;
+		if(traceFile == nullptr){
+			const char *root = platform::storageRoot();
+			if(root != nullptr && root[0] != '\0'){
+				char path[512];
+				const int pathLength = snprintf(path, sizeof(path),
+					"%s/menu_transition.log", root);
+				if(pathLength > 0 && pathLength < (int)sizeof(path))
+					traceFile = fopen(path, "w");
+			}
+			if(traceFile != nullptr){
+				xrvk::RenderScaleStatus scale = {};
+				uint32 temporalMode = 0, sceneWidth = 0, sceneHeight = 0;
+				uint32 outputWidth = 0, outputHeight = 0;
+				const bool scaleValid = xrvk::getRenderScaleStatus(&scale);
+				const bool temporalValid = rw::vulkan::getSgsrStatus(
+					&temporalMode, &sceneWidth, &sceneHeight,
+					&outputWidth, &outputHeight);
+				fprintf(traceFile,
+					"# scale valid=%d request=%d selected=%d effective=%.2f "
+					"base=%ux%u actual=%ux%u fallback=%d\n",
+					scaleValid, scale.requestedPercent,
+					scale.selectedPresetPercent, scale.effectivePercent,
+					scale.recommendedWidth, scale.recommendedHeight,
+					scale.actualWidth, scale.actualHeight,
+					scale.fallbackReason);
+				fprintf(traceFile,
+					"# temporal valid=%d mode=%u scene=%ux%u output=%ux%u\n",
+					temporalValid, temporalMode, sceneWidth, sceneHeight,
+					outputWidth, outputHeight);
+				fprintf(traceFile,
+					"frame,time_ns,theater_before,theater_after,theater_submitted,"
+					"game_state,game_not_loaded,menu_active,want_restart,want_load,"
+					"playing_intro,cutscene_processing,cutscene_running,widescreen,"
+					"player_present,screen,colour_mode,cpu_setup_ms,cpu_begin_ms,"
+					"cpu_step_ms,cpu_end_ms,cpu_total_ms\n");
+			}
+		}
+		if(traceFile != nullptr){
+			fprintf(traceFile,
+				"%llu,%lld,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,"
+				"%.3f,%.3f,%.3f,%.3f,%.3f\n",
+				(unsigned long long)current.frame,
+				(long long)xrvk::getPredictedDisplayTimeNs(),
+				current.theaterBefore, current.theaterAfter,
+				theaterSubmitted, current.gameState,
+				current.gameNotLoaded, current.menuActive,
+				current.wantRestart, current.wantLoad,
+				current.playingIntro, current.cutsceneProcessing,
+				current.cutsceneRunning, current.widescreen,
+				current.playerPresent, current.currentScreen,
+				current.colourMode,
+				(double)(beginStartNs-frameStartNs)/1000000.0,
+				(double)(beginEndNs-beginStartNs)/1000000.0,
+				(double)(stepEndNs-beginEndNs)/1000000.0,
+				(double)(endFrameEndNs-stepEndNs)/1000000.0,
+				(double)(endFrameEndNs-frameStartNs)/1000000.0);
+			fflush(traceFile);
+		}
+	}
+
+	current.frame++;
+	gMenuTransitionTrace = current;
+}
+
 // Installed as the OpenXR layer's frame renderer once the game is up. Opens
 // librw's multiview render pass against the swapchain image the runtime just
 // handed over, steps the game inside it, and submits.
@@ -81,8 +276,10 @@ void
 renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
                 const float im2dWorld[16], float im2dDistance,
                 const float headPos[3], float headYaw,
-                const float headQuat[4], float eyeFovDeg)
+                const float headQuat[4], float eyeFovDeg,
+                const float eyePos[2][3], const float eyeQuat[2][4])
 {
+	const int64_t frameStartNs = monotonicNowNs();
 	androidgame::QuestProfilerBeginAppFrame();
 	xrvk::ControllerInput controllers;
 	xrvk::getInput(&controllers);
@@ -130,32 +327,6 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 		xrvk::setDebugOverlay(pixels, width, height);
 	}
 
-	// Frame cadence probe: the vehicle "pushes" forward instead of gliding,
-	// which smells like uneven frame pacing. Reports the achieved rate and
-	// the worst gap so the theory gets numbers.
-	{
-		static timespec last, windowStart;
-		static int frames;
-		static double worstMs;
-		timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-		if(last.tv_sec != 0){
-			const double ms = (now.tv_sec - last.tv_sec)*1000.0 +
-			                  (now.tv_nsec - last.tv_nsec)/1e6;
-			if(ms > worstMs) worstMs = ms;
-			if(++frames >= 360){
-				const double windowS =
-					(now.tv_sec - windowStart.tv_sec) +
-					(now.tv_nsec - windowStart.tv_nsec)/1e9;
-				__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
-					"[probe] cadence: %.1f fps, worst gap %.1f ms",
-					frames/windowS, worstMs);
-				frames = 0; worstMs = 0.0; windowStart = now;
-			}
-		}else
-			windowStart = now;
-		last = now;
-	}
-
 	const bool theaterBefore = androidgame::VrShouldUseTheaterMode();
 	xrvk::setTheaterMode(theaterBefore);
 	if(theaterBefore){
@@ -168,10 +339,13 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 		rw::vulkan::setIm2DTransform(
 			theaterIm2D, theaterDistance, origin);
 		rw::vulkan::setHeadPose(origin, 0.0f, identityQuat);
+		rw::vulkan::clearFirstPersonEyePoses();
 	}else{
 		rw::vulkan::setStereoViewProjection(viewProj[0], viewProj[1]);
+		rw::vulkan::setSgsrHorizontalFovDegrees(eyeFovDeg);
 		rw::vulkan::setIm2DTransform(im2dWorld, im2dDistance, headPos);
 		rw::vulkan::setHeadPose(headPos, headYaw, headQuat);
+		rw::vulkan::setFirstPersonEyePoses(eyePos, eyeQuat);
 	}
 	androidgame::SetEyeFovDeg(eyeFovDeg);
 	// Game time follows the display clock, not the wall clock; see
@@ -179,22 +353,25 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 	androidgame::SetFrameTimeNs(xrvk::getPredictedDisplayTimeNs());
 	platform::setCheckpoint("vk/beginFrame");
 	androidgame::QuestProfilerBeginVkBegin();
+	const int64_t beginStartNs = monotonicNowNs();
 	if(!rw::vulkan::beginFrame(image, view)){
 		androidgame::QuestProfilerCancelAppFrame();
 		return;
 	}
+	const int64_t beginEndNs = monotonicNowNs();
 	androidgame::QuestProfilerEndVkBegin();
 	platform::setCheckpoint("game/Step");
 	androidgame::QuestProfilerBeginStep();
 	androidgame::Step();
+	const int64_t stepEndNs = monotonicNowNs();
 	androidgame::QuestProfilerEndStep();
 
 	// Step owns both simulation and rendering, so a cutscene/menu transition
-	// can occur inside it. Keep a frame flat on either side of that boundary;
-	// the following frame will already have the correct mono matrices.
+	// can occur inside it. Submit this frame with the same mode and matrices it
+	// started with; switching the compositor layer to theaterAfter here used to
+	// present an immersive-rendered image as a flat quad for one frame.
 	const bool theaterAfter = androidgame::VrShouldUseTheaterMode();
-	const bool theaterFrame = theaterBefore || theaterAfter;
-	xrvk::setTheaterMode(theaterFrame);
+	const bool theaterFrame = theaterBefore;
 
 	// A cutscene can end inside Step.  That transition frame was prepared
 	// above with the theater identity head pose, so first-person gameplay may
@@ -217,24 +394,7 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 		CCutsceneMgr::IsCutsceneProcessing() ||
 		CCutsceneMgr::IsRunning() ||
 		TheCamera.m_WideScreenOn;
-	// A scene boundary can briefly render after the old world has been removed
-	// but before the next cutscene camera is ready. Mask that invalid frame
-	// instead of showing the clear-colour sky and half rebuilt geometry.
-	const bool worldTransitionFrame =
-		gGameState == GS_PLAYING_GAME &&
-		!FrontEndMenuManager.m_bGameNotLoaded &&
-		!FrontEndMenuManager.m_bMenuActive &&
-		!CCutsceneMgr::IsRunning() &&
-		!TheCamera.m_WideScreenOn &&
-		(CGame::playingIntro || CCutsceneMgr::IsCutsceneProcessing() ||
-		 FindPlayerPed() == nil);
-	const bool gameplayCutsceneBoundary =
-		gGameState == GS_PLAYING_GAME &&
-		!FrontEndMenuManager.m_bMenuActive &&
-		theaterBefore != theaterAfter;
-	const bool maskTransition =
-		worldTransitionFrame || gameplayCutsceneBoundary;
-	const uint32 colourMode = maskTransition ? 2u :
+	const uint32 colourMode =
 		(androidgame::VrViceCityColorEnabled() &&
 		 (!theaterFrame || cutsceneFrame) &&
 		 TheCamera.m_BlurType != MOTION_BLUR_NONE ? 1u : 0u);
@@ -243,23 +403,26 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 		(uint32)TheCamera.m_BlurGreen,
 		(uint32)TheCamera.m_BlurBlue,
 		1.0f);
-	rw::vulkan::setFxaaEnabled(androidgame::VrFxaaEnabled());
+	rw::vulkan::setSpatialAaMode((RwUInt32)androidgame::VrSpatialAaMode());
 	static uint32 lastColourMode = ~0u;
 	if(colourMode != lastColourMode){
 		__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
-			"Vice City colour filter %s (type=%d rgb=%d,%d,%d)",
-			colourMode == 2 ? "TRANSITION MASK" :
-				(colourMode ? "ON" : "OFF"), TheCamera.m_BlurType,
+			"Vice City postfx %s (type=%d rgb=%d,%d,%d)",
+			colourMode == 2u ? "STARTUP BLACK" :
+				(colourMode == 1u ? "COLOUR ON" : "COLOUR OFF"),
+			TheCamera.m_BlurType,
 			TheCamera.m_BlurRed, TheCamera.m_BlurGreen,
 			TheCamera.m_BlurBlue);
 		lastColourMode = colourMode;
 	}
-
 	platform::setCheckpoint("vk/endFrame");
 	androidgame::QuestProfilerBeginVkEnd();
 	rw::vulkan::endFrame();
+	const int64_t endFrameEndNs = monotonicNowNs();
 	androidgame::QuestProfilerEndVkEnd();
 	androidgame::QuestProfilerEndAppFrame();
+	traceMenuTransition(theaterBefore, theaterAfter, theaterFrame, colourMode,
+		frameStartNs, beginStartNs, beginEndNs, stepEndNs, endFrameEndNs);
 	platform::setCheckpoint("frame/done");
 }
 #endif
@@ -353,13 +516,29 @@ gameThreadMain(android_app *app, AppState *state)
 			context.queueFamilyIndex = graphics.queueFamilyIndex;
 			context.width = graphics.width;
 			context.height = graphics.height;
+			context.renderScaleEffectivePercent =
+				graphics.renderScaleEffectivePercent;
 			context.viewCount = graphics.viewCount;
 			context.colourFormat = graphics.colourFormat;
 
-			if(!androidgame::Initialise(context)){
+			bool renderTargetStartupFailure = false;
+			if(!androidgame::Initialise(
+			     context, &renderTargetStartupFailure)){
+				if(renderTargetStartupFailure)
+					autoResetRenderScaleAfterGameInitialiseFailure();
 				LOGE("game initialisation failed");
 				break;
 			}
+			// Finish the expensive one-time game/frontend setup before an
+			// OpenXR frame can be begun.  Running this from Step held the first
+			// submitted frame open for hundreds of milliseconds and produced a
+			// repeatable compositor/reprojection flash in the main menu.
+			if(!androidgame::PrepareFrontendBeforeFrames()){
+				LOGE("pre-frame frontend preparation failed");
+				androidgame::Shutdown();
+				break;
+			}
+			xrvk::confirmRenderScaleRendererReady();
 			xrvk::setFrameRenderer(renderGameFrame);
 			gameStarted = true;
 		}

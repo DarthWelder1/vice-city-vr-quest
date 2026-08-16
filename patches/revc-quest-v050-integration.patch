@@ -1,0 +1,3203 @@
+diff --git a/src/control/CarCtrl.cpp b/src/control/CarCtrl.cpp
+index f8685c0..f352c5f 100644
+--- a/src/control/CarCtrl.cpp
++++ b/src/control/CarCtrl.cpp
+@@ -37,6 +37,18 @@
+ #include "Zones.h"
+ #include "Pickups.h"
+ 
++#ifdef __ANDROID__
++#include <time.h>
++#endif
++
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#define QUEST_VEHICLE_TRAFFIC_JOBS
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#endif
++
+ #define DISTANCE_TO_SPAWN_ROADBLOCK_PEDS (51.0f)
+ #define DISTANCE_TO_SCAN_FOR_DANGER (14.0f)
+ #define DISTANCE_TO_SCAN_FOR_PED_DANGER (11.0f)
+@@ -77,6 +89,22 @@
+ #define DISTANCE_BETWEEN_CAR_AND_DEAD_PED (6.0f)
+ #define PROBABILITY_OF_PASSENGER_IN_VEHICLE (0.125f)
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++static double
++VrTrafficClockMilliseconds(void)
++{
++#ifdef __ANDROID__
++	timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (double)now.tv_sec*1000.0 +
++		(double)now.tv_nsec/1000000.0;
++#else
++	return (double)CTimer::GetCurrentTimeInCycles() /
++		(double)Max((uint32)1, CTimer::GetCyclesPerMillisecond());
++#endif
++}
++#endif
++
+ #define ONSCREEN_DESPAWN_RANGE (120.0f)
+ #define MINIMAL_DISTANCE_TO_SPAWN_ONSCREEN (100.0f)
+ #define REQUEST_ONSCREEN_DISTANCE ((ONSCREEN_DESPAWN_RANGE + MINIMAL_DISTANCE_TO_SPAWN_ONSCREEN) / 2)
+@@ -123,7 +151,9 @@ enum eVrSpawnTrace {
+ 	VR_SPAWN_ABORT_APPROACH,
+ 	VR_SPAWN_ABORT_COPS_BLOCKED,
+ 	VR_SPAWN_OK,
+-	VR_SPAWN_ABORT_CELL_SEEN
++	VR_SPAWN_ABORT_CELL_SEEN,
++	VR_SPAWN_ABORT_POOL_RESERVE,
++	VR_SPAWN_ABORT_DEMAND
+ };
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ #define VR_SPAWN_TRACE(reason) (++CCarCtrl::VrSpawnTrace[reason])
+@@ -141,7 +171,1217 @@ float CCarCtrl::VrLocalDesired;
+ float CCarCtrl::VrLocalServed;
+ // Dev diagnostics: why spawn attempts die, indexed by eVrSpawnTrace.
+ int32 CCarCtrl::VrSpawnTrace[16];
+-static CVehicle* aVrStillnessVehicle[NUMVEHICLES];
++int32 CCarCtrl::NumVrActiveProxies;
++int32 CCarCtrl::NumVrPendingMaterializations;
++int32 CCarCtrl::NumVrSpawnAttempts;
++int32 CCarCtrl::NumVrSpawnSuccess;
++int32 CCarCtrl::NumVrPoolReserveBlocks;
++float CCarCtrl::VrDirectorLastUpdateMs;
++float CCarCtrl::VrDirectorMaxUpdateMs;
++#ifdef QUEST_VEHICLE_TRAFFIC_JOBS
++int32 CCarCtrl::NumVrTrafficJobHits;
++int32 CCarCtrl::NumVrTrafficJobMisses;
++int32 CCarCtrl::NumVrTrafficJobDispatches;
++int32 CCarCtrl::NumVrTrafficJobSkips;
++int32 CCarCtrl::NumVrTrafficCruiseEligible;
++int32 CCarCtrl::NumVrTrafficCruiseHits;
++int32 CCarCtrl::NumVrTrafficCruiseMisses;
++int32 CCarCtrl::NumVrTrafficCruiseStale;
++float CCarCtrl::VrTrafficJobLastMs;
++float CCarCtrl::VrTrafficJobMaxMs;
++float CCarCtrl::VrTrafficJobBuildMs;
++float CCarCtrl::VrTrafficJobBuildMaxMs;
++
++namespace {
++
++enum eVrTrafficJobBufferState {
++	VR_TRAFFIC_JOB_FREE = 0,
++	VR_TRAFFIC_JOB_BUILDING,
++	VR_TRAFFIC_JOB_QUEUED,
++	VR_TRAFFIC_JOB_RUNNING,
++	VR_TRAFFIC_JOB_READY
++};
++
++enum {
++	VR_TRAFFIC_JOB_BUFFER_COUNT = 2,
++	VR_TRAFFIC_GRID_BUCKETS = 256
++};
++
++static const float VR_TRAFFIC_GRID_CELL_SIZE = 16.0f;
++
++// The worker never receives a CEntity pointer. Every field below is copied on
++// the game thread before CWorld starts mutating entities for this frame.
++struct SVrTrafficVehicleSnapshot {
++	int32 handle;
++	int16 poolSlot;
++	int16 modelIndex;
++	int32 gridNext;
++	int32 cellX;
++	int32 cellY;
++	uint32 stateToken;
++	uint32 pedStateToken;
++	uint32 cruiseStateToken;
++	float positionX;
++	float positionY;
++	float positionZ;
++	float boundX;
++	float boundY;
++	float boundZ;
++	float forwardX;
++	float forwardY;
++	float forwardZ;
++	float rightX;
++	float rightY;
++	float rightZ;
++	float moveSpeedX;
++	float moveSpeedY;
++	float moveSpeedZ;
++	float width;
++	float frontLength;
++	float backLength;
++	float cruiseSpeed;
++	float cruiseCurrentLinkX;
++	float cruiseCurrentLinkY;
++	float cruiseCurrentForwardX;
++	float cruiseCurrentForwardY;
++	float cruiseNextLinkX;
++	float cruiseNextLinkY;
++	float cruiseNextForwardX;
++	float cruiseNextForwardY;
++	uint32 currentPathNodeInfo;
++	uint32 nextPathNodeInfo;
++	uint8 rawCruiseSpeed;
++	uint8 drivingStyle;
++	uint8 status;
++	uint8 carMission;
++	uint8 tempAction;
++	uint8 createdBy;
++	uint8 vehicleType;
++	bool usesCollision;
++	bool isPlayerVehicle;
++	bool isBike;
++	bool ignorePathfinding;
++	bool isLawEnforcer;
++	bool cruiseEligible;
++};
++
++struct SVrTrafficPedSnapshot {
++	int32 handle;
++	int16 poolSlot;
++	int16 gridNext;
++	int32 cellX;
++	int32 cellY;
++	uint32 stateToken;
++	float positionX;
++	float positionY;
++	float positionZ;
++	bool usesCollision;
++};
++
++// Only immutable geometry is produced off-thread. The game thread still
++// visits the original sector lists, writes scan codes and performs every ped
++// reaction/autopilot side effect in the original order.
++struct SVrTrafficPedGeometry {
++	float dotDirection;
++	float dotVelocity;
++	float distanceUntilHit;
++	float movementTowardsPedPerSecond;
++	float sidewaysDistance;
++	bool passesGeometry;
++};
++
++struct SVrTrafficCruiseSteering {
++	float steerAngle;
++	float speedAngleMultiplier;
++	float speedNodesMultiplier;
++	float currentForwardSpeed;
++	bool valid;
++};
++
++struct SVrTrafficJobResult {
++	int32 handle;
++	uint32 stateToken;
++	uint32 pedStateToken;
++	uint32 cruiseStateToken;
++	float maximumSpeed;
++	SVrTrafficCruiseSteering cruise;
++	bool valid;
++	bool cruiseEligible;
++	bool slowedDownBecauseOfCars;
++	bool requiresSynchronousFallback;
++	bool pedGeometryValid;
++};
++
++struct SVrTrafficJobBatch {
++	std::atomic<int32> state;
++	uint32 frame;
++	uint32 epoch;
++	int32 vehicleCount;
++	int32 pedCount;
++	int32 gridHeads[VR_TRAFFIC_GRID_BUCKETS];
++	int32 pedGridHeads[VR_TRAFFIC_GRID_BUCKETS];
++	int16 pedIndexBySlot[NUMPEDS];
++	SVrTrafficVehicleSnapshot vehicles[NUMVEHICLES];
++	SVrTrafficPedSnapshot peds[NUMPEDS];
++	SVrTrafficJobResult results[NUMVEHICLES];
++	SVrTrafficPedGeometry pedGeometry[NUMVEHICLES][NUMPEDS];
++	float workerMs;
++	bool statsReported;
++};
++
++static std::atomic<uint32> gVrTrafficJobEpoch(1);
++
++static uint32
++VrTrafficHashBits(uint32 hash, uint32 value)
++{
++	return (hash ^ value)*16777619u;
++}
++
++static uint32
++VrTrafficHashFloat(uint32 hash, float value)
++{
++	uint32 bits;
++	memcpy(&bits, &value, sizeof(bits));
++	return VrTrafficHashBits(hash, bits);
++}
++
++static int32
++VrTrafficGridCell(float value)
++{
++	return (int32)floorf(value/VR_TRAFFIC_GRID_CELL_SIZE);
++}
++
++static int32
++VrTrafficGridHash(int32 x, int32 y)
++{
++	const uint32 hash = (uint32)x*73856093u ^ (uint32)y*19349663u;
++	return (int32)(hash & (VR_TRAFFIC_GRID_BUCKETS-1));
++}
++
++// Capturing and validation are game-thread-only. The generation-bearing pool
++// handle prevents a reused slot from accepting a result for its old vehicle.
++static bool
++VrCaptureTrafficVehicle(CVehicle *vehicle, int32 poolSlot,
++	SVrTrafficVehicleSnapshot *snapshot)
++{
++	if(vehicle == nil || vehicle->m_entryInfoList.first == nil)
++		return false;
++	CColModel *colModel = vehicle->GetColModel();
++	if(colModel == nil)
++		return false;
++
++	CVehiclePool *pool = CPools::GetVehiclePool();
++	const CVector position = vehicle->GetPosition();
++	const CVector bound = vehicle->GetBoundCentre();
++	const CVector forward = vehicle->GetForward();
++	const CVector right = vehicle->GetRight();
++	const CVector moveSpeed = vehicle->GetMoveSpeed();
++
++	snapshot->handle = pool->GetIndex(vehicle);
++	snapshot->poolSlot = (int16)poolSlot;
++	snapshot->modelIndex = (int16)vehicle->GetModelIndex();
++	snapshot->gridNext = -1;
++	snapshot->positionX = position.x;
++	snapshot->positionY = position.y;
++	snapshot->positionZ = position.z;
++	snapshot->boundX = bound.x;
++	snapshot->boundY = bound.y;
++	snapshot->boundZ = bound.z;
++	// SlowCarDownForOtherCar normalises a temporary CVector2D, then continues
++	// with the original CVector. Preserve that observable raw XY behaviour.
++	snapshot->forwardX = forward.x;
++	snapshot->forwardY = forward.y;
++	snapshot->forwardZ = forward.z;
++	snapshot->rightX = right.x;
++	snapshot->rightY = right.y;
++	snapshot->rightZ = right.z;
++	snapshot->moveSpeedX = moveSpeed.x;
++	snapshot->moveSpeedY = moveSpeed.y;
++	snapshot->moveSpeedZ = moveSpeed.z;
++	snapshot->width = colModel->boundingBox.max.x;
++	snapshot->frontLength = colModel->boundingBox.max.y;
++	snapshot->backLength = -colModel->boundingBox.min.y;
++	snapshot->cruiseSpeed = vehicle->AutoPilot.GetCruiseSpeed();
++	snapshot->rawCruiseSpeed = vehicle->AutoPilot.m_nCruiseSpeed;
++	snapshot->drivingStyle = vehicle->AutoPilot.m_nDrivingStyle;
++	snapshot->status = vehicle->GetStatus();
++	snapshot->carMission = vehicle->AutoPilot.m_nCarMission;
++	snapshot->tempAction = vehicle->AutoPilot.m_nTempAction;
++	snapshot->createdBy = vehicle->VehicleCreatedBy;
++	snapshot->vehicleType = vehicle->m_vehType;
++	snapshot->usesCollision = vehicle->bUsesCollision;
++	snapshot->isPlayerVehicle = vehicle == FindPlayerVehicle();
++	snapshot->isBike = vehicle->m_vehType == VEHICLE_TYPE_BIKE;
++	snapshot->ignorePathfinding = vehicle->AutoPilot.m_bIgnorePathfinding;
++	snapshot->isLawEnforcer = vehicle->bIsLawEnforcer;
++	snapshot->currentPathNodeInfo = vehicle->AutoPilot.m_nCurrentPathNodeInfo;
++	snapshot->nextPathNodeInfo = vehicle->AutoPilot.m_nNextPathNodeInfo;
++	snapshot->cruiseCurrentLinkX = 0.0f;
++	snapshot->cruiseCurrentLinkY = 0.0f;
++	snapshot->cruiseCurrentForwardX = 0.0f;
++	snapshot->cruiseCurrentForwardY = 0.0f;
++	snapshot->cruiseNextLinkX = 0.0f;
++	snapshot->cruiseNextLinkY = 0.0f;
++	snapshot->cruiseNextForwardX = 0.0f;
++	snapshot->cruiseNextForwardY = 0.0f;
++	snapshot->cruiseEligible = false;
++
++	const bool supportedDrivingStyle =
++		vehicle->AutoPilot.m_nDrivingStyle == DRIVINGSTYLE_STOP_FOR_CARS ||
++		vehicle->AutoPilot.m_nDrivingStyle == DRIVINGSTYLE_SLOW_DOWN_FOR_CARS ||
++		vehicle->AutoPilot.m_nDrivingStyle == DRIVINGSTYLE_STOP_FOR_CARS_IGNORE_LIGHTS;
++	const int32 numLinks = Min(ThePaths.m_numCarPathLinks,
++		(int32)NUM_CARPATHLINKS);
++	if(vehicle->VehicleCreatedBy == RANDOM_VEHICLE &&
++	   vehicle->AutoPilot.m_nCarMission == MISSION_CRUISE &&
++	   vehicle->AutoPilot.m_nTempAction == TEMPACT_NONE &&
++	   vehicle->m_vehType == VEHICLE_TYPE_CAR &&
++	   !snapshot->isPlayerVehicle && !vehicle->bIsLawEnforcer &&
++	   !vehicle->AutoPilot.m_bIgnorePathfinding && supportedDrivingStyle &&
++	   numLinks > 0 &&
++	   vehicle->AutoPilot.m_nCurrentPathNodeInfo < (uint32)numLinks &&
++	   vehicle->AutoPilot.m_nNextPathNodeInfo < (uint32)numLinks){
++		CCarPathLink *currentLink = &ThePaths.m_carPathLinks[
++			vehicle->AutoPilot.m_nCurrentPathNodeInfo];
++		CCarPathLink *nextLink = &ThePaths.m_carPathLinks[
++			vehicle->AutoPilot.m_nNextPathNodeInfo];
++		snapshot->cruiseCurrentForwardX = currentLink->GetDirX() *
++			vehicle->AutoPilot.m_nCurrentDirection;
++		snapshot->cruiseCurrentForwardY = currentLink->GetDirY() *
++			vehicle->AutoPilot.m_nCurrentDirection;
++		snapshot->cruiseNextForwardX = nextLink->GetDirX() *
++			vehicle->AutoPilot.m_nNextDirection;
++		snapshot->cruiseNextForwardY = nextLink->GetDirY() *
++			vehicle->AutoPilot.m_nNextDirection;
++		const float currentLane =
++			(vehicle->AutoPilot.m_nCurrentLane+
++			 currentLink->OneWayLaneOffset())*LANE_WIDTH;
++		const float nextLane =
++			(vehicle->AutoPilot.m_nNextLane+
++			 nextLink->OneWayLaneOffset())*LANE_WIDTH;
++		snapshot->cruiseCurrentLinkX = currentLink->GetX()+
++			currentLane*snapshot->cruiseCurrentForwardY;
++		snapshot->cruiseCurrentLinkY = currentLink->GetY()-
++			currentLane*snapshot->cruiseCurrentForwardX;
++		snapshot->cruiseNextLinkX = nextLink->GetX()+
++			nextLane*snapshot->cruiseNextForwardY;
++		snapshot->cruiseNextLinkY = nextLink->GetY()-
++			nextLane*snapshot->cruiseNextForwardX;
++		snapshot->cruiseEligible = true;
++	}
++	snapshot->cellX = VrTrafficGridCell(bound.x);
++	snapshot->cellY = VrTrafficGridCell(bound.y);
++
++	uint32 token = 2166136261u;
++	token = VrTrafficHashBits(token, (uint32)snapshot->modelIndex);
++	token = VrTrafficHashFloat(token, snapshot->positionX);
++	token = VrTrafficHashFloat(token, snapshot->positionY);
++	token = VrTrafficHashFloat(token, snapshot->positionZ);
++	token = VrTrafficHashFloat(token, snapshot->boundX);
++	token = VrTrafficHashFloat(token, snapshot->boundY);
++	token = VrTrafficHashFloat(token, snapshot->boundZ);
++	token = VrTrafficHashFloat(token, snapshot->forwardX);
++	token = VrTrafficHashFloat(token, snapshot->forwardY);
++	token = VrTrafficHashFloat(token, snapshot->moveSpeedX);
++	token = VrTrafficHashFloat(token, snapshot->moveSpeedY);
++	token = VrTrafficHashFloat(token, snapshot->cruiseSpeed);
++	token = VrTrafficHashBits(token, (uint32)snapshot->drivingStyle);
++	token = VrTrafficHashBits(token, (uint32)snapshot->status);
++	token = VrTrafficHashBits(token, snapshot->usesCollision ? 1u : 0u);
++	token = VrTrafficHashBits(token, snapshot->isPlayerVehicle ? 1u : 0u);
++	snapshot->stateToken = token;
++
++	uint32 pedToken = token;
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->forwardZ);
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->rightX);
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->rightY);
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->rightZ);
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->moveSpeedZ);
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->width);
++	pedToken = VrTrafficHashFloat(pedToken, snapshot->frontLength);
++	pedToken = VrTrafficHashBits(pedToken, snapshot->isBike ? 1u : 0u);
++	snapshot->pedStateToken = pedToken;
++
++	uint32 cruiseToken = pedToken;
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)snapshot->rawCruiseSpeed);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)snapshot->carMission);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)snapshot->tempAction);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)snapshot->createdBy);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)snapshot->vehicleType);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		snapshot->ignorePathfinding ? 1u : 0u);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		snapshot->isLawEnforcer ? 1u : 0u);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		snapshot->cruiseEligible ? 1u : 0u);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		snapshot->currentPathNodeInfo);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		snapshot->nextPathNodeInfo);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)(uint8)vehicle->AutoPilot.m_nCurrentDirection);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)(uint8)vehicle->AutoPilot.m_nNextDirection);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)(uint8)vehicle->AutoPilot.m_nCurrentLane);
++	cruiseToken = VrTrafficHashBits(cruiseToken,
++		(uint32)(uint8)vehicle->AutoPilot.m_nNextLane);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseCurrentLinkX);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseCurrentLinkY);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseCurrentForwardX);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseCurrentForwardY);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseNextLinkX);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseNextLinkY);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseNextForwardX);
++	cruiseToken = VrTrafficHashFloat(cruiseToken,
++		snapshot->cruiseNextForwardY);
++	snapshot->cruiseStateToken = cruiseToken;
++	return true;
++}
++
++static uint32
++VrTrafficPedStateToken(const CVector &position, bool usesCollision)
++{
++	uint32 token = 2166136261u;
++	token = VrTrafficHashFloat(token, position.x);
++	token = VrTrafficHashFloat(token, position.y);
++	token = VrTrafficHashFloat(token, position.z);
++	token = VrTrafficHashBits(token, usesCollision ? 1u : 0u);
++	return token;
++}
++
++static bool
++VrCaptureTrafficPed(CPed *ped, int32 poolSlot,
++	SVrTrafficPedSnapshot *snapshot)
++{
++	if(ped == nil || ped->m_entryInfoList.first == nil)
++		return false;
++	CPedPool *pool = CPools::GetPedPool();
++	if(pool == nil)
++		return false;
++
++	const CVector position = ped->GetPosition();
++	snapshot->handle = pool->GetIndex(ped);
++	snapshot->poolSlot = (int16)poolSlot;
++	snapshot->gridNext = -1;
++	snapshot->positionX = position.x;
++	snapshot->positionY = position.y;
++	snapshot->positionZ = position.z;
++	snapshot->usesCollision = ped->bUsesCollision;
++	snapshot->cellX = VrTrafficGridCell(position.x);
++	snapshot->cellY = VrTrafficGridCell(position.y);
++	snapshot->stateToken = VrTrafficPedStateToken(position,
++		snapshot->usesCollision);
++	return true;
++}
++
++static float
++VrTrafficMovingRectProximity(const SVrTrafficVehicleSnapshot &vehicleA,
++	const SVrTrafficVehicleSnapshot &vehicleB, float projectionX,
++	float projectionY, float forwardAX, float forwardAY,
++	float forwardBX, float forwardBY)
++{
++	const float vecBToAX = vehicleA.positionX-vehicleB.positionX;
++	const float vecBToAY = vehicleA.positionY-vehicleB.positionY;
++	const float lenB = vehicleB.frontLength;
++	const float widthB = vehicleB.width;
++	const float backLenB = vehicleB.backLength;
++	const float lenA = vehicleA.frontLength;
++	const float widthA = vehicleA.width;
++	const float backLenA = vehicleA.backLength;
++	float proximity = 1.0f;
++	const float fullWidthB = 2.0f*widthB;
++	const float fullLenB = lenB+backLenB;
++
++	for(int32 i = 0; i < 4; i++){
++		float testedOffsetX;
++		float testedOffsetY;
++		switch(i){
++		case 0:
++			testedOffsetX = vecBToAX+widthA*forwardBY+lenA*forwardBX;
++			testedOffsetY = vecBToAY+lenA*forwardBY-widthA*forwardBX;
++			break;
++		case 1:
++			// Preserve the original expression exactly, including its unusual
++			// use of forwardBX for both terms.
++			testedOffsetX = vecBToAX-widthA*forwardBX+lenA*forwardBX;
++			testedOffsetY = vecBToAY+lenA*forwardBY+widthA*forwardBX;
++			break;
++		case 2:
++			testedOffsetX = vecBToAX+widthA*forwardBY-backLenA*forwardBX;
++			testedOffsetY = vecBToAY-backLenA*forwardBY-widthA*forwardBX;
++			break;
++		default:
++			testedOffsetX = vecBToAX-widthA*forwardBY-backLenA*forwardBX;
++			testedOffsetY = vecBToAY-backLenA*forwardBY+widthA*forwardBX;
++			break;
++		}
++
++		float baseWidthProximity = 0.0f;
++		float fullWidthProximity = 1.0f;
++		const float widthDistance = testedOffsetX*forwardAY-
++			testedOffsetY*forwardAX;
++		const float widthProjection = projectionX*forwardAY-
++			projectionY*forwardAX;
++		if(widthDistance > widthB){
++			if(widthProjection < 0.0f){
++				const float p = -(widthDistance-widthB)/widthProjection;
++				if(p < 1.0f){
++					baseWidthProximity = p;
++					fullWidthProximity = Min(1.0f, p-fullWidthB/widthProjection);
++				}else
++					baseWidthProximity = 1.0f;
++			}else{
++				baseWidthProximity = 1.0f;
++				fullWidthProximity = 1.0f;
++			}
++		}else if(widthDistance < -widthB){
++			if(widthProjection > 0.0f){
++				const float p = -(widthDistance+widthB)/widthProjection;
++				if(p < 1.0f){
++					baseWidthProximity = p;
++					fullWidthProximity = Min(1.0f, p+fullWidthB/widthProjection);
++				}else
++					baseWidthProximity = 1.0f;
++			}else{
++				baseWidthProximity = 1.0f;
++				fullWidthProximity = 1.0f;
++			}
++		}else if(widthProjection > 0.0f)
++			fullWidthProximity = (widthB-widthDistance)/widthProjection;
++		else if(widthProjection < 0.0f)
++			fullWidthProximity = -(widthB+widthDistance)/widthProjection;
++
++		float baseLengthProximity = 0.0f;
++		float fullLengthProximity = 1.0f;
++		const float lenDistance = testedOffsetX*forwardAX+
++			testedOffsetY*forwardAY;
++		const float lenProjection = projectionX*forwardAX+
++			projectionY*forwardAY;
++		if(lenDistance > lenB){
++			if(lenProjection < 0.0f){
++				const float p = -(lenDistance-lenB)/lenProjection;
++				if(p < 1.0f){
++					baseLengthProximity = p;
++					fullLengthProximity = Min(1.0f, p-fullLenB/lenProjection);
++				}else
++					baseLengthProximity = 1.0f;
++			}else{
++				baseLengthProximity = 1.0f;
++				fullLengthProximity = 1.0f;
++			}
++		}else if(lenDistance < -backLenB){
++			if(lenProjection > 0.0f){
++				const float p = -(lenDistance+backLenB)/lenProjection;
++				if(p < 1.0f){
++					baseLengthProximity = p;
++					fullLengthProximity = Min(1.0f, p+fullLenB/lenProjection);
++				}else
++					baseLengthProximity = 1.0f;
++			}else{
++				baseLengthProximity = 1.0f;
++				fullLengthProximity = 1.0f;
++			}
++		}else if(lenProjection > 0.0f)
++			fullLengthProximity = (lenB-lenDistance)/lenProjection;
++		else if(lenProjection < 0.0f)
++			fullLengthProximity = -(backLenB+lenDistance)/lenProjection;
++
++		const float baseProximity = Max(baseWidthProximity,
++			baseLengthProximity);
++		if(baseProximity < fullWidthProximity &&
++		   baseProximity < fullLengthProximity)
++			proximity = Min(proximity, baseProximity);
++	}
++	return proximity;
++}
++
++static void
++VrTrafficComputePair(const SVrTrafficVehicleSnapshot &subject,
++	const SVrTrafficVehicleSnapshot &other, SVrTrafficJobResult *result)
++{
++	if(subject.handle == other.handle || !other.usesCollision)
++		return;
++	if(other.boundX < subject.positionX-DISTANCE_TO_SCAN_FOR_DANGER ||
++	   other.boundX > subject.positionX+DISTANCE_TO_SCAN_FOR_DANGER ||
++	   other.boundY < subject.positionY-DISTANCE_TO_SCAN_FOR_DANGER ||
++	   other.boundY > subject.positionY+DISTANCE_TO_SCAN_FOR_DANGER ||
++	   Abs(other.boundZ-subject.positionZ) >= 5.0f)
++		return;
++
++	const float aheadX = other.positionX-subject.positionX;
++	const float aheadY = other.positionY-subject.positionY;
++	if(aheadX*subject.forwardX+aheadY*subject.forwardY < 0.0f)
++		return;
++
++	const float projectionX =
++		other.moveSpeedX*GAME_SPEED_TO_CARAI_SPEED-
++		subject.forwardX*subject.cruiseSpeed;
++	const float projectionY =
++		other.moveSpeedY*GAME_SPEED_TO_CARAI_SPEED-
++		subject.forwardY*subject.cruiseSpeed;
++	const float proximityA = VrTrafficMovingRectProximity(other, subject,
++		projectionX, projectionY, subject.forwardX, subject.forwardY,
++		other.forwardX, other.forwardY);
++	const float proximityB = VrTrafficMovingRectProximity(subject, other,
++		-projectionX, -projectionY, other.forwardX, other.forwardY,
++		subject.forwardX, subject.forwardY);
++	const float minProximity = Min(proximityA, proximityB);
++	if(minProximity >= 0.0f && minProximity < 1.5f){
++		const float scaled = Max(0.0f, (minProximity-0.2f)/1.3f);
++		result->maximumSpeed = Min(result->maximumSpeed,
++			scaled*subject.cruiseSpeed);
++		result->slowedDownBecauseOfCars = true;
++	}
++
++	// The original branch changes status, intrusive world membership and the
++	// autopilot. A worker result must never replace it.
++	// SlowCarDownForOtherCar overwrites minProximity with the remapped value
++	// before running the stuck-car branch. Preserve that observable order:
++	// remapped < 0.5 is equivalent to raw proximity < 0.85.
++	if(minProximity >= 0.0f && minProximity < 0.85f &&
++	   !other.isPlayerVehicle &&
++	   subject.forwardX*other.forwardX+
++		 subject.forwardY*other.forwardY < -0.5f &&
++	   subject.poolSlot < other.poolSlot)
++		// Be deliberately conservative: the main-thread branch also checks two
++		// 15-second timers, but those can cross their threshold after capture.
++		// Any geometrically eligible pair therefore keeps the original scan.
++		result->requiresSynchronousFallback = true;
++}
++
++static void
++VrTrafficComputePedPair(const SVrTrafficVehicleSnapshot &subject,
++	const SVrTrafficPedSnapshot &ped, SVrTrafficPedGeometry *geometry)
++{
++	if(!ped.usesCollision)
++		return;
++	if(ped.positionX < subject.positionX-DISTANCE_TO_SCAN_FOR_DANGER ||
++	   ped.positionX > subject.positionX+DISTANCE_TO_SCAN_FOR_DANGER ||
++	   ped.positionY < subject.positionY-DISTANCE_TO_SCAN_FOR_DANGER ||
++	   ped.positionY > subject.positionY+DISTANCE_TO_SCAN_FOR_DANGER ||
++	   ABS(ped.positionZ-subject.positionZ) >= 4.0f)
++		return;
++
++	const CVector vecToPed(ped.positionX-subject.positionX,
++		ped.positionY-subject.positionY,
++		ped.positionZ-subject.positionZ);
++	const CVector forward(subject.forwardX, subject.forwardY,
++		subject.forwardZ);
++	const CVector right(subject.rightX, subject.rightY, subject.rightZ);
++	const CVector moveSpeed(subject.moveSpeedX, subject.moveSpeedY,
++		subject.moveSpeedZ);
++	const float dotDirection = DotProduct(forward, vecToPed);
++	const float dotVelocity = DotProduct(forward, moveSpeed);
++	if(dotDirection <= subject.frontLength)
++		return;
++
++	const float distanceUntilHit = dotDirection-subject.frontLength;
++	const float movementTowardsPedPerSecond =
++		GAME_SPEED_TO_METERS_PER_SECOND*dotVelocity;
++	if(4.0f*movementTowardsPedPerSecond <= distanceUntilHit)
++		return;
++
++	const float sidewaysDistance = ABS(DotProduct(right, vecToPed));
++	float sideLength = subject.width;
++	if(subject.isBike)
++		sideLength *= 1.6f;
++	if(sideLength+0.5f < sidewaysDistance)
++		return;
++
++	geometry->distanceUntilHit = distanceUntilHit;
++	geometry->dotDirection = dotDirection;
++	geometry->dotVelocity = dotVelocity;
++	geometry->movementTowardsPedPerSecond =
++		movementTowardsPedPerSecond;
++	geometry->sidewaysDistance = sidewaysDistance;
++	geometry->passesGeometry = true;
++}
++
++// Pure path-following geometry for the common ambient cruise case. Link and
++// entity data are copied by the game thread; transitions, traffic queries,
++// lights, bridges and every mutation remain on the game thread.
++static void
++VrTrafficComputeCruiseSteering(const SVrTrafficVehicleSnapshot &subject,
++	SVrTrafficCruiseSteering *cruise)
++{
++	cruise->valid = false;
++	if(!subject.cruiseEligible)
++		return;
++
++	CVector2D forward(subject.forwardX, subject.forwardY);
++	forward.Normalise();
++	const CVector2D currentForward(subject.cruiseCurrentForwardX,
++		subject.cruiseCurrentForwardY);
++	const CVector2D nextForward(subject.cruiseNextForwardX,
++		subject.cruiseNextForwardY);
++	const CVector2D currentLink(subject.cruiseCurrentLinkX,
++		subject.cruiseCurrentLinkY);
++	const CVector2D nextLink(subject.cruiseNextLinkX,
++		subject.cruiseNextLinkY);
++	const CVector2D position(subject.positionX, subject.positionY);
++	const CVector2D distanceToNextNode = position-currentLink;
++	const float scalarDistanceToNextNode =
++		distanceToNextNode.Magnitude();
++	const CVector2D distanceBetweenNodes = nextLink-currentLink;
++	const float distanceBetweenNodesMagnitude =
++		distanceBetweenNodes.Magnitude();
++	const float dp = DotProduct2D(distanceBetweenNodes,
++		distanceToNextNode);
++
++	// Any state that would run PickNextNodeAccordingStrategy (or makes the
++	// original quotient degenerate) deliberately falls back to the untouched
++	// synchronous path.
++	if(scalarDistanceToNextNode < DISTANCE_TO_NEXT_NODE_TO_SELECT_NEW ||
++	   dp > 0.0f && scalarDistanceToNextNode <
++		DISTANCE_TO_FACING_NEXT_NODE_TO_SELECT_NEW ||
++	   scalarDistanceToNextNode <= 0.0f ||
++	   distanceBetweenNodesMagnitude <= 0.0f ||
++	   dp/(scalarDistanceToNextNode*distanceBetweenNodesMagnitude) > 0.7f ||
++	   subject.nextPathNodeInfo == subject.currentPathNodeInfo)
++		return;
++
++	CVector2D projectedPosition = currentLink-
++		currentForward*scalarDistanceToNextNode*0.4f;
++	if(scalarDistanceToNextNode >
++	   DISTANCE_TO_NEXT_NODE_TO_CONSIDER_SLOWING_DOWN)
++		projectedPosition = currentLink;
++	const CVector2D distanceToProjectedPosition =
++		projectedPosition-position;
++	const float angleCurrentLink = CGeneral::GetATanOfXY(
++		distanceToProjectedPosition.x, distanceToProjectedPosition.y);
++	const float angleForward = CGeneral::GetATanOfXY(forward.x,
++		forward.y);
++	float steerAngle = CCarCtrl::LimitRadianAngle(
++		angleCurrentLink-angleForward);
++	const float maxAngle = subject.modelIndex == MI_ENFORCER ?
++		0.7f : DEFAULT_MAX_STEER_ANGLE;
++	steerAngle = Min(maxAngle, Max(-maxAngle, steerAngle));
++	const float moveSpeedMagnitude = Sqrt(
++		subject.moveSpeedX*subject.moveSpeedX+
++		subject.moveSpeedY*subject.moveSpeedY+
++		subject.moveSpeedZ*subject.moveSpeedZ);
++	if(moveSpeedMagnitude > MIN_SPEED_TO_START_LIMITING_STEER)
++		steerAngle = Min(MAX_ANGLE_TO_STEER_AT_HIGH_SPEED,
++			Max(-MAX_ANGLE_TO_STEER_AT_HIGH_SPEED, steerAngle));
++
++	const CVector2D trajectory = currentLink-position;
++	const float speedAngleMultiplier = CCarCtrl::FindSpeedMultiplier(
++		CGeneral::GetATanOfXY(trajectory.x, trajectory.y)-angleForward,
++		MIN_ANGLE_FOR_SPEED_LIMITING, MAX_ANGLE_FOR_SPEED_LIMITING,
++		MIN_LOWERING_SPEED_COEFFICIENT);
++	const float tmpWideMultiplier = CCarCtrl::FindSpeedMultiplier(
++		CGeneral::GetATanOfXY(currentForward.x, currentForward.y)-
++		CGeneral::GetATanOfXY(nextForward.x, nextForward.y),
++		MIN_ANGLE_FOR_SPEED_LIMITING_BETWEEN_NODES,
++		MAX_ANGLE_FOR_SPEED_LIMITING,
++		MIN_LOWERING_SPEED_COEFFICIENT);
++	float speedNodesMultiplier;
++	if(scalarDistanceToNextNode >
++	   DISTANCE_TO_NEXT_NODE_TO_CONSIDER_SLOWING_DOWN ||
++	   subject.rawCruiseSpeed < 12)
++		speedNodesMultiplier = 1.0f;
++	else
++		speedNodesMultiplier = 1.0f-
++			(1.0f-scalarDistanceToNextNode/
++			 DISTANCE_TO_NEXT_NODE_TO_CONSIDER_SLOWING_DOWN)*
++			(1.0f-tmpWideMultiplier);
++
++	cruise->steerAngle = steerAngle;
++	cruise->speedAngleMultiplier = speedAngleMultiplier;
++	cruise->speedNodesMultiplier = speedNodesMultiplier;
++	cruise->currentForwardSpeed =
++		(subject.moveSpeedX*subject.forwardX+
++		 subject.moveSpeedY*subject.forwardY+
++		 subject.moveSpeedZ*subject.forwardZ)*GAME_SPEED_TO_CARAI_SPEED;
++	cruise->valid = true;
++}
++
++class CVrVehicleTrafficJobSystem {
++public:
++	CVrVehicleTrafficJobSystem() : m_stop(false), m_pending(nil),
++		m_workerBusy(false), m_lastDispatchedFrame(0xFFFFFFFFu),
++		m_lastDispatchedEpoch(0), m_pedLookupBatch(nil),
++		m_pedLookupVehicle(nil), m_pedLookupVehicleHandle(-1),
++		m_pedLookupVehicleSlot(-1),
++		m_pedLookupFrame(0xFFFFFFFFu), m_pedLookupEpoch(0)
++	{
++		for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++			m_batches[i].state.store(VR_TRAFFIC_JOB_FREE,
++				std::memory_order_relaxed);
++			m_batches[i].frame = 0;
++			m_batches[i].epoch = 0;
++			m_batches[i].statsReported = true;
++		}
++		m_worker = std::thread(&CVrVehicleTrafficJobSystem::WorkerMain, this);
++	}
++
++	~CVrVehicleTrafficJobSystem()
++	{
++		{
++			std::lock_guard<std::mutex> lock(m_mutex);
++			m_stop = true;
++		}
++		m_wake.notify_one();
++		if(m_worker.joinable())
++			m_worker.join();
++	}
++
++	void BeginFrame(uint32 frame)
++	{
++		CollectCompletedStats();
++		const uint32 epoch = gVrTrafficJobEpoch.load(
++			std::memory_order_relaxed);
++		// Lookup validation is scoped to one CWorld::Process pass, even when a
++		// frontend transition re-enters it without advancing the frame counter.
++		m_pedLookupBatch = nil;
++		m_pedLookupVehicle = nil;
++		m_pedLookupVehicleHandle = -1;
++		m_pedLookupVehicleSlot = -1;
++		m_pedLookupFrame = 0xFFFFFFFFu;
++		m_pedLookupEpoch = 0;
++		// Some frontend/cinema transitions can enter CWorld::Process more than
++		// once without advancing the game frame. Never publish two snapshots for
++		// the same logical frame.
++		if(m_lastDispatchedFrame == frame &&
++		   m_lastDispatchedEpoch == epoch)
++			return;
++		m_lastDispatchedFrame = frame;
++		m_lastDispatchedEpoch = epoch;
++		CCarCtrl::VrTrafficJobBuildMs = 0.0f;
++
++		// Results are useful only during this frame. Do not queue a second batch
++		// behind work that has already missed its same-frame consumption window.
++		if(m_workerBusy.load(std::memory_order_acquire)){
++			CCarCtrl::NumVrTrafficJobSkips++;
++			return;
++		}
++		SVrTrafficJobBatch *batch = AcquireBuildBuffer();
++		if(batch == nil){
++			CCarCtrl::NumVrTrafficJobSkips++;
++			return;
++		}
++
++		const double buildStartedMs = VrTrafficClockMilliseconds();
++		BuildSnapshot(batch, frame);
++		CCarCtrl::VrTrafficJobBuildMs =
++			(float)(VrTrafficClockMilliseconds()-buildStartedMs);
++		CCarCtrl::VrTrafficJobBuildMaxMs = Max(
++			CCarCtrl::VrTrafficJobBuildMaxMs,
++			CCarCtrl::VrTrafficJobBuildMs);
++		if(batch->vehicleCount == 0){
++			batch->state.store(VR_TRAFFIC_JOB_FREE,
++				std::memory_order_release);
++			CCarCtrl::NumVrTrafficJobSkips++;
++			return;
++		}
++
++		std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
++		if(!lock.owns_lock() || m_pending != nil ||
++		   m_workerBusy.load(std::memory_order_relaxed)){
++			batch->state.store(VR_TRAFFIC_JOB_FREE,
++				std::memory_order_release);
++			CCarCtrl::NumVrTrafficJobSkips++;
++			return;
++		}
++		m_pending = batch;
++		batch->state.store(VR_TRAFFIC_JOB_QUEUED,
++			std::memory_order_release);
++		CCarCtrl::NumVrTrafficJobDispatches++;
++		lock.unlock();
++		m_wake.notify_one();
++	}
++
++	bool TryGet(CVehicle *vehicle, float *maximumSpeed,
++		bool *slowedDownBecauseOfCars)
++	{
++		CVehiclePool *pool = CPools::GetVehiclePool();
++		if(pool == nil || vehicle == nil)
++			return false;
++		const int32 handle = pool->GetIndex(vehicle);
++		const int32 slot = pool->GetJustIndex(vehicle);
++		if(slot < 0 || slot >= NUMVEHICLES)
++			return false;
++		const uint32 frame = CTimer::GetFrameCounter();
++		const uint32 epoch = gVrTrafficJobEpoch.load(
++			std::memory_order_relaxed);
++
++		for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++			SVrTrafficJobBatch &batch = m_batches[i];
++			if(batch.state.load(std::memory_order_acquire) !=
++			   VR_TRAFFIC_JOB_READY || batch.frame != frame ||
++			   batch.epoch != epoch)
++				continue;
++			const SVrTrafficJobResult &result = batch.results[slot];
++			if(!result.valid || result.handle != handle ||
++			   result.requiresSynchronousFallback)
++				return false;
++
++			SVrTrafficVehicleSnapshot current;
++			if(!VrCaptureTrafficVehicle(vehicle, slot, &current) ||
++			   current.stateToken != result.stateToken)
++				return false;
++			*maximumSpeed = result.maximumSpeed;
++			*slowedDownBecauseOfCars =
++				result.slowedDownBecauseOfCars;
++			return true;
++		}
++		return false;
++	}
++
++	bool TryGetCruiseSteering(CVehicle *vehicle,
++		SVrTrafficCruiseSteering *cruise)
++	{
++		CVehiclePool *pool = CPools::GetVehiclePool();
++		if(pool == nil || vehicle == nil || cruise == nil)
++			return false;
++		const int32 handle = pool->GetIndex(vehicle);
++		const int32 slot = pool->GetJustIndex(vehicle);
++		if(slot < 0 || slot >= NUMVEHICLES)
++			return false;
++
++		SVrTrafficVehicleSnapshot current;
++		if(!VrCaptureTrafficVehicle(vehicle, slot, &current) ||
++		   !current.cruiseEligible)
++			return false;
++		CCarCtrl::NumVrTrafficCruiseEligible++;
++
++		const uint32 frame = CTimer::GetFrameCounter();
++		const uint32 epoch = gVrTrafficJobEpoch.load(
++			std::memory_order_relaxed);
++		for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++			SVrTrafficJobBatch &batch = m_batches[i];
++			if(batch.state.load(std::memory_order_acquire) !=
++			   VR_TRAFFIC_JOB_READY || batch.frame != frame ||
++			   batch.epoch != epoch)
++				continue;
++			const SVrTrafficJobResult &result = batch.results[slot];
++			if(!result.cruiseEligible || !result.cruise.valid){
++				CCarCtrl::NumVrTrafficCruiseMisses++;
++				return false;
++			}
++			if(result.handle != handle ||
++			   result.cruiseStateToken != current.cruiseStateToken){
++				CCarCtrl::NumVrTrafficCruiseStale++;
++				return false;
++			}
++			*cruise = result.cruise;
++			CCarCtrl::NumVrTrafficCruiseHits++;
++			return true;
++		}
++		CCarCtrl::NumVrTrafficCruiseMisses++;
++		return false;
++	}
++
++	bool TryGetPedGeometry(CVehicle *vehicle, CPed *ped,
++		const CVector &pedPosition, SVrTrafficPedGeometry *geometry)
++	{
++		CVehiclePool *vehiclePool = CPools::GetVehiclePool();
++		CPedPool *pedPool = CPools::GetPedPool();
++		if(vehiclePool == nil || pedPool == nil || vehicle == nil ||
++		   ped == nil || geometry == nil)
++			return false;
++
++		const uint32 frame = CTimer::GetFrameCounter();
++		const uint32 epoch = gVrTrafficJobEpoch.load(
++			std::memory_order_relaxed);
++		const int32 vehicleHandle = vehiclePool->GetIndex(vehicle);
++		if(m_pedLookupVehicle != vehicle ||
++		   m_pedLookupVehicleHandle != vehicleHandle ||
++		   m_pedLookupFrame != frame || m_pedLookupEpoch != epoch){
++			m_pedLookupBatch = nil;
++			m_pedLookupVehicle = vehicle;
++			m_pedLookupVehicleHandle = vehicleHandle;
++			m_pedLookupVehicleSlot = -1;
++			m_pedLookupFrame = frame;
++			m_pedLookupEpoch = epoch;
++
++			const int32 vehicleSlot = vehiclePool->GetJustIndex(vehicle);
++			if(vehicleSlot < 0 || vehicleSlot >= NUMVEHICLES)
++				return false;
++			for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++				SVrTrafficJobBatch &batch = m_batches[i];
++				if(batch.state.load(std::memory_order_acquire) !=
++				   VR_TRAFFIC_JOB_READY || batch.frame != frame ||
++				   batch.epoch != epoch)
++					continue;
++				const SVrTrafficJobResult &result =
++					batch.results[vehicleSlot];
++				if(!result.pedGeometryValid ||
++				   result.handle != vehicleHandle)
++					continue;
++
++				SVrTrafficVehicleSnapshot current;
++				if(!VrCaptureTrafficVehicle(vehicle, vehicleSlot,
++				   &current) ||
++				   current.pedStateToken != result.pedStateToken)
++					return false;
++				m_pedLookupBatch = &batch;
++				m_pedLookupVehicleSlot = vehicleSlot;
++				break;
++			}
++		}
++		if(m_pedLookupBatch == nil || m_pedLookupVehicleSlot < 0)
++			return false;
++
++		const int32 pedSlot = pedPool->GetJustIndex_NoFreeAssert(ped);
++		if(pedSlot < 0 || pedSlot >= NUMPEDS ||
++		   pedPool->GetSlot(pedSlot) != ped)
++			return false;
++		const int32 pedIndex =
++			m_pedLookupBatch->pedIndexBySlot[pedSlot];
++		if(pedIndex < 0 || pedIndex >= m_pedLookupBatch->pedCount)
++			return false;
++		const SVrTrafficPedSnapshot &snapshot =
++			m_pedLookupBatch->peds[pedIndex];
++		if(snapshot.poolSlot != pedSlot ||
++		   pedPool->GetAt(snapshot.handle) != ped ||
++		   snapshot.stateToken != VrTrafficPedStateToken(pedPosition,
++			ped->bUsesCollision))
++			return false;
++
++		*geometry = m_pedLookupBatch->pedGeometry
++			[m_pedLookupVehicleSlot][pedSlot];
++		return true;
++	}
++
++private:
++	SVrTrafficJobBatch *AcquireBuildBuffer()
++	{
++		for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++			int32 expected = VR_TRAFFIC_JOB_FREE;
++			if(m_batches[i].state.compare_exchange_strong(expected,
++			   VR_TRAFFIC_JOB_BUILDING, std::memory_order_acq_rel))
++				return &m_batches[i];
++		}
++		// Current-frame results are never reclaimed. At BeginFrame every READY
++		// buffer is necessarily from an older frame and can be recycled.
++		for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++			int32 expected = VR_TRAFFIC_JOB_READY;
++			if(m_batches[i].state.compare_exchange_strong(expected,
++			   VR_TRAFFIC_JOB_BUILDING, std::memory_order_acq_rel))
++				return &m_batches[i];
++		}
++		return nil;
++	}
++
++	void BuildSnapshot(SVrTrafficJobBatch *batch, uint32 frame)
++	{
++		batch->frame = frame;
++		batch->epoch = gVrTrafficJobEpoch.load(std::memory_order_relaxed);
++		batch->vehicleCount = 0;
++		batch->pedCount = 0;
++		batch->workerMs = 0.0f;
++		batch->statsReported = false;
++		for(int32 i = 0; i < VR_TRAFFIC_GRID_BUCKETS; i++){
++			batch->gridHeads[i] = -1;
++			batch->pedGridHeads[i] = -1;
++		}
++		for(int32 i = 0; i < NUMPEDS; i++)
++			batch->pedIndexBySlot[i] = -1;
++		for(int32 i = 0; i < NUMVEHICLES; i++){
++			batch->results[i].valid = false;
++			batch->results[i].pedGeometryValid = false;
++			batch->results[i].cruiseEligible = false;
++			batch->results[i].cruise.valid = false;
++		}
++
++		CVehiclePool *pool = CPools::GetVehiclePool();
++		if(pool == nil)
++			return;
++		for(int32 slot = 0;
++		    slot < pool->GetSize() && slot < NUMVEHICLES;
++		    slot++){
++			CVehicle *vehicle = pool->GetSlot(slot);
++			SVrTrafficVehicleSnapshot snapshot;
++			if(!VrCaptureTrafficVehicle(vehicle, slot, &snapshot))
++				continue;
++			const int32 index = batch->vehicleCount++;
++			batch->vehicles[index] = snapshot;
++			const int32 bucket = VrTrafficGridHash(snapshot.cellX,
++				snapshot.cellY);
++			batch->vehicles[index].gridNext = batch->gridHeads[bucket];
++			batch->gridHeads[bucket] = index;
++		}
++
++		CPedPool *pedPool = CPools::GetPedPool();
++		if(pedPool == nil)
++			return;
++		for(int32 slot = 0;
++		    slot < pedPool->GetSize() && slot < NUMPEDS;
++		    slot++){
++			CPed *ped = pedPool->GetSlot(slot);
++			SVrTrafficPedSnapshot snapshot;
++			if(!VrCaptureTrafficPed(ped, slot, &snapshot))
++				continue;
++			const int32 index = batch->pedCount++;
++			batch->peds[index] = snapshot;
++			batch->pedIndexBySlot[slot] = (int16)index;
++			const int32 bucket = VrTrafficGridHash(snapshot.cellX,
++				snapshot.cellY);
++			batch->peds[index].gridNext =
++				(int16)batch->pedGridHeads[bucket];
++			batch->pedGridHeads[bucket] = index;
++		}
++	}
++
++	void Compute(SVrTrafficJobBatch *batch)
++	{
++		const double startedMs = VrTrafficClockMilliseconds();
++		for(int32 i = 0; i < batch->vehicleCount; i++){
++			const SVrTrafficVehicleSnapshot &subject = batch->vehicles[i];
++			SVrTrafficJobResult &result = batch->results[subject.poolSlot];
++			result.handle = subject.handle;
++			result.stateToken = subject.stateToken;
++			result.pedStateToken = subject.pedStateToken;
++			result.cruiseStateToken = subject.cruiseStateToken;
++			result.valid = false;
++			result.pedGeometryValid = false;
++			result.cruiseEligible = subject.cruiseEligible;
++			result.cruise.valid = false;
++			VrTrafficComputeCruiseSteering(subject, &result.cruise);
++			memset(batch->pedGeometry[subject.poolSlot], 0,
++				sizeof(batch->pedGeometry[subject.poolSlot]));
++
++			const int32 pedCellX = VrTrafficGridCell(subject.positionX);
++			const int32 pedCellY = VrTrafficGridCell(subject.positionY);
++			for(int32 y = pedCellY-1; y <= pedCellY+1; y++){
++				for(int32 x = pedCellX-1; x <= pedCellX+1; x++){
++					const int32 bucket = VrTrafficGridHash(x, y);
++					for(int32 pedIndex = batch->pedGridHeads[bucket];
++					    pedIndex >= 0;
++					    pedIndex = batch->peds[pedIndex].gridNext){
++						const SVrTrafficPedSnapshot &ped =
++							batch->peds[pedIndex];
++						if(ped.cellX != x || ped.cellY != y)
++							continue;
++						VrTrafficComputePedPair(subject, ped,
++							&batch->pedGeometry[subject.poolSlot]
++								[ped.poolSlot]);
++					}
++				}
++			}
++			result.pedGeometryValid = true;
++
++			if(subject.drivingStyle == DRIVINGSTYLE_AVOID_CARS ||
++			   subject.drivingStyle == DRIVINGSTYLE_PLOUGH_THROUGH)
++				continue;
++
++			result.maximumSpeed = subject.cruiseSpeed;
++			result.valid = true;
++			result.slowedDownBecauseOfCars = false;
++			result.requiresSynchronousFallback = false;
++
++			const int32 queryCellX = VrTrafficGridCell(subject.positionX);
++			const int32 queryCellY = VrTrafficGridCell(subject.positionY);
++			for(int32 y = queryCellY-1; y <= queryCellY+1; y++){
++				for(int32 x = queryCellX-1; x <= queryCellX+1; x++){
++					const int32 bucket = VrTrafficGridHash(x, y);
++					for(int32 otherIndex = batch->gridHeads[bucket];
++					    otherIndex >= 0;
++					    otherIndex = batch->vehicles[otherIndex].gridNext){
++						const SVrTrafficVehicleSnapshot &other =
++							batch->vehicles[otherIndex];
++						if(other.cellX != x || other.cellY != y)
++							continue;
++						VrTrafficComputePair(subject, other, &result);
++					}
++				}
++			}
++		}
++		batch->workerMs = (float)(VrTrafficClockMilliseconds()-startedMs);
++	}
++
++	void CollectCompletedStats()
++	{
++		const uint32 epoch = gVrTrafficJobEpoch.load(
++			std::memory_order_relaxed);
++		for(int32 i = 0; i < VR_TRAFFIC_JOB_BUFFER_COUNT; i++){
++			SVrTrafficJobBatch &batch = m_batches[i];
++			if(batch.state.load(std::memory_order_acquire) !=
++			   VR_TRAFFIC_JOB_READY || batch.statsReported)
++				continue;
++			if(batch.epoch == epoch){
++				CCarCtrl::VrTrafficJobLastMs = batch.workerMs;
++				CCarCtrl::VrTrafficJobMaxMs = Max(
++					CCarCtrl::VrTrafficJobMaxMs, batch.workerMs);
++			}
++			batch.statsReported = true;
++		}
++	}
++
++	void WorkerMain()
++	{
++		for(;;){
++			SVrTrafficJobBatch *batch;
++			{
++				std::unique_lock<std::mutex> lock(m_mutex);
++				m_wake.wait(lock, [this] { return m_stop || m_pending != nil; });
++				if(m_stop)
++					return;
++				batch = m_pending;
++				m_pending = nil;
++				m_workerBusy.store(true, std::memory_order_release);
++				batch->state.store(VR_TRAFFIC_JOB_RUNNING,
++					std::memory_order_release);
++			}
++			Compute(batch);
++			batch->state.store(VR_TRAFFIC_JOB_READY,
++				std::memory_order_release);
++			m_workerBusy.store(false, std::memory_order_release);
++		}
++	}
++
++	SVrTrafficJobBatch m_batches[VR_TRAFFIC_JOB_BUFFER_COUNT];
++	std::thread m_worker;
++	std::mutex m_mutex;
++	std::condition_variable m_wake;
++	bool m_stop;
++	SVrTrafficJobBatch *m_pending;
++	std::atomic<bool> m_workerBusy;
++	uint32 m_lastDispatchedFrame;
++	uint32 m_lastDispatchedEpoch;
++	// Main-thread-only cache. It avoids re-hashing the subject vehicle for
++	// every ped while retaining generation/frame/epoch validation.
++	SVrTrafficJobBatch *m_pedLookupBatch;
++	CVehicle *m_pedLookupVehicle;
++	int32 m_pedLookupVehicleHandle;
++	int32 m_pedLookupVehicleSlot;
++	uint32 m_pedLookupFrame;
++	uint32 m_pedLookupEpoch;
++};
++
++static CVrVehicleTrafficJobSystem &
++VrVehicleTrafficJobs(void)
++{
++	static CVrVehicleTrafficJobSystem jobs;
++	return jobs;
++}
++
++} // namespace
++
++void
++CCarCtrl::BeginVrTrafficJobFrame(void)
++{
++	VrVehicleTrafficJobs().BeginFrame(CTimer::GetFrameCounter());
++}
++#endif
++// Pool entry addresses are stable across reuse. Store the full pool handle
++// (slot + generation id), not the pointer, so a new vehicle cannot inherit
++// the visibility/stall history of the previous occupant of the same slot.
++static int32 aVrVehicleHandle[NUMVEHICLES];
+ static uint32 aVrStillnessSince[NUMVEHICLES];
+ // Phase 2: local demand. Weight of each car path link inside the player's
+ // interest field, and per-vehicle route-progress tracking that separates a
+@@ -156,6 +1396,115 @@ static bool aVrStalledFlag[NUMVEHICLES];
+ // not suddenly grow a car the moment the player looks away.
+ static uint32 aVrVehicleLastSeen[NUMVEHICLES];
+ static uint32 aVrLinkLastSeen[NUM_CARPATHLINKS];
++// Phase 2 completion: per-cell occupancy for deficit-targeted spawning.
++// The director aims every other ambient spawn at the hungriest cell of the
++// interest field, so demanded-but-empty streets (a long bridge ahead, the
++// road the player is about to enter) actually receive their cars instead of
++// waiting for ring randomness to stumble onto them.
++static uint8 aVrLinkCarCount[NUM_CARPATHLINKS];
++static CVector VrDeficitCellPos(0.0f, 0.0f, 0.0f);
++static bool VrDeficitCellValid;
++
++// Phase 4: the traffic proxy tier. Distant ambient cars stop being CVehicle
++// objects at all: a proxy is pure data — model, colours, a node pair on the
++// road graph, progress and speed — advanced a few times a second, closing
++// the demand of the street it travels, costing neither pool slots nor
++// simulation. When one drifts close enough to matter it is materialized
++// back into a full vehicle through the ordinary spawn pipeline (which
++// enforces every visibility rule), and far unseen real cars are demoted
++// into proxies instead of being deleted outright.
++#define NUM_VR_TRAFFIC_PROXIES 24
++// Hysteresis: demote real cars beyond this range (only after 3s unseen)...
++#define VR_PROXY_DEMOTE_RANGE 220.0f
++// ...materialize proxies only with enough headroom for the road-coordinate
++// placement step. The director further clamps this against the current
++// player-relative retention shell, so a ghost can never become a real car
++// just beyond the range where real vehicles are immediately removed.
++#define VR_PROXY_MATERIALIZE_RANGE 210.0f
++// Hard cull for proxies that drifted out of relevance.
++#define VR_PROXY_CULL_RANGE 380.0f
++struct SVrTrafficProxy {
++	bool active;
++	int16 modelId;
++	uint8 colour1, colour2;
++	int16 prevNode, nextNode;
++	int16 linkId;
++	float progress;
++	float speedMps;
++	uint32 lastUpdate;
++};
++static SVrTrafficProxy aVrTrafficProxies[NUM_VR_TRAFFIC_PROXIES];
++static int32 VrProxyMaterializeIndex = -1;
++
++static void
++ResetVrTrafficDirectorState(void)
++{
++	memset(aVrVehicleHandle, 0xFF, sizeof(aVrVehicleHandle));
++	memset(aVrStillnessSince, 0, sizeof(aVrStillnessSince));
++	memset(aVrLinkWeight, 0, sizeof(aVrLinkWeight));
++	memset(aVrProgressPos, 0, sizeof(aVrProgressPos));
++	memset(aVrProgressTime, 0, sizeof(aVrProgressTime));
++	memset(aVrStalledFlag, 0, sizeof(aVrStalledFlag));
++	memset(aVrVehicleLastSeen, 0, sizeof(aVrVehicleLastSeen));
++	memset(aVrLinkLastSeen, 0, sizeof(aVrLinkLastSeen));
++	memset(aVrLinkCarCount, 0, sizeof(aVrLinkCarCount));
++	memset(aVrTrafficProxies, 0, sizeof(aVrTrafficProxies));
++	memset(CCarCtrl::VrSpawnTrace, 0, sizeof(CCarCtrl::VrSpawnTrace));
++	VrDeficitCellPos = CVector(0.0f, 0.0f, 0.0f);
++	VrDeficitCellValid = false;
++	VrProxyMaterializeIndex = -1;
++	CCarCtrl::NumVrScavengedCars = 0;
++	CCarCtrl::NumVrEffectiveAmbient = 0;
++	CCarCtrl::NumVrEffectivePursuit = 0;
++	CCarCtrl::NumVrDebris = 0;
++	CCarCtrl::NumVrStalled = 0;
++	CCarCtrl::VrLocalDesired = 0.0f;
++	CCarCtrl::VrLocalServed = 0.0f;
++	CCarCtrl::NumVrActiveProxies = 0;
++	CCarCtrl::NumVrPendingMaterializations = 0;
++	CCarCtrl::NumVrSpawnAttempts = 0;
++	CCarCtrl::NumVrSpawnSuccess = 0;
++	CCarCtrl::NumVrPoolReserveBlocks = 0;
++	CCarCtrl::VrDirectorLastUpdateMs = 0.0f;
++	CCarCtrl::VrDirectorMaxUpdateMs = 0.0f;
++#ifdef QUEST_VEHICLE_TRAFFIC_JOBS
++	// Running batches are immutable and may finish normally, but their epoch
++	// will no longer match after a new game/load/reinitialisation.
++	gVrTrafficJobEpoch.fetch_add(1, std::memory_order_relaxed);
++	CCarCtrl::NumVrTrafficJobHits = 0;
++	CCarCtrl::NumVrTrafficJobMisses = 0;
++	CCarCtrl::NumVrTrafficJobDispatches = 0;
++	CCarCtrl::NumVrTrafficJobSkips = 0;
++	CCarCtrl::NumVrTrafficCruiseEligible = 0;
++	CCarCtrl::NumVrTrafficCruiseHits = 0;
++	CCarCtrl::NumVrTrafficCruiseMisses = 0;
++	CCarCtrl::NumVrTrafficCruiseStale = 0;
++	CCarCtrl::VrTrafficJobLastMs = 0.0f;
++	CCarCtrl::VrTrafficJobMaxMs = 0.0f;
++	CCarCtrl::VrTrafficJobBuildMs = 0.0f;
++	CCarCtrl::VrTrafficJobBuildMaxMs = 0.0f;
++#endif
++}
++
++static CVector
++VrProxyPosition(const SVrTrafficProxy& proxy)
++{
++	const CVector from = ThePaths.m_pathNodes[proxy.prevNode].GetPosition();
++	const CVector to = ThePaths.m_pathNodes[proxy.nextNode].GetPosition();
++	return from + (to - from)*proxy.progress;
++}
++
++// Resolve the car path link between two connected nodes, mirroring the
++// lookup GenerateOneRandomCar performs; -1 when the pair is not connected.
++static int16
++VrFindLinkBetween(int16 fromNode, int16 toNode)
++{
++	const CPathNode& node = ThePaths.m_pathNodes[fromNode];
++	for (int16 i = 0; i < node.numLinks; i++)
++		if (ThePaths.ConnectedNode(i + node.firstLink) == toNode)
++			return ThePaths.m_carPathConnections[i + node.firstLink];
++	return -1;
++}
+ 
+ // VR traffic director, phase 1. The original accounting treated every
+ // vehicle as interchangeable load on one global budget, so parked scenery,
+@@ -191,6 +1540,37 @@ IsVrVehicleVisible(CVehicle* pVehicle)
+ 		pVehicle->GetPosition(), true, false, false, false, false, false);
+ }
+ 
++void
++CCarCtrl::MarkVrVehicleRendered(CVehicle *pVehicle)
++{
++	if (pVehicle == nil)
++		return;
++	CPool<CVehicle, CAutomobile> *pool = CPools::GetVehiclePool();
++	const int32 slot = pool->GetJustIndex_NoFreeAssert(pVehicle);
++	if (slot < 0 || slot >= Min(pool->GetSize(), (int32)NUMVEHICLES) ||
++		pool->GetSlot(slot) != pVehicle)
++		return;
++
++	// Do not let a reused pool slot inherit a render timestamp from the old
++	// car. UpdateVrTrafficDirector establishes the new generation's history.
++	if (aVrVehicleHandle[slot] == pool->GetIndex(pVehicle))
++		aVrVehicleLastSeen[slot] = CTimer::GetTimeInMilliseconds();
++}
++
++static bool
++WasVrVehicleRecentlySeen(CVehicle *pVehicle, uint32 graceMs)
++{
++	if (pVehicle == nil)
++		return false;
++	CPool<CVehicle, CAutomobile> *pool = CPools::GetVehiclePool();
++	const int32 slot = pool->GetJustIndex_NoFreeAssert(pVehicle);
++	if (slot < 0 || slot >= Min(pool->GetSize(), (int32)NUMVEHICLES) ||
++		pool->GetSlot(slot) != pVehicle ||
++		aVrVehicleHandle[slot] != pool->GetIndex(pVehicle))
++		return false;
++	return CTimer::GetTimeInMilliseconds() - aVrVehicleLastSeen[slot] < graceMs;
++}
++
+ static bool
+ IsVrVehicleUntouchable(CVehicle* pVehicle)
+ {
+@@ -208,6 +1588,9 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ {
+ 	if ((CTimer::GetFrameCounter() & 15) != 5)
+ 		return;
++	if (CCutsceneMgr::IsRunning())
++		return;
++	const double directorStartedMs = VrTrafficClockMilliseconds();
+ 	const uint32 now = CTimer::GetTimeInMilliseconds();
+ 
+ 	// ---- Phase 2: interest field over the road graph -------------------
+@@ -232,6 +1615,7 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ 		(int32)NUM_CARPATHLINKS);
+ 	const CVector directorCamPos = TheCamera.GetPosition();
+ 	const CVector directorCamFwd = TheCamera.GetForward();
++	memset(aVrLinkCarCount, 0, sizeof(aVrLinkCarCount));
+ 	for (int i = 0; i < numLinks; i++) {
+ 		aVrLinkWeight[i] = 0.0f;
+ 		CCarPathLink& link = ThePaths.m_carPathLinks[i];
+@@ -286,30 +1670,59 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ 		rawDesired += lanes*(35.0f/90.0f)*weight*spawnFactor;
+ 	}
+ 	CPlayerInfo* pDirectorPlayer = &CWorld::Players[CWorld::PlayerInFocus];
+-	const float zoneBudget = pDirectorPlayer->m_nTrafficMultiplier *
+-		CarDensityMultiplier * CIniFile::CarNumberMultiplier;
+-	VrLocalDesired = Min(rawDesired, zoneBudget*1.3f);
++	CZoneInfo directorZone;
++	CVector directorZonePosition = playerPosition;
++	CTheZones::GetZoneInfoForTimeOfDay(&directorZonePosition,
++		&directorZone);
++	// Do not depend on GenerateOneRandomCar having run recently. Under a
++	// streaming spike that call is deliberately throttled, and the old cached
++	// integer multiplier could otherwise leave the director using the previous
++	// zone (or zero at startup).
++	const float baseZoneBudget = pDirectorPlayer->m_fRoadDensity *
++		directorZone.carDensity * CarDensityMultiplier;
++	pDirectorPlayer->m_nTrafficMultiplier =
++		pDirectorPlayer->m_fRoadDensity * directorZone.carDensity;
++	const float userTrafficScale =
++		Max(0.0f, CIniFile::CarNumberMultiplier);
++	// 135% is the established Quest baseline. Scale geometric density relative
++	// to it so existing users keep the same default while higher settings have
++	// a real effect even where the authored zone ceiling was not binding.
++	const float geometricDensityScale = userTrafficScale/1.35f;
++	const int32 directorPoolReserve = Max((int32)12,
++		CPools::GetVehiclePool()->GetSize()*3/20);
++	const float physicalCapacity = Max(0,
++		CPools::GetVehiclePool()->GetSize()-directorPoolReserve) +
++		NUM_VR_TRAFFIC_PROXIES;
++	// Scale the actual geometric demand as well as the zone ceiling. Previously
++	// the slider only raised the ceiling, so any road whose raw demand already
++	// fit below both ceilings looked identical at 135% and 300%.
++	VrLocalDesired = Min(
++		Min(rawDesired*geometricDensityScale,
++			baseZoneBudget*userTrafficScale*1.3f),
++		physicalCapacity);
+ 
+ 	int32 effectiveAmbient = 0, effectivePursuit = 0, debris = 0;
+ 	int32 stalledCount = 0;
+ 	float servedLocal = 0.0f;
++	CVehicle* pDemotionVictim = nil;
+ 	CVehicle* pDebrisVictim = nil;
+ 	uint32 debrisVictimScore = 0;
+ 	const int poolSize = Min(CPools::GetVehiclePool()->GetSize(),
+ 		(int)NUMVEHICLES);
+ 	for (int i = 0; i < poolSize; i++) {
+ 		CVehicle* pVehicle = CPools::GetVehiclePool()->GetSlot(i);
+-		if (pVehicle != aVrStillnessVehicle[i]) {
++		const int32 vehicleHandle = pVehicle != nil ?
++			CPools::GetVehiclePool()->GetIndex(pVehicle) : -1;
++		if (vehicleHandle != aVrVehicleHandle[i]) {
+ 			// The slot changed occupants; a fresh stamp keeps a new car
+ 			// from inheriting its predecessor's records.
+-			aVrStillnessVehicle[i] = pVehicle;
++			aVrVehicleHandle[i] = vehicleHandle;
+ 			aVrStillnessSince[i] = now;
+ 			if (pVehicle != nil)
+ 				aVrProgressPos[i] = pVehicle->GetPosition();
+ 			aVrProgressTime[i] = now;
+ 			aVrStalledFlag[i] = false;
+ 			aVrVehicleLastSeen[i] = 0;
+-			continue;
+ 		}
+ 		if (pVehicle == nil)
+ 			continue;
+@@ -332,7 +1745,7 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ 		// carries bIsLawEnforcer too, and letting it close a pursuit-CAR
+ 		// slot starves the ground chase; boats and trains likewise
+ 		// neither serve street demand nor count as street debris.
+-		if (!pVehicle->IsCar())
++		if (!pVehicle->IsCar() && !pVehicle->IsBike())
+ 			continue;
+ 		const uint32 stillness = now - aVrStillnessSince[i];
+ 		const bool deadWeight =
+@@ -351,8 +1764,24 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ 				// about that street right now.
+ 				const uint32 link =
+ 					pVehicle->AutoPilot.m_nCurrentPathNodeInfo;
+-				if (link < (uint32)numLinks)
++				if (link < (uint32)numLinks) {
+ 					servedLocal += aVrLinkWeight[link];
++					if (aVrLinkCarCount[link] < 255)
++						aVrLinkCarCount[link]++;
++				}
++				// Phase 4: a healthy far unseen ambient car is a
++				// demotion candidate — it will keep existing as a
++				// proxy without holding a pool slot.
++				if (pVehicle->IsCar() && pDemotionVictim == nil &&
++				    pVehicle->GetStatus() == STATUS_SIMPLE &&
++				    pVehicle->pDriver != nil &&
++				    pVehicle->GetModelIndex() != MI_AMBULAN &&
++				    pVehicle->GetModelIndex() != MI_FIRETRUCK &&
++				    now - aVrVehicleLastSeen[i] >= 3000 &&
++				    (pVehicle->GetPosition() - playerPosition).
++					Magnitude2D() > VR_PROXY_DEMOTE_RANGE &&
++				    !IsVrVehicleUntouchable(pVehicle))
++					pDemotionVictim = pVehicle;
+ 			}
+ 			continue;
+ 		}
+@@ -373,11 +1802,177 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ 		pDebrisVictim = pVehicle;
+ 		debrisVictimScore = score;
+ 	}
++	// ---- Phase 4: the proxy tier ---------------------------------------
++	// Demote at most one far unseen car per pass into a free proxy slot.
++	if (pDemotionVictim != nil) {
++		for (int p = 0; p < NUM_VR_TRAFFIC_PROXIES; p++) {
++			if (aVrTrafficProxies[p].active)
++				continue;
++			const int16 fromNode =
++				(int16)pDemotionVictim->AutoPilot.m_nCurrentRouteNode;
++			const int16 toNode =
++				(int16)pDemotionVictim->AutoPilot.m_nNextRouteNode;
++			if (fromNode < 0 || toNode < 0 || fromNode == toNode ||
++			    fromNode >= ThePaths.m_numCarPathNodes ||
++			    toNode >= ThePaths.m_numCarPathNodes)
++				break;
++			SVrTrafficProxy& proxy = aVrTrafficProxies[p];
++			proxy.active = true;
++			proxy.modelId = (int16)pDemotionVictim->GetModelIndex();
++			proxy.colour1 = pDemotionVictim->m_currentColour1;
++			proxy.colour2 = pDemotionVictim->m_currentColour2;
++			proxy.prevNode = fromNode;
++			proxy.nextNode = toNode;
++			proxy.linkId = VrFindLinkBetween(fromNode, toNode);
++			// Recover the position on the segment geometrically; any
++			// autopilot semantic slip only shifts an invisible ghost.
++			{
++				const CVector from =
++					ThePaths.m_pathNodes[fromNode].GetPosition();
++				const CVector to =
++					ThePaths.m_pathNodes[toNode].GetPosition();
++				const CVector seg = to - from;
++				const float segLenSq = Max(seg.MagnitudeSqr(), 1.0f);
++				proxy.progress = Min(1.0f, Max(0.0f,
++					DotProduct(pDemotionVictim->GetPosition() - from,
++						seg)/segLenSq));
++			}
++			float speed = pDemotionVictim->m_vecMoveSpeed.
++				Magnitude()*50.0f;
++			if (speed < 4.0f) speed = 9.0f;
++			proxy.speedMps = Min(speed, 25.0f);
++			proxy.lastUpdate = now;
++			// This car was already included in the real-car census above.
++			// Remove that contribution before the proxy pass adds it back,
++			// otherwise a demotion double-serves its cell for one cycle.
++			if (effectiveAmbient > 0)
++				effectiveAmbient--;
++			const uint32 demotedLink =
++				pDemotionVictim->AutoPilot.m_nCurrentPathNodeInfo;
++			if (demotedLink < (uint32)numLinks) {
++				servedLocal -= aVrLinkWeight[demotedLink];
++				if (aVrLinkCarCount[demotedLink] > 0)
++					aVrLinkCarCount[demotedLink]--;
++			}
++			CWorld::Remove(pDemotionVictim);
++			delete pDemotionVictim;
++			break;
++		}
++	}
++	// Advance the ghosts along the road graph, let them close the demand
++	// of their streets, and offer the nearest ripe one for materialization.
++	VrProxyMaterializeIndex = -1;
++	const float realRetentionDistance = ONSCREEN_DESPAWN_RANGE *
++		TheCamera.GenerationDistMultiplier;
++	float bestProxyDistance = Min(VR_PROXY_MATERIALIZE_RANGE,
++		Max(40.0f, realRetentionDistance - 30.0f));
++	int32 activeProxyCount = 0;
++	for (int p = 0; p < NUM_VR_TRAFFIC_PROXIES; p++) {
++		SVrTrafficProxy& proxy = aVrTrafficProxies[p];
++		if (!proxy.active)
++			continue;
++		float dt = (now - proxy.lastUpdate)*0.001f;
++		proxy.lastUpdate = now;
++		if (dt < 0.0f || dt > 2.0f) dt = 0.25f;
++		{
++			const CVector from =
++				ThePaths.m_pathNodes[proxy.prevNode].GetPosition();
++			const CVector to =
++				ThePaths.m_pathNodes[proxy.nextNode].GetPosition();
++			proxy.progress += proxy.speedMps*dt /
++				Max((to - from).Magnitude(), 1.0f);
++		}
++		int turnGuard = 4;
++		while (proxy.progress >= 1.0f && turnGuard-- > 0) {
++			const CPathNode& junction =
++				ThePaths.m_pathNodes[proxy.nextNode];
++			int16 pick = -1;
++			int options = 0;
++			for (int16 l = 0; l < junction.numLinks; l++) {
++				const int16 cand = (int16)ThePaths.ConnectedNode(
++					l + junction.firstLink);
++				if (cand < 0 || cand >= ThePaths.m_numCarPathNodes)
++					continue;
++				if (cand == proxy.prevNode)
++					continue;
++				options++;
++				if ((int)(CGeneral::GetRandomNumber() %
++				          (uint32)options) == 0)
++					pick = cand;
++			}
++			if (pick < 0) {
++				// Dead end: the ghost simply dissolves.
++				proxy.active = false;
++				break;
++			}
++			proxy.prevNode = proxy.nextNode;
++			proxy.nextNode = pick;
++			proxy.progress = 0.0f;
++			proxy.linkId = VrFindLinkBetween(proxy.prevNode,
++				proxy.nextNode);
++		}
++		if (!proxy.active)
++			continue;
++		const CVector proxyPosition = VrProxyPosition(proxy);
++		const float proxyDistance =
++			(proxyPosition - playerPosition).Magnitude2D();
++		if (proxyDistance > VR_PROXY_CULL_RANGE) {
++			proxy.active = false;
++			continue;
++		}
++		activeProxyCount++;
++		if (proxy.linkId >= 0 && proxy.linkId < (int16)numLinks) {
++			servedLocal += aVrLinkWeight[proxy.linkId];
++			if (aVrLinkCarCount[proxy.linkId] < 255)
++				aVrLinkCarCount[proxy.linkId]++;
++		}
++		if (proxyDistance < bestProxyDistance) {
++			bestProxyDistance = proxyDistance;
++			VrProxyMaterializeIndex = p;
++		}
++	}
++	// Deficit targeting: find the hungriest cell of the interest field —
++	// high demand, high weight, nothing on it — for the spawner to aim at.
++	VrDeficitCellValid = false;
++	{
++		float bestDeficit = 0.4f;
++		for (int i = 0; i < numLinks; i++) {
++			if (aVrLinkWeight[i] <= 0.0f)
++				continue;
++			CCarPathLink& link = ThePaths.m_carPathLinks[i];
++			// Far cells remain in demand and can be served by proxies, but
++			// must not become anchors for a full CVehicle beyond the real
++			// retention shell. Leave placement headroom for path generation.
++			const CVector2D linkDelta = link.GetPosition() -
++				CVector2D(playerPosition.x, playerPosition.y);
++			if (linkDelta.Magnitude() > Max(40.0f,
++			    realRetentionDistance - 30.0f))
++				continue;
++			const int lanes = link.numLeftLanes + link.numRightLanes;
++			float spawnFactor =
++				ThePaths.m_pathNodes[link.pathNodeIndex].spawnRate/12.0f;
++			if (spawnFactor < 0.25f) spawnFactor = 0.25f;
++			if (spawnFactor > 1.0f) spawnFactor = 1.0f;
++			const float cellDeficit =
++				lanes*(35.0f/90.0f)*aVrLinkWeight[i]*spawnFactor*
++				geometricDensityScale -
++				(float)aVrLinkCarCount[i];
++			if (cellDeficit > bestDeficit) {
++				bestDeficit = cellDeficit;
++				VrDeficitCellPos = CVector(link.GetX(), link.GetY(),
++					ThePaths.m_pathNodes[link.pathNodeIndex].GetZ());
++				VrDeficitCellValid = true;
++			}
++		}
++	}
++
+ 	NumVrEffectiveAmbient = effectiveAmbient;
+ 	NumVrEffectivePursuit = effectivePursuit;
+ 	NumVrDebris = debris;
+ 	NumVrStalled = stalledCount;
+ 	VrLocalServed = servedLocal;
++	NumVrActiveProxies = activeProxyCount;
++	NumVrPendingMaterializations = VrProxyMaterializeIndex >= 0 ? 1 : 0;
+ 	// Debris has its own small budget: a battlefield may stay littered
+ 	// with wrecks for its look, but the moment the litter grows past it,
+ 	// the least important invisible piece is recycled.
+@@ -386,6 +1981,10 @@ CCarCtrl::UpdateVrTrafficDirector(void)
+ 		delete pDebrisVictim;
+ 		++NumVrScavengedCars;
+ 	}
++	VrDirectorLastUpdateMs =
++		(float)(VrTrafficClockMilliseconds() - directorStartedMs);
++	VrDirectorMaxUpdateMs = Max(VrDirectorMaxUpdateMs,
++		VrDirectorLastUpdateMs);
+ }
+ #endif
+ 
+@@ -396,17 +1995,24 @@ CCarCtrl::GenerateRandomCars()
+ 		CountDownToCarsAtStart = 2;
+ 		return;
+ 	}
++	// Do not wrap the director in the legacy NumRandomCars < 30 gate. The
++	// effective local census and the physical pool reserve now regulate
++	// ambient traffic, while pursuit and proxy materialization must remain
++	// eligible even when that overlapping legacy counter is high.
++	if (CountDownToCarsAtStart == 0)
++		GenerateOneRandomCar();
++	else if (--CountDownToCarsAtStart == 0) {
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-	UpdateVrTrafficDirector();
+-#endif
+-	if (NumRandomCars < 30){
+-		if (CountDownToCarsAtStart == 0)
++		// Immediate accounting in GenerateOneRandomCar closes demand after
++		// every success. Keep the cold-start attempt burst bounded as an
++		// additional guard against stale census data and frame spikes.
++		for (int i = 0; i < 4; i++)
+ 			GenerateOneRandomCar();
+-		else if (--CountDownToCarsAtStart == 0) {
+-			for (int i = 0; i < 100; i++)
+-				GenerateOneRandomCar();
+-			CTheCarGenerators::GenerateEvenIfPlayerIsCloseCounter = 20;
+-		}
++#else
++		for (int i = 0; i < 100; i++)
++			GenerateOneRandomCar();
++#endif
++		CTheCarGenerators::GenerateEvenIfPlayerIsCloseCounter = 20;
+ 	}
+ 	/* Approximately once per 4 seconds. */
+ 	if ((CTimer::GetTimeInMilliseconds() & 0xFFFFF000) != (CTimer::GetPreviousTimeInMilliseconds() & 0xFFFFF000))
+@@ -420,6 +2026,10 @@ CCarCtrl::GenerateOneRandomCar()
+ 	bool bTopDownCamera = false;
+ 	CPlayerInfo* pPlayer = &CWorld::Players[CWorld::PlayerInFocus];
+ 	CVector vecTargetPos = FindPlayerCentreOfWorld(CWorld::PlayerInFocus);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	const CVector vecPlayerPos = vecTargetPos;
++	++NumVrSpawnAttempts;
++#endif
+ 	CVector2D vecPlayerSpeed = FindPlayerSpeed();
+ 	CZoneInfo zone;
+ 	CTheZones::GetZoneInfoForTimeOfDay(&vecTargetPos, &zone);
+@@ -433,8 +2043,30 @@ CCarCtrl::GenerateOneRandomCar()
+ 	// vehicles close no demand at all).
+ 	const int32 poolReserve =
+ 		Max((int32)12, CPools::GetVehiclePool()->GetSize()*3/20);
+-	if (CPools::GetVehiclePool()->GetNoOfFreeSpaces() <= poolReserve)
++	if (CPools::GetVehiclePool()->GetNoOfFreeSpaces() <= poolReserve) {
++		++NumVrPoolReserveBlocks;
++		VR_SPAWN_TRACE(VR_SPAWN_ABORT_POOL_RESERVE);
++		return;
++	}
++	// A physical entity consumes one entry-info node for every world sector
++	// touched by its bounds.  A busy fight can therefore exhaust this pool well
++	// before the vehicle pool itself is full.  Do not let optional ambient
++	// traffic consume the last nodes needed by bullets, debris and missions.
++	const int32 entryInfoReserve = 256;
++	if (CPools::GetEntryInfoNodePool()->GetNoOfFreeSpaces() <= entryInfoReserve) {
++		++NumVrPoolReserveBlocks;
++		VR_SPAWN_TRACE(VR_SPAWN_ABORT_POOL_RESERVE);
++		return;
++	}
++	// A generated car immediately asks for one driver and may ask for three
++	// passengers.  Do not let optional traffic consume the ped slots reserved
++	// for combat and mission actors.
++	const int32 pedOccupantReserve = 24 + 4;
++	if (CPools::GetPedPool()->GetNoOfFreeSpaces() <= pedOccupantReserve) {
++		++NumVrPoolReserveBlocks;
++		VR_SPAWN_TRACE(VR_SPAWN_ABORT_POOL_RESERVE);
+ 		return;
++	}
+ #else
+ 	if (NumRandomCars >= pPlayer->m_nTrafficMultiplier * CarDensityMultiplier * CIniFile::CarNumberMultiplier)
+ 		return;
+@@ -443,6 +2075,8 @@ CCarCtrl::GenerateOneRandomCar()
+ #endif
+ 	int carClass;
+ 	int carModel;
++	bool proxySpawnBound = false;
++	bool deficitSpawnBound = false;
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ 	// A stalled or wrecked unit stops counting here immediately, so the
+ 	// pursuit stays at strength through any amount of carnage.
+@@ -466,24 +2100,52 @@ CCarCtrl::GenerateOneRandomCar()
+ 		carClass = COPS;
+ 		carModel = ChoosePoliceCarModel();
+ 	}else{
+-		carModel = ChooseModel(&zone, &carClass);
+-		if (carModel == -1 || (carClass == COPS && pWanted->GetWantedLevel() >= 1)) {
+-			/* All cop spawns with wanted level are handled by condition above. */
+-			/* In particular it means that cop cars never spawn if player has wanted level of 1. */
+-			VR_SPAWN_TRACE(VR_SPAWN_ABORT_NO_MODEL);
+-			return;
+-		}
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-		// Civilian demand is local (phase 2): cars on streets outside
+-		// the interest field neither create nor close it, so an empty
+-		// street ahead keeps the spawner working no matter how many
+-		// cars exist somewhere else.
+-		if (VrLocalDesired - VrLocalServed < 0.5f)
+-			return;
+-		// Runaway ceiling only; the local field is the real regulator.
+-		if (NumVrEffectiveAmbient >= 2.0f * pPlayer->m_nTrafficMultiplier *
+-		    CarDensityMultiplier * CIniFile::CarNumberMultiplier)
+-			return;
++		if (VrProxyMaterializeIndex >= 0 &&
++		    aVrTrafficProxies[VrProxyMaterializeIndex].active) {
++			// Phase 4: materialize the ripe ghost. It is traffic that
++			// already exists and already closes demand, so the local
++			// gates below do not apply to its conversion. Do not inherit
++			// the random model chooser's class: proxies contain only
++			// healthy civilian cars, never police or boats.
++			const int16 ghostModel =
++				aVrTrafficProxies[VrProxyMaterializeIndex].modelId;
++			if (!CStreaming::HasModelLoaded(ghostModel)) {
++				CStreaming::RequestModel(ghostModel,
++					STREAMFLAGS_DEPENDENCY);
++				VR_SPAWN_TRACE(VR_SPAWN_ABORT_NO_MODEL);
++				return;
++			}
++			proxySpawnBound = true;
++			carClass = NORMAL;
++			carModel = ghostModel;
++		} else {
++#endif
++			carModel = ChooseModel(&zone, &carClass);
++			if (carModel == -1 ||
++			    (carClass == COPS && pWanted->GetWantedLevel() >= 1)) {
++				/* All cop spawns with wanted level are handled above. */
++				VR_SPAWN_TRACE(VR_SPAWN_ABORT_NO_MODEL);
++				return;
++			}
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			// Civilian demand is local (phase 2): cars on streets
++			// outside the interest field neither create nor close it,
++			// so an empty street ahead keeps the spawner working no
++			// matter how many cars exist somewhere else.
++			if (VrLocalDesired - VrLocalServed < 0.5f) {
++				VR_SPAWN_TRACE(VR_SPAWN_ABORT_DEMAND);
++				return;
++			}
++			// Runaway ceiling; the local field is the real regulator.
++			const float currentZoneBudget = pPlayer->m_fRoadDensity *
++				zone.carDensity * CarDensityMultiplier *
++				CIniFile::CarNumberMultiplier;
++			if (NumVrEffectiveAmbient >= 2.0f*currentZoneBudget) {
++				VR_SPAWN_TRACE(VR_SPAWN_ABORT_DEMAND);
++				return;
++			}
++		}
+ #endif
+ 	}
+ 	float frontX, frontY;
+@@ -613,6 +2275,34 @@ CCarCtrl::GenerateOneRandomCar()
+ 		}
+ 	}
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	if (proxySpawnBound) {
++		// Phase 4: materialize exactly where the ghost drives. The
++		// epilogue's visibility rules still veto anything the player
++		// could actually see.
++		vecTargetPos = VrProxyPosition(
++			aVrTrafficProxies[VrProxyMaterializeIndex]);
++		frontX = 0.707f;
++		frontY = 0.707f;
++		angleLimit = -1.0f;
++		invertAngleLimitTest = true;
++		preferredDistance = 20.0f;
++		testForCollision = false;
++	} else if (carClass != COPS && VrDeficitCellValid &&
++	           (CTimer::GetFrameCounter() & 1)) {
++		// Phase 2 completion: every other ambient spawn aims at the
++		// hungriest cell of the interest field instead of the blind
++		// ring, so a demanded-but-empty street ahead (a bridge span,
++		// the avenue being entered) actually receives its traffic.
++		// The epilogue rules still keep every appearance unseen.
++		deficitSpawnBound = true;
++		vecTargetPos = VrDeficitCellPos;
++		frontX = 0.707f;
++		frontY = 0.707f;
++		angleLimit = -1.0f;
++		invertAngleLimitTest = true;
++		preferredDistance = 25.0f;
++		testForCollision = false;
++	}
+ 	// There is no safe "offscreen" side in VR. Generate every ambient car at
+ 	// the distant ring; otherwise looking sideways reveals cars being created.
+ 	// Two exceptions restore the original combat choreography:
+@@ -623,7 +2313,7 @@ CCarCtrl::GenerateOneRandomCar()
+ 	//    scene includes panicking civilian traffic all around, which the far
+ 	//    ring cannot deliver — cars turn away long before reaching the fight.
+ 	//    The commotion of the fight itself masks the close pop-in.
+-	if(!(pWanted->GetWantedLevel() >= 2 ||
++	else if(!(pWanted->GetWantedLevel() >= 2 ||
+ 	     (carClass == COPS && pWanted->GetWantedLevel() >= 1)))
+ 		preferredDistance = REQUEST_ONSCREEN_DISTANCE * TheCamera.GenerationDistMultiplier;
+ #endif
+@@ -948,9 +2638,12 @@ CCarCtrl::GenerateOneRandomCar()
+ 	// beyond fog — is acceptable at any range the retention keeps; a
+ 	// genuinely visible one must stay beyond the pop-in distance.
+ 	{
+-		const float spawnDistance =
+-			(vecTargetPos - pVehicle->GetPosition()).Magnitude2D();
+-		if (spawnDistance > ONSCREEN_DESPAWN_RANGE *
++		// vecTargetPos may be rebound to a deficit cell or proxy. Retention
++		// is always player-relative; measuring from the rebound target used
++		// to admit cars that were born outside the real retention shell.
++		const float playerSpawnDistance =
++			(vecPlayerPos - pVehicle->GetPosition()).Magnitude2D();
++		if (playerSpawnDistance > ONSCREEN_DESPAWN_RANGE *
+ 			TheCamera.GenerationDistMultiplier *
+ 			(pVehicle->bExtendedRange ? EXTENDED_RANGE_DESPAWN_MULTIPLIER : 1.0f)) {
+ 			VR_SPAWN_TRACE(VR_SPAWN_ABORT_TOO_FAR);
+@@ -958,7 +2651,7 @@ CCarCtrl::GenerateOneRandomCar()
+ 			return;
+ 		}
+ 		if (IsVrVehicleVisible(pVehicle) &&
+-			(spawnDistance < TheCamera.GenerationDistMultiplier *
++			(playerSpawnDistance < TheCamera.GenerationDistMultiplier *
+ 				MINIMAL_DISTANCE_TO_SPAWN_ONSCREEN ||
+ 			 pVehicle->GetModelIndex() == MI_MARQUIS)) {
+ 			VR_SPAWN_TRACE(VR_SPAWN_ABORT_IN_VIEW);
+@@ -970,7 +2663,7 @@ CCarCtrl::GenerateOneRandomCar()
+ 		// away for a moment and back would read as magic. Cells behind
+ 		// buildings never register as seen, so battle-time gateway
+ 		// spawns around corners stay unaffected.
+-		if (spawnDistance < ONSCREEN_DESPAWN_RANGE &&
++		if (playerSpawnDistance < ONSCREEN_DESPAWN_RANGE &&
+ 		    connectionId >= 0 && connectionId < (int16)NUM_CARPATHLINKS &&
+ 		    CTimer::GetTimeInMilliseconds() -
+ 			aVrLinkLastSeen[connectionId] < 3000) {
+@@ -1019,7 +2712,8 @@ CCarCtrl::GenerateOneRandomCar()
+ 		delete pVehicle;
+ 		return;
+ 	}
+-	if (speedDifferenceWithTarget.x * distanceToTarget.x +
++	if (!proxySpawnBound && !deficitSpawnBound &&
++		speedDifferenceWithTarget.x * distanceToTarget.x +
+ 		speedDifferenceWithTarget.y * distanceToTarget.y >= 0.0f){
+ 		VR_SPAWN_TRACE(VR_SPAWN_ABORT_APPROACH);
+ 		delete pVehicle;
+@@ -1028,6 +2722,44 @@ CCarCtrl::GenerateOneRandomCar()
+ 	pVehicleModel->AvoidSameVehicleColour(&pVehicle->m_currentColour1, &pVehicle->m_currentColour2);
+ 	CWorld::Add(pVehicle);
+ 	VR_SPAWN_TRACE(VR_SPAWN_OK);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	++NumVrSpawnSuccess;
++	// The director census runs only four times per second. Close its
++	// pending demand immediately after each success so a same-frame burst
++	// cannot repeatedly fill against stale served/ambient values. Bikes
++	// count as ambient service, but only cars participate in proxying.
++	if (pVehicle->IsCar() || pVehicle->IsBike()) {
++		if (pVehicle->bIsLawEnforcer) {
++			++NumVrEffectivePursuit;
++		} else if (pVehicle->VehicleCreatedBy == RANDOM_VEHICLE) {
++			++NumVrEffectiveAmbient;
++			if (!proxySpawnBound) {
++				const uint32 servedLink =
++					pVehicle->AutoPilot.m_nCurrentPathNodeInfo;
++				if (servedLink < (uint32)Min(ThePaths.m_numCarPathLinks,
++				    (int32)NUM_CARPATHLINKS)) {
++					VrLocalServed += aVrLinkWeight[servedLink];
++					if (aVrLinkCarCount[servedLink] < 255)
++						aVrLinkCarCount[servedLink]++;
++				}
++			}
++		}
++	}
++	if (proxySpawnBound && VrProxyMaterializeIndex >= 0) {
++		// The ghost became this car: keep its identity when the model
++		// survived streaming, then retire the proxy slot.
++		SVrTrafficProxy& ghost =
++			aVrTrafficProxies[VrProxyMaterializeIndex];
++		if (pVehicle->GetModelIndex() == ghost.modelId) {
++			pVehicle->m_currentColour1 = ghost.colour1;
++			pVehicle->m_currentColour2 = ghost.colour2;
++		}
++		ghost.active = false;
++		NumVrActiveProxies = Max(0, NumVrActiveProxies - 1);
++		NumVrPendingMaterializations = 0;
++		VrProxyMaterializeIndex = -1;
++	}
++#endif
+ 	if (carClass == COPS || carClass == COPS_BOAT)
+ 		CCarAI::AddPoliceCarOccupants(pVehicle);
+ 	else {
+@@ -1299,11 +3031,21 @@ CCarCtrl::AddToCarArray(int32 id, int32 vehclass)
+ void
+ CCarCtrl::RemoveDistantCars()
+ {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// This function is serviced even when the frame CPU budget suppresses
++	// GenerateRandomCars. Keep census, proxy motion/demotion and scavenging
++	// alive under overload; only creation remains budget-gated.
++	UpdateVrTrafficDirector();
++#endif
+ 	for (int i = CPools::GetVehiclePool()->GetSize()-1; i >= 0; i--) {
+ 		CVehicle* pVehicle = CPools::GetVehiclePool()->GetSlot(i);
+ 		if (!pVehicle)
+ 			continue;
+ 		PossiblyRemoveVehicle(pVehicle);
++		// PossiblyRemoveVehicle can delete the object and release this pool slot.
++		// Never dereference the stale pointer afterwards.
++		if (CPools::GetVehiclePool()->GetSlot(i) != pVehicle)
++			continue;
+ 		if (pVehicle->bCreateRoadBlockPeds){
+ 			if ((pVehicle->GetPosition() - FindPlayerCentreOfWorld(CWorld::PlayerInFocus)).Magnitude2D() < DISTANCE_TO_SPAWN_ROADBLOCK_PEDS) {
+ 				CRoadBlocks::GenerateRoadBlockCopsForCar(pVehicle, pVehicle->m_nRoadblockType);
+@@ -1343,14 +3085,17 @@ CCarCtrl::RemoveCarsIfThePoolGetsFull(void)
+ 			continue;
+ 		// Grace period via the visibility history: never removed while
+ 		// seen, nor within three seconds of last being seen.
+-		if (pVehicle == aVrStillnessVehicle[i] &&
++		const bool historyMatches =
++			CPools::GetVehiclePool()->GetIndex(pVehicle) ==
++			aVrVehicleHandle[i];
++		if (historyMatches &&
+ 		    recycleNow - aVrVehicleLastSeen[i] < 3000)
+ 			continue;
+ 		if (IsVrVehicleVisible(pVehicle))
+ 			continue;
+ 		const float distance =
+ 			(TheCamera.GetPosition() - pVehicle->GetPosition()).Magnitude();
+-		const float stillSeconds = pVehicle == aVrStillnessVehicle[i] ?
++		const float stillSeconds = historyMatches ?
+ 			(recycleNow - aVrStillnessSince[i])/1000.0f : 0.0f;
+ 		const bool deadWeight =
+ 			pVehicle->GetStatus() == STATUS_WRECKED ||
+@@ -1440,6 +3185,14 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
+ 		if (pVehicle->bExtendedRange)
+ 			threshold *= EXTENDED_RANGE_DESPAWN_MULTIPLIER;
+ 		if (distanceToPlayer > threshold && !CGarages::IsPointWithinHideOutGarage(pVehicle->GetPosition())){
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			// Render submission is authoritative. Never delete a car that either
++			// eye rendered now or that was rendered during the short turn-away
++			// grace, even if the legacy camera reports it offscreen.
++			if (IsVrVehicleVisible(pVehicle) ||
++				WasVrVehicleRecentlySeen(pVehicle, 3000))
++				return;
++#endif
+ 			if (pVehicle->GetIsOnScreen()){
+ 				pVehicle->bFadeOut = true;
+ 			}else{
+@@ -1457,7 +3210,9 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
+ 	// for the screen test: a stationary car quietly leaving the world beyond
+ 	// ~45m is not something a player tracks.
+ 	const bool stalledCarClearance =
+-		(pVehicle->GetPosition() - vecPlayerPos).Magnitude2D() > 45.0f;
++		(pVehicle->GetPosition() - vecPlayerPos).Magnitude2D() > 45.0f &&
++		!IsVrVehicleVisible(pVehicle) &&
++		!WasVrVehicleRecentlySeen(pVehicle, 5000);
+ #else
+ 	const bool stalledCarClearance = !pVehicle->GetIsOnScreen() &&
+ 		(pVehicle->GetPosition() - vecPlayerPos).Magnitude2D() > 22.0f;
+@@ -1479,7 +3234,12 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
+ 	if (pVehicle->GetStatus() != STATUS_WRECKED || pVehicle->m_nTimeOfDeath == 0)
+ 		return;
+ 	if (CTimer::GetTimeInMilliseconds() > pVehicle->m_nTimeOfDeath + 60000 &&
+-		!pVehicle->GetIsOnScreen()){
++		!pVehicle->GetIsOnScreen()
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		&& !IsVrVehicleVisible(pVehicle) &&
++		!WasVrVehicleRecentlySeen(pVehicle, 3000)
++#endif
++	){
+ 		if ((pVehicle->GetPosition() - vecPlayerPos).MagnitudeSqr() > SQR(7.5f)){
+ 			if (!CGarages::IsPointWithinHideOutGarage(pVehicle->GetPosition())){
+ 				CWorld::Remove(pVehicle);
+@@ -1586,14 +3346,31 @@ CCarCtrl::FindMaximumSpeedForThisCarInTraffic(CVehicle* pVehicle)
+ 	assert(ystart <= yend);
+ 
+ 	float maxSpeed = pVehicle->AutoPilot.GetCruiseSpeed();
++	bool trafficJobHit = false;
++#ifdef QUEST_VEHICLE_TRAFFIC_JOBS
++	bool slowedDownBecauseOfCars = false;
++	trafficJobHit = VrVehicleTrafficJobs().TryGet(pVehicle, &maxSpeed,
++		&slowedDownBecauseOfCars);
++	if(trafficJobHit){
++		CCarCtrl::NumVrTrafficJobHits++;
++		if(slowedDownBecauseOfCars)
++			pVehicle->AutoPilot.m_bSlowedDownBecauseOfCars = true;
++	}else
++		CCarCtrl::NumVrTrafficJobMisses++;
++#endif
+ 
+ 	CWorld::AdvanceCurrentScanCode();
+ 
+ 	for (int y = ystart; y <= yend; y++){
+ 		for (int x = xstart; x <= xend; x++){
+ 			CSector* s = CWorld::GetSector(x, y);
+-			SlowCarDownForCarsSectorList(s->m_lists[ENTITYLIST_VEHICLES], pVehicle, left, top, right, bottom, &maxSpeed, pVehicle->AutoPilot.GetCruiseSpeed());
+-			SlowCarDownForCarsSectorList(s->m_lists[ENTITYLIST_VEHICLES_OVERLAP], pVehicle, left, top, right, bottom, &maxSpeed, pVehicle->AutoPilot.GetCruiseSpeed());
++			// Ped reactions and the stuck-car recovery branch mutate live world
++			// state. On a job miss the original car scan is used unchanged; on a
++			// hit only the pure car/car speed minimum came from the snapshot.
++			if(!trafficJobHit){
++				SlowCarDownForCarsSectorList(s->m_lists[ENTITYLIST_VEHICLES], pVehicle, left, top, right, bottom, &maxSpeed, pVehicle->AutoPilot.GetCruiseSpeed());
++				SlowCarDownForCarsSectorList(s->m_lists[ENTITYLIST_VEHICLES_OVERLAP], pVehicle, left, top, right, bottom, &maxSpeed, pVehicle->AutoPilot.GetCruiseSpeed());
++			}
+ 			SlowCarDownForPedsSectorList(s->m_lists[ENTITYLIST_PEDS], pVehicle, left, top, right, bottom, &maxSpeed, pVehicle->AutoPilot.GetCruiseSpeed());
+ 			SlowCarDownForPedsSectorList(s->m_lists[ENTITYLIST_PEDS_OVERLAP], pVehicle, left, top, right, bottom, &maxSpeed, pVehicle->AutoPilot.GetCruiseSpeed());
+ 		}
+@@ -1674,23 +3451,56 @@ void CCarCtrl::SlowCarDownForPedsSectorList(CPtrList& lst, CVehicle* pVehicle, f
+ 			continue;
+ 		if (ABS(vecPedPos.z - pVehicle->GetPosition().z) >= 4.0f)
+ 			continue;
+-		CVector vecToPed = vecPedPos - pVehicle->GetPosition();
+-		float dotDirection = DotProduct(pVehicle->GetForward(), vecToPed);
+-		float dotVelocity = DotProduct(pVehicle->GetForward(), pVehicle->GetMoveSpeed());
+-		if (dotDirection <= frontOffset) /* If already run him over, don't care */
+-			continue;
+-		float distanceUntilHit = dotDirection - frontOffset;
+-		float movementTowardsPedPerSecond = GAME_SPEED_TO_METERS_PER_SECOND * dotVelocity;
+-		if (4 * movementTowardsPedPerSecond <= distanceUntilHit)
+-			/* If car isn't projected to hit a ped in 4 seconds, don't care */
+-			continue;
+-		float sidewaysDistance = ABS(DotProduct(pVehicle->GetRight(), vecToPed));
+-		float sideLength = pVehicle->GetModelInfo()->GetColModel()->boundingBox.max.x;
+-		if (pVehicle->m_vehType == VEHICLE_TYPE_BIKE)
+-			sideLength *= 1.6f;
+-		if (sideLength + 0.5f < sidewaysDistance)
+-			/* If car is far enough taking side into account, don't care */
+-			continue;
++
++		float dotDirection;
++		float dotVelocity;
++		float distanceUntilHit;
++		float movementTowardsPedPerSecond;
++		float sidewaysDistance;
++		float sideLength;
++#ifdef QUEST_VEHICLE_TRAFFIC_JOBS
++		SVrTrafficPedGeometry cachedGeometry;
++		if(VrVehicleTrafficJobs().TryGetPedGeometry(pVehicle, pPed,
++		   vecPedPos, &cachedGeometry)){
++			if(!cachedGeometry.passesGeometry)
++				continue;
++			dotDirection = cachedGeometry.dotDirection;
++			dotVelocity = cachedGeometry.dotVelocity;
++			distanceUntilHit = cachedGeometry.distanceUntilHit;
++			movementTowardsPedPerSecond =
++				cachedGeometry.movementTowardsPedPerSecond;
++			sidewaysDistance = cachedGeometry.sidewaysDistance;
++			sideLength = pVehicle->GetModelInfo()->GetColModel()->
++				boundingBox.max.x;
++			if(pVehicle->m_vehType == VEHICLE_TYPE_BIKE)
++				sideLength *= 1.6f;
++		}else
++#endif
++		{
++			// A late worker result, a changed entity or a reused pool slot takes
++			// the exact original synchronous path for this pair.
++			CVector vecToPed = vecPedPos - pVehicle->GetPosition();
++			dotDirection = DotProduct(pVehicle->GetForward(), vecToPed);
++			dotVelocity = DotProduct(pVehicle->GetForward(),
++				pVehicle->GetMoveSpeed());
++			if (dotDirection <= frontOffset) /* If already run him over, don't care */
++				continue;
++			distanceUntilHit = dotDirection - frontOffset;
++			movementTowardsPedPerSecond =
++				GAME_SPEED_TO_METERS_PER_SECOND * dotVelocity;
++			if (4 * movementTowardsPedPerSecond <= distanceUntilHit)
++				/* If car isn't projected to hit a ped in 4 seconds, don't care */
++				continue;
++			sidewaysDistance = ABS(DotProduct(pVehicle->GetRight(),
++				vecToPed));
++			sideLength = pVehicle->GetModelInfo()->GetColModel()->
++				boundingBox.max.x;
++			if (pVehicle->m_vehType == VEHICLE_TYPE_BIKE)
++				sideLength *= 1.6f;
++			if (sideLength + 0.5f < sidewaysDistance)
++				/* If car is far enough taking side into account, don't care */
++				continue;
++		}
+ 		if (pPed->IsPed()){ /* ...how can it not be? */
+ 			if (pPed->GetPedState() != PED_STEP_AWAY && pPed->GetPedState() != PED_DIVE_AWAY){
+ 				if (distanceUntilHit < movementTowardsPedPerSecond){
+@@ -2671,6 +4481,9 @@ void CCarCtrl::Init(void)
+ 		NumRequestsOfCarRating[i] = 0;
+ 		TotalNumOfCarsOfRating[i] = 0;
+ 	}
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	ResetVrTrafficDirectorState();
++#endif
+ }
+ 
+ void CCarCtrl::ReInit(void)
+@@ -2694,6 +4507,9 @@ void CCarCtrl::ReInit(void)
+ 		apCarsToKeep[i] = nil;
+ 	for (int i = 0; i < TOTAL_CUSTOM_CLASSES; i++)
+ 		NumRequestsOfCarRating[i] = 0;
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	ResetVrTrafficDirectorState();
++#endif
+ }
+ 
+ void CCarCtrl::DragCarToPoint(CVehicle* pVehicle, CVector* pPoint)
+@@ -3247,6 +5063,73 @@ void CCarCtrl::SteerAIPlaneTowardsTargetCoors(CAutomobile* pPlane)
+ 
+ void CCarCtrl::SteerAICarWithPhysicsFollowPath(CVehicle* pVehicle, float* pSwerve, float* pAccel, float* pBrake, bool* pHandbrake)
+ {
++#ifdef QUEST_VEHICLE_TRAFFIC_JOBS
++	SVrTrafficCruiseSteering cachedCruise;
++	if(VrVehicleTrafficJobs().TryGetCruiseSteering(pVehicle,
++	   &cachedCruise)){
++		// Traffic scans and their side effects intentionally remain on the game
++		// thread. Only immutable route geometry came from the worker.
++		float speedStyleMultiplier;
++		switch(pVehicle->AutoPilot.m_nDrivingStyle){
++		case DRIVINGSTYLE_STOP_FOR_CARS:
++		case DRIVINGSTYLE_SLOW_DOWN_FOR_CARS:
++		case DRIVINGSTYLE_STOP_FOR_CARS_IGNORE_LIGHTS:
++			speedStyleMultiplier =
++				FindMaximumSpeedForThisCarInTraffic(pVehicle);
++#ifdef FIX_BUGS
++			if(pVehicle->AutoPilot.GetCruiseSpeed() != 0)
++				speedStyleMultiplier /=
++					pVehicle->AutoPilot.GetCruiseSpeed();
++#else
++			speedStyleMultiplier /=
++				pVehicle->AutoPilot.m_nCruiseSpeed;
++#endif
++			break;
++		default:
++			speedStyleMultiplier = 1.0f;
++			break;
++		}
++		switch(pVehicle->AutoPilot.m_nDrivingStyle){
++		case DRIVINGSTYLE_STOP_FOR_CARS:
++		case DRIVINGSTYLE_SLOW_DOWN_FOR_CARS:
++			if(CTrafficLights::ShouldCarStopForLight(pVehicle, false)){
++				CCarAI::CarHasReasonToStop(pVehicle);
++				speedStyleMultiplier = 0.0f;
++			}
++			break;
++		default:
++			break;
++		}
++		if(CTrafficLights::ShouldCarStopForBridge(pVehicle)){
++			CCarAI::CarHasReasonToStop(pVehicle);
++			speedStyleMultiplier = 0.0f;
++		}
++
++		const float speedMultiplier = Min(speedStyleMultiplier,
++			Min(cachedCruise.speedAngleMultiplier,
++				cachedCruise.speedNodesMultiplier));
++		const float speed = pVehicle->AutoPilot.m_nCruiseSpeed*
++			speedMultiplier;
++		const float speedDifference = speed-
++			cachedCruise.currentForwardSpeed;
++		if(speed < 0.05f && speedDifference < 0.03f){
++			*pBrake = 1.0f;
++			*pAccel = 0.0f;
++		}else if(speedDifference <= 0.0f){
++			*pBrake = Min(0.5f, -speedDifference*0.05f);
++			*pAccel = 0.0f;
++		}else if(cachedCruise.currentForwardSpeed < 2.0f){
++			*pBrake = 0.0f;
++			*pAccel = Min(1.0f, speedDifference*0.25f);
++		}else{
++			*pBrake = 0.0f;
++			*pAccel = Min(1.0f, speedDifference*0.125f);
++		}
++		*pSwerve = cachedCruise.steerAngle;
++		*pHandbrake = false;
++		return;
++	}
++#endif
+ 	CVector2D forward = pVehicle->GetForward();
+ 	forward.Normalise();
+ 	CCarPathLink* pCurrentLink = &ThePaths.m_carPathLinks[pVehicle->AutoPilot.m_nCurrentPathNodeInfo];
+diff --git a/src/control/CarCtrl.h b/src/control/CarCtrl.h
+index 99c77c3..3e50c66 100644
+--- a/src/control/CarCtrl.h
++++ b/src/control/CarCtrl.h
+@@ -147,6 +147,9 @@ public:
+ 
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ 	static void UpdateVrTrafficDirector(void);
++	// Feed the traffic recycler the ground truth from the render submission
++	// path; the legacy camera cone is only a conservative fallback in VR.
++	static void MarkVrVehicleRendered(CVehicle *vehicle);
+ 	static int32 NumVrScavengedCars;
+ 	static int32 NumVrEffectiveAmbient;
+ 	static int32 NumVrEffectivePursuit;
+@@ -155,6 +158,33 @@ public:
+ 	static float VrLocalDesired;
+ 	static float VrLocalServed;
+ 	static int32 VrSpawnTrace[16];
++	// Lightweight public diagnostics consumed by the in-headset profiler.
++	// Counts are cumulative since Init/ReInit unless their name describes a
++	// current snapshot.
++	static int32 NumVrActiveProxies;
++	static int32 NumVrPendingMaterializations;
++	static int32 NumVrSpawnAttempts;
++	static int32 NumVrSpawnSuccess;
++	static int32 NumVrPoolReserveBlocks;
++	static float VrDirectorLastUpdateMs;
++	static float VrDirectorMaxUpdateMs;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	// Quest-only, snapshot-based car/car traffic prediction. CWorld and entity
++	// mutation remain exclusively on the game thread.
++	static void BeginVrTrafficJobFrame(void);
++	static int32 NumVrTrafficJobHits;
++	static int32 NumVrTrafficJobMisses;
++	static int32 NumVrTrafficJobDispatches;
++	static int32 NumVrTrafficJobSkips;
++	static int32 NumVrTrafficCruiseEligible;
++	static int32 NumVrTrafficCruiseHits;
++	static int32 NumVrTrafficCruiseMisses;
++	static int32 NumVrTrafficCruiseStale;
++	static float VrTrafficJobLastMs;
++	static float VrTrafficJobMaxMs;
++	static float VrTrafficJobBuildMs;
++	static float VrTrafficJobBuildMaxMs;
++#endif
+ #endif
+ 	static bool bMadDriversCheat;
+ 	static int32 NumLawEnforcerCars;
+@@ -182,4 +212,4 @@ public:
+ 	static int32 LoadedCarsArray[TOTAL_CUSTOM_CLASSES][MAX_CAR_MODELS_IN_ARRAY];
+ };
+ 
+-extern CVehicle* apCarsToKeep[MAX_CARS_TO_KEEP];
+\ No newline at end of file
++extern CVehicle* apCarsToKeep[MAX_CARS_TO_KEEP];
+diff --git a/src/control/Script.cpp b/src/control/Script.cpp
+index cb20891..c9aff60 100644
+--- a/src/control/Script.cpp
++++ b/src/control/Script.cpp
+@@ -4813,11 +4813,62 @@ void RetryMission(int type, int unk)
+ #endif
+ 
+ #ifdef MISSION_SWITCHER
++bool
++CTheScripts::TrySwitchToMission(int32 mission)
++{
++	if(!bUsingAMultiScriptFile || mission < 0 ||
++	   mission >= NumberOfMissionScripts ||
++	   mission >= MAX_NUM_MISSION_SCRIPTS ||
++	   MultiScriptArray[mission] <= 0)
++		return false;
++
++	// A running mission can only be unwound after its death/arrest return
++	// frame exists. Starting another mission during an early setup/cutscene
++	// window would corrupt the shared mission script area.
++	for(CRunningScript *script = pActiveScripts; script;
++	    script = script->GetNext()){
++		if(!script->m_bIsActive || !script->m_bIsMissionScript)
++			continue;
++		if(!script->m_bDeatharrestEnabled || script->m_nStackPointer < 1)
++			return false;
++	}
++
++	if(NumberOfExclusiveMissionScripts > 0 && mission <= UINT16_MAX-2)
++		return false;
++
++#ifdef USE_DEBUG_SCRIPT_LOADER
++	CFileMgr::ChangeDir("\\data\\");
++	int handle = CFileMgr::OpenFile(scriptfile, "rb");
++	CFileMgr::ChangeDir("\\");
++#else
++	CFileMgr::ChangeDir("\\");
++	int handle = CFileMgr::OpenFile("data\\main.scm", "rb");
++#endif
++	if(handle == 0)
++		return false;
++	uint8 missionHeader[2];
++	const bool seekFailed = CFileMgr::Seek(handle, MultiScriptArray[mission], 0);
++	const bool offsetReadable = !seekFailed &&
++		CFileMgr::Read(handle, (const char*)missionHeader,
++			sizeof(missionHeader)) == sizeof(missionHeader);
++	CFileMgr::CloseFile(handle);
++	if(!offsetReadable)
++		return false;
++
++	SwitchToMission(mission);
++	return bAlreadyRunningAMissionScript;
++}
++
+ void
+ CTheScripts::SwitchToMission(int32 mission)
+ {
+-	for (CRunningScript* pScript = CTheScripts::pActiveScripts; pScript != nil; pScript = pScript->GetNext()) {
+-		if (!pScript->m_bIsMissionScript || !pScript->m_bDeatharrestEnabled) {
++	for (CRunningScript* pScript = CTheScripts::pActiveScripts; pScript != nil;) {
++		// Cleanup may relink this node into the idle list. Preserve the active
++		// successor before processing the mission's native cleanup commands.
++		CRunningScript *nextActive = pScript->GetNext();
++		if (!pScript->m_bIsActive || !pScript->m_bIsMissionScript ||
++		    !pScript->m_bDeatharrestEnabled) {
++			pScript = nextActive;
+ 			continue;
+ 		}
+ 		while (pScript->m_nStackPointer > 0)
+@@ -4831,6 +4882,7 @@ CTheScripts::SwitchToMission(int32 mission)
+ 		while (!pScript->ProcessOneCommand());
+ 
+ 		CMessages::ClearMessages();
++		pScript = nextActive;
+ 	}
+ 
+ 	if (CTheScripts::NumberOfExclusiveMissionScripts > 0 && mission <= UINT16_MAX - 2)
+diff --git a/src/control/Script.h b/src/control/Script.h
+index 80c0536..771a021 100644
+--- a/src/control/Script.h
++++ b/src/control/Script.h
+@@ -554,6 +554,9 @@ public:
+ 	static uint32& GetLastMissionPassedTime() { return LastMissionPassedTime; }
+ #ifdef MISSION_SWITCHER
+ 	static void SwitchToMission(int32 mission);
++	// Validate the active mission state and exact main.scm entry before the
++	// debug mission browser mutates the shared mission script area.
++	static bool TrySwitchToMission(int32 mission);
+ #endif
+ 
+ #ifdef GTA_SCRIPT_COLLECTIVE
+diff --git a/src/peds/Population.cpp b/src/peds/Population.cpp
+index 0f7314c..8eb6fed 100644
+--- a/src/peds/Population.cpp
++++ b/src/peds/Population.cpp
+@@ -39,6 +39,7 @@ PedGroup CPopulation::ms_pPedGroups[NUMPEDGROUPS];
+ bool CPopulation::ms_bGivePedsWeapons;
+ int32 CPopulation::m_AllRandomPedsThisType = -1;
+ float CPopulation::PedDensityMultiplier = 1.0f;
++float CPopulation::VrTargetAmbientPeds = 0.0f;
+ uint32 CPopulation::ms_nTotalMissionPeds;
+ int32 CPopulation::MaxNumberOfPedsInUse = 25;
+ int32 CPopulation::MaxNumberOfPedsInUseInterior = 40;
+@@ -69,6 +70,124 @@ uint32 gLastSelectedCivilianIndex;
+ CEntity *gSunbatheObstacles[2];
+ CEntity *gCoupleObstacles[3];
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++// Ambient pedestrians are cheap enough to keep for a short while, but very
++// noticeable when they are created or recycled in view.  These values give
++// the normal 40-50 m creation ring a real distance/time hysteresis while
++// keeping enough free pool entries for mission actors and vehicle occupants.
++static const uint32 VR_PED_SPAWN_GRACE_MS = 6000;
++static const uint32 VR_PED_HIDDEN_GRACE_MS = 4000;
++static const uint32 VR_COP_HIDDEN_GRACE_MS = 10000;
++static const float VR_PED_REMOVE_HYSTERESIS = 18.0f;
++static const float VR_PED_OBSERVABLE_RANGE = 150.0f;
++static const float VR_PED_HEAD_CONE_DOT = 0.20f;
++static const float VR_PED_POOL_SAFE_DISTANCE = 30.0f;
++// Optional world population must never consume the slots needed by scripted
++// actors, wanted-level reinforcements and vehicle occupants.  The physical
++// pool contains all of those classes, while ms_nTotalPeds intentionally counts
++// only ambient walkers.
++static const int32 VR_PED_POOL_AMBIENT_RESERVE = 24;
++static const int32 VR_PED_POOL_ESSENTIAL_RESERVE = 4;
++
++static bool
++IsVrPedTimerActive(uint32 now, uint32 until)
++{
++	return until != 0 && (int32)(until - now) > 0;
++}
++
++// GetIsOnScreen/IsSphereVisible alone only describes the legacy mono camera
++// and can miss part of the headset view.  Protect both the render frustum and
++// a deliberately wider head-facing cone, then use building LOS so a ped safely
++// hidden around a corner does not consume the visible grace forever.
++static bool
++IsVrPedSpotObservable(const CVector &spot, float radius)
++{
++	CVector target = spot;
++	target.z += 0.9f;
++	CVector toSpot = target - TheCamera.GetPosition();
++	const float distance = toSpot.Magnitude();
++	if (distance < 12.0f)
++		return true;
++	if (distance >= VR_PED_OBSERVABLE_RANGE)
++		return false;
++
++	const bool inRenderFrustum = TheCamera.IsSphereVisible(spot, radius);
++	toSpot *= 1.0f / distance;
++	const bool inHeadCone = DotProduct(toSpot, TheCamera.GetForward()) > VR_PED_HEAD_CONE_DOT;
++	if (!inRenderFrustum && !inHeadCone)
++		return false;
++
++	return CWorld::GetIsLineOfSightClear(TheCamera.GetPosition(), target,
++		true, false, false, false, false, false);
++}
++
++static bool
++IsVrPedObservable(CPed *ped)
++{
++	return ped->GetIsOnScreen() || IsVrPedSpotObservable(ped->GetPosition(), 1.5f);
++}
++
++// The RAMPAGE script uses FORCE_RANDOM_PED_TYPE to turn newly generated
++// walkers into one gang. It does not convert civilians that already exist.
++// VR normally retains those civilians for much longer to prevent head-turn
++// popping, so they can fill the ambient budget and leave only one target
++// group for the whole two-minute rampage.
++static bool
++IsVrForcedGangRampage(void)
++{
++	return CDarkel::FrenzyOnGoing() &&
++		CPopulation::m_AllRandomPedsThisType >= PEDTYPE_GANG1 &&
++		CPopulation::m_AllRandomPedsThisType <= PEDTYPE_GANG9;
++}
++
++static uint32
++CountVrLiveForcedGangPeds(void)
++{
++	if (!IsVrForcedGangRampage())
++		return 0;
++
++	uint32 count = 0;
++	for (int32 i = CPools::GetPedPool()->GetSize() - 1; i >= 0; i--) {
++		CPed *ped = CPools::GetPedPool()->GetSlot(i);
++		if (ped && ped->CharCreatedBy == RANDOM_CHAR && !ped->bInVehicle &&
++			ped->m_nPedType == CPopulation::m_AllRandomPedsThisType &&
++			ped->m_fHealth > 0.0f && ped->m_nPedState != PED_DEAD)
++			count++;
++	}
++	return count;
++}
++
++static void
++ArmVrPedGrace(CPed *ped, uint32 duration)
++{
++	if (ped)
++		ped->m_nExtendedRangeTimer = CTimer::GetTimeInMilliseconds() + duration;
++}
++
++// Keep the walking-ped budget independent from the much denser vehicle
++// director.  The legacy total already knew about passengers but not drivers;
++// centralising the calculation also keeps initial population generation and
++// steady-state updates in sync.
++static void
++RefreshVrAmbientPedTotals(void)
++{
++	CPopulation::ms_nTotalCivPeds = CPopulation::ms_nNumCivFemale + CPopulation::ms_nNumCivMale;
++	CPopulation::ms_nTotalGangPeds = CPopulation::ms_nNumGang9 + CPopulation::ms_nNumGang8 + CPopulation::ms_nNumGang7
++		+ CPopulation::ms_nNumGang6 + CPopulation::ms_nNumGang5 + CPopulation::ms_nNumGang4
++		+ CPopulation::ms_nNumGang3 + CPopulation::ms_nNumGang2 + CPopulation::ms_nNumGang1;
++	uint32 total = CPopulation::ms_nNumDummy + CPopulation::ms_nNumEmergency + CPopulation::ms_nNumCop
++		+ CPopulation::ms_nTotalGangPeds + CPopulation::ms_nNumCivFemale + CPopulation::ms_nNumCivMale;
++
++	uint32 vehiclePeds = CPopulation::ms_nTotalCarPassengerPeds;
++	for (int32 i = CPools::GetVehiclePool()->GetSize() - 1; i >= 0; i--) {
++		CVehicle *vehicle = CPools::GetVehiclePool()->GetSlot(i);
++		if (vehicle && vehicle->pDriver && !vehicle->pDriver->IsPlayer())
++			vehiclePeds++;
++	}
++	CPopulation::ms_nTotalPeds = vehiclePeds < total ? total - vehiclePeds : 0;
++}
++#endif
++
+ void
+ CPopulation::Initialise()
+ {
+@@ -94,6 +213,7 @@ CPopulation::Initialise()
+ 	ms_nTotalGangPeds = 0;
+ 	ms_nTotalPeds = 0;
+ 	ms_nTotalMissionPeds = 0;
++	VrTargetAmbientPeds = 0.0f;
+ 	m_CountDownToPedsAtStart = 2;
+ 	bZoneChangeHasHappened = false; // III leftover
+ 
+@@ -357,11 +477,46 @@ CPopulation::DealWithZoneChange(eLevelName oldLevel, eLevelName newLevel, bool f
+ {
+ }
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++static float
++ComputeVrAmbientPedTarget(void)
++{
++	CVector playerPosition = FindPlayerCentreOfWorld(CWorld::PlayerInFocus);
++	CZoneInfo zoneInfo;
++	CTheZones::GetZoneInfoForTimeOfDay(&playerPosition, &zoneInfo);
++	CPlayerInfo *playerInfo = &CWorld::Players[CWorld::PlayerInFocus];
++	float missionAndWeatherMult = -0.8f*Sqrt(CWeather::Rain)+1.0f;
++	if(CTheScripts::IsPlayerOnAMission()){
++		CPed *player = FindPlayerPed();
++		if(player != nil && player->InVehicle() &&
++		   player->m_pMyVehicle->IsTaxi())
++			missionAndWeatherMult = 1.0f;
++	}
++	if(CDarkel::FrenzyOnGoing())
++		missionAndWeatherMult = 1.0f;
++	const int32 selectedMaxPeds = CGame::IsInInterior() ?
++		CPopulation::MaxNumberOfPedsInUseInterior :
++		CPopulation::MaxNumberOfPedsInUse;
++	const float target =
++		(zoneInfo.pedDensity+zoneInfo.carDensity)*
++		playerInfo->m_fRoadDensity*CPopulation::PedDensityMultiplier*
++		(CDarkel::FrenzyOnGoing() ? 1.0f :
++		 CIniFile::PedNumberMultiplier)*missionAndWeatherMult;
++	return Min(target, (float)selectedMaxPeds);
++}
++#endif
++
+ void
+ CPopulation::Update(bool addPeds)
+ {
+ 	if (!CReplay::IsPlayingBack()) {
+ 		ManagePopulation();
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		// Keep the diagnostic target live even when the frame-budget gate skips
++		// this frame's spawn attempt. This is the requested number of ambient
++		// walkers in the current zone, not merely the global pool cap.
++		VrTargetAmbientPeds = ComputeVrAmbientPedTarget();
++#endif
+ 		RemovePedsIfThePoolGetsFull();
+ 		MoveCarsAndPedsOutOfAbandonedZones();
+ 		// The Android/Quest port can spend several simulation ticks preparing
+@@ -380,6 +535,9 @@ CPopulation::Update(bool addPeds)
+ 			if (!cutsceneActive && --m_CountDownToPedsAtStart == 0)
+ 				GeneratePedsAtStartOfGame();
+ 		} else {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			RefreshVrAmbientPedTotals();
++#else
+ 			ms_nTotalCivPeds = ms_nNumCivFemale + ms_nNumCivMale;
+ 			ms_nTotalGangPeds = ms_nNumGang9 + ms_nNumGang8 + ms_nNumGang7
+ 				+ ms_nNumGang6 + ms_nNumGang5 + ms_nNumGang4 + ms_nNumGang3
+@@ -387,26 +545,6 @@ CPopulation::Update(bool addPeds)
+ 			ms_nTotalPeds = ms_nNumDummy + ms_nNumEmergency + ms_nNumCop
+ 				+ ms_nTotalGangPeds + ms_nNumCivFemale + ms_nNumCivMale;
+ 			ms_nTotalPeds -= ms_nTotalCarPassengerPeds;
+-#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-			// Only passengers are excluded by the legacy counter; every
+-			// DRIVER still occupies a walking-pedestrian slot. With the
+-			// traffic director keeping far more cars alive than the
+-			// original ever did, drivers alone consumed most of the
+-			// sidewalk budget: streets filled with cars but no people.
+-			// Drivers belong to their cars, not to the crowd.
+-			{
+-				uint32 driverPeds = 0;
+-				for (int vs = CPools::GetVehiclePool()->GetSize()-1;
+-				     vs >= 0; vs--) {
+-					CVehicle* vehicle =
+-						CPools::GetVehiclePool()->GetSlot(vs);
+-					if (vehicle && vehicle->pDriver &&
+-					    !vehicle->pDriver->IsPlayer())
+-						driverPeds++;
+-				}
+-				ms_nTotalPeds = driverPeds < ms_nTotalPeds ?
+-					ms_nTotalPeds - driverPeds : 0;
+-			}
+ #endif
+ 			if (!cutsceneActive && addPeds) {
+ 				float pcdm = PedCreationDistMultiplier();
+@@ -430,7 +568,24 @@ CPopulation::Update(bool addPeds)
+ void
+ CPopulation::GeneratePedsAtStartOfGame()
+ {
+-	for (int i = 0; i < 100; i++) {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Do a bounded warm-up only.  The old 100-attempt burst can monopolise an
++	// Android frame, especially when most attempts fail streaming/visibility
++	// tests.  Normal Update calls fill the remaining budget over subsequent
++	// frames without touching scripted cutscene or mission actors.
++	const int32 maxInitialAttempts = 16;
++	int32 failedAttempts = 0;
++#else
++	const int32 maxInitialAttempts = 100;
++#endif
++	for (int i = 0; i < maxInitialAttempts; i++) {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		RefreshVrAmbientPedTotals();
++		const int32 selectedMaxPeds = CGame::IsInInterior() ? MaxNumberOfPedsInUseInterior : MaxNumberOfPedsInUse;
++		if (ms_nTotalPeds >= (uint32)selectedMaxPeds)
++			break;
++		const uint32 countBeforeAttempt = ms_nTotalPeds;
++#else
+ 		ms_nTotalCivPeds = ms_nNumCivFemale + ms_nNumCivMale;
+ 		ms_nTotalGangPeds = ms_nNumGang9 + ms_nNumGang8 + ms_nNumGang7
+ 			+ ms_nNumGang6 + ms_nNumGang5 + ms_nNumGang4
+@@ -438,10 +593,18 @@ CPopulation::GeneratePedsAtStartOfGame()
+ 		ms_nTotalPeds = ms_nNumDummy + ms_nNumEmergency + ms_nNumCop
+ 			+ ms_nTotalGangPeds + ms_nNumCivFemale + ms_nNumCivMale;
+ 		ms_nTotalPeds -= ms_nTotalCarPassengerPeds;
++#endif
+ 
+ 		// Min dist is 10.0f only for start of the game (naturally)
+ 		AddToPopulation(10.0f, PedCreationDistMultiplier() * (MIN_CREATION_DIST + CREATION_RANGE),
+ 			10.0f, PedCreationDistMultiplier() * (MIN_CREATION_DIST + CREATION_RANGE));
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		RefreshVrAmbientPedTotals();
++		if (ms_nTotalPeds > countBeforeAttempt)
++			failedAttempts = 0;
++		else if (++failedAttempts >= 6)
++			break;
++#endif
+ 	}
+ }
+ 
+@@ -460,6 +623,14 @@ CPopulation::PedCreationDistMultiplier()
+ CPed*
+ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors, int32 modifier)
+ {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// CPool::New returns nil when full, but the legacy class-specific operator
++	// new still lets the C++ constructor run on that null address.  Guard the
++	// allocation centrally so callers can fail cleanly instead of crashing in
++	// CPlaceable/CMatrix at address 0x48.
++	if (CPools::GetPedPool()->GetNoOfFreeSpaces() <= 0)
++		return nil;
++#endif
+ 	switch (pedType) {
+ 		case PEDTYPE_CIVMALE:
+ 		case PEDTYPE_CIVFEMALE:
+@@ -492,6 +663,9 @@ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors,
+ 					ped->SetCurrentWeapon(CWeaponInfo::GetWeaponInfo(weapon)->m_nWeaponSlot);
+ 				}
+ 			}
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			ArmVrPedGrace(ped, VR_PED_SPAWN_GRACE_MS);
++#endif
+ 			return ped;
+ 		}
+ 		case PEDTYPE_COP:
+@@ -500,6 +674,9 @@ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors,
+ 			ped->SetPosition(coors);
+ 			ped->SetOrientation(0.0f, 0.0f, 0.0f);
+ 			CWorld::Add(ped);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			ArmVrPedGrace(ped, VR_PED_SPAWN_GRACE_MS);
++#endif
+ 			return ped;
+ 		}
+ 		case PEDTYPE_GANG1:
+@@ -525,6 +702,9 @@ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors,
+ 
+ 			ped->GiveDelayedWeapon(weapon, 25001);
+ 			ped->SetCurrentWeapon(CWeaponInfo::GetWeaponInfo(weapon)->m_nWeaponSlot);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			ArmVrPedGrace(ped, VR_PED_SPAWN_GRACE_MS);
++#endif
+ 			return ped;
+ 		}
+ 		case PEDTYPE_EMERGENCY:
+@@ -533,6 +713,9 @@ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors,
+ 		    ped->SetPosition(coors);
+ 			ped->SetOrientation(0.0f, 0.0f, 0.0f);
+ 			CWorld::Add(ped);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			ArmVrPedGrace(ped, VR_PED_SPAWN_GRACE_MS);
++#endif
+ 			return ped;
+ 		}
+ 		case PEDTYPE_FIREMAN:
+@@ -541,6 +724,9 @@ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors,
+ 		    ped->SetPosition(coors);
+ 			ped->SetOrientation(0.0f, 0.0f, 0.0f);
+ 			CWorld::Add(ped);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			ArmVrPedGrace(ped, VR_PED_SPAWN_GRACE_MS);
++#endif
+ 			return ped;
+ 		}
+ 		case PEDTYPE_CRIMINAL:
+@@ -550,6 +736,9 @@ CPopulation::AddPed(ePedType pedType, uint32 miOrCopType, CVector const &coors,
+ 			ped->SetPosition(coors);
+ 			ped->SetOrientation(0.0f, 0.0f, 0.0f);
+ 			CWorld::Add(ped);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			ArmVrPedGrace(ped, VR_PED_SPAWN_GRACE_MS);
++#endif
+ 			return ped;
+ 		}
+ 		default:
+@@ -608,8 +797,33 @@ CPopulation::AddToPopulation(float minDist, float maxDist, float minDistOffScree
+ 	float maxPossiblePedsForArea = (zoneInfo.pedDensity + zoneInfo.carDensity) * playerInfo->m_fRoadDensity * PedDensityMultiplier
+ 		* (CDarkel::FrenzyOnGoing() ? 1.f : CIniFile::PedNumberMultiplier) * missionAndWeatherMult;
+ 	maxPossiblePedsForArea = Min(maxPossiblePedsForArea, selectedMaxPeds);
++	VrTargetAmbientPeds = maxPossiblePedsForArea;
++
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// A rampage must have enough live targets even when retained civilians have
++	// already filled the ordinary ambient budget. Keep this temporary reserve
++	// bounded by the user's/global ped cap and the physical pool reserve below.
++	const bool forcedGangRampage = IsVrForcedGangRampage();
++	const int32 forcedGangTarget = forcedGangRampage ?
++		Min(selectedMaxPeds, Max(12, (int32)maxPossiblePedsForArea)) : 0;
++	const bool needsForcedGang = forcedGangRampage &&
++		CountVrLiveForcedGangPeds() < (uint32)forcedGangTarget;
++#endif
+ 
+-	if (ms_nTotalPeds < maxPossiblePedsForArea || addCop) {
++	const int32 freePedSlots = CPools::GetPedPool()->GetNoOfFreeSpaces();
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Ambient population is optional.  Preserve a hard physical reserve for
++	// combat and mission actors; a cop may use the smaller essential reserve.
++	if ((!addCop && freePedSlots <= VR_PED_POOL_AMBIENT_RESERVE) ||
++	    (addCop && freePedSlots <= VR_PED_POOL_ESSENTIAL_RESERVE))
++		return;
++#endif
++
++	if (ms_nTotalPeds < maxPossiblePedsForArea || addCop
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		|| needsForcedGang
++#endif
++	) {
+ 		int decisionThreshold = CGeneral::GetRandomNumberInRange(0, 1000);
+ 		if (decisionThreshold < zoneInfo.copPedThreshold || addCop) {
+ 			pedTypeToAdd = PEDTYPE_COP;
+@@ -650,8 +864,15 @@ CPopulation::AddToPopulation(float minDist, float maxDist, float minDistOffScree
+ 				}
+ 			}
+ 		}
+-		if (!addCop && m_AllRandomPedsThisType > PEDTYPE_PLAYER1)
++		if (!addCop && m_AllRandomPedsThisType > PEDTYPE_PLAYER1) {
+ 			pedTypeToAdd = m_AllRandomPedsThisType;
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			// A random security-guard choice must not suppress gang grouping
++			// after the script has overridden the actual pedestrian type.
++			if (forcedGangRampage)
++				isSecurityGuard = false;
++#endif
++		}
+ 
+ 		if (pedTypeToAdd >= PEDTYPE_GANG1 && pedTypeToAdd <= PEDTYPE_GANG9 && !isSecurityGuard) {
+ 			minDist += 30.0f;
+@@ -660,6 +881,17 @@ CPopulation::AddToPopulation(float minDist, float maxDist, float minDistOffScree
+ 		} else
+ 			pedAmount = 1;
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		// Couple/gang/mall paths can allocate several peds in one call.  Leave
++		// the reserve intact even after the complete group has been created.
++		const int32 requestedSlots = Max(pedAmount,
++			(man > -1 && woman > -1) ? 2 :
++			(CGame::currArea == AREA_MALL ? 6 : 1));
++		if (!addCop && CPools::GetPedPool()->GetNoOfFreeSpaces() <
++		    VR_PED_POOL_AMBIENT_RESERVE + requestedSlots)
++			return;
++#endif
++
+ 		CVector generatedCoors;
+ 		int node1, node2;
+ 		float randomPos;
+@@ -675,6 +907,22 @@ CPopulation::AddToPopulation(float minDist, float maxDist, float minDistOffScree
+ 			return;
+ 
+ 		CPathFind::TakeWidthIntoAccountForCoors(&ThePaths.m_pathNodes[node1], &ThePaths.m_pathNodes[node2], CGeneral::GetRandomNumber(), &generatedCoors.x, &generatedCoors.y);
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		// The headset can expose a much wider area than the legacy mono
++		// frustum.  Never create an ambient ped in either the rendered view or
++		// the wider unobstructed head-facing cone.  This guard is before the
++		// group/couple paths so every ambient creation route gets the same rule.
++		// Forced gang groups fade in from alpha zero and are deliberately
++		// generated farther away. During a rampage allow that stock mission path
++		// to work in the forward street; otherwise open areas only ever receive
++		// targets behind the player's head.
++		const bool allowDistantForcedGangFadeIn = forcedGangRampage &&
++			!addCop && (generatedCoors - playerCentreOfWorld).Magnitude2D() >=
++			MIN_CREATION_DIST + 20.0f;
++		if (IsVrPedSpotObservable(generatedCoors, 2.0f) &&
++			!allowDistantForcedGangFadeIn)
++			return;
++#endif
+ 		if (CGame::currArea == AREA_MALL && (pedTypeToAdd == PEDTYPE_CIVMALE || pedTypeToAdd == PEDTYPE_CIVFEMALE || pedTypeToAdd == PEDTYPE_CRIMINAL) &&
+ 			CGeneral::GetRandomNumberInRange(0.f, 1.f) > 0.5f) {
+ 
+@@ -772,6 +1020,8 @@ CPopulation::AddToPopulation(float minDist, float maxDist, float minDistOffScree
+ 			if (!surfaceAndDistIsOk)
+ 				break;
+ 			CPed *newPed = AddPed((ePedType)pedTypeToAdd, modelToAdd, generatedCoors);
++			if (newPed == nil)
++				return;
+ 			if (forceAddingCop && newPed->m_nPedType == PEDTYPE_COP)
+ 				((CCopPed*)newPed)->m_bThrowsSpikeTrap = true;
+ 
+@@ -840,6 +1090,9 @@ CPopulation::AddToPopulation(float minDist, float maxDist, float minDistOffScree
+ CPed*
+ CPopulation::AddPedInCar(CVehicle* car, bool isDriver)
+ {
++	if (car == nil)
++		return nil;
++
+ 	const int defaultModel = MI_MALE01;
+ 	int miamiViceIndex = 0;
+ 	bool imSureThatModelIsLoaded = true;
+@@ -934,6 +1187,8 @@ CPopulation::AddPedInCar(CVehicle* car, bool isDriver)
+ 	}
+ 
+ 	CPed *newPed = CPopulation::AddPed((ePedType)pedType, preferredModel, car->GetPosition(), miamiViceIndex);
++	if (newPed == nil)
++		return nil;
+ 	newPed->bUsesCollision = false;
+ 
+ 	if (newPed->GetWeapon()->m_eWeaponType != WEAPONTYPE_UNARMED) {
+@@ -970,6 +1225,7 @@ CPopulation::ConvertToRealObject(CDummyObject *dummy)
+ 		return;
+ 
+ 	CObject *obj = new CObject(dummy);
++	// Pool exhausted: the nearby prop stays a dummy.
+ 	if (!obj)
+ 		return;
+ 
+@@ -992,6 +1248,10 @@ void
+ CPopulation::ConvertToDummyObject(CObject *obj)
+ {
+ 	CDummyObject *dummy = new CDummyObject(obj);
++	// Pool exhausted: keep the real object alive instead of dereferencing
++	// nil. The conversion is retried by the next management pass.
++	if (!dummy)
++		return;
+ 
+ 	dummy->GetMatrix() = obj->m_objectMatrix;
+ 	dummy->GetMatrix().UpdateRW();
+@@ -1074,6 +1334,27 @@ CPopulation::TestSafeForRealObject(CDummyObject *dummy)
+ 	return true;
+ }
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++// Is this world point currently observable: within the gaze cone, in range
++// and not hidden by buildings. Used to time prop restorations so nothing
++// snaps back into place in front of the player.
++static bool
++IsVrSpotVisible(const CVector &spot)
++{
++	CVector toSpot = spot - TheCamera.GetPosition();
++	const float distance = toSpot.Magnitude();
++	if (distance < 10.0f)
++		return true;
++	if (distance >= 120.0f)
++		return false;
++	toSpot *= 1.0f/distance;
++	if (DotProduct(toSpot, TheCamera.GetForward()) <= 0.5f)
++		return false;
++	return CWorld::GetIsLineOfSightClear(TheCamera.GetPosition(), spot,
++		true, false, false, false, false, false);
++}
++#endif
++
+ void
+ CPopulation::ManagePopulation(void)
+ {
+@@ -1102,6 +1383,26 @@ CPopulation::ManagePopulation(void)
+ 					ConvertToDummyObject(obj);
+ 				}
+ 			}
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			// A knocked prop that physics flung far from its authored
++			// spot — observed kilometres below the map after tunnelling
++			// through collision — can never be restored by the rule
++			// above while the player stands near the now-empty spot
++			// (the original-position distance check blocks it forever).
++			// Send it home as soon as the spot itself is not watched.
++			// GAME objects only: they inherited a valid authored matrix
++			// from their dummy. Script-created objects never initialize
++			// m_objectMatrix (the mi-constructor leaves it garbage), so
++			// "returning" one would teleport it to random coordinates.
++			else if (obj->ObjectCreatedBy == GAME_OBJECT &&
++				(obj->GetPosition() -
++				 obj->m_objectMatrix.GetPosition()).MagnitudeSqr() >
++					SQR(40.0f) &&
++				TestRoomForDummyObject(obj) &&
++				!IsVrSpotVisible(obj->m_objectMatrix.GetPosition())) {
++				ConvertToDummyObject(obj);
++			}
++#endif
+ 		}
+ 	}
+ 
+@@ -1141,12 +1442,28 @@ CPopulation::ManagePopulation(void)
+ 			else if (ped->bDeadPedInFrontOfCar && ped->m_vehicleInAccident)
+ 				dist = 0.0f;
+ 
++			#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			const float distanceScale = PedCreationDistMultiplier() * TheCamera.GenerationDistMultiplier;
++			const float regularRemoveDist = (PED_REMOVE_DIST + VR_PED_REMOVE_HYSTERESIS) * distanceScale;
++			const float specialRemoveDist = (PED_REMOVE_DIST_SPECIAL + VR_PED_REMOVE_HYSTERESIS) * distanceScale;
++			const bool outsideKeepRange = dist > (ped->bCullExtraFarAway ? specialRemoveDist : regularRemoveDist);
++			const uint32 now = CTimer::GetTimeInMilliseconds();
++			const bool observable = IsVrPedObservable(ped);
++
++			if (!outsideKeepRange || observable) {
++				// Refresh while the ped is nearby or could be seen. Once it is
++				// both outside the wider keep radius and hidden, the timer becomes
++				// a grace period instead of an immediate pop/despawn boundary.
++				ArmVrPedGrace(ped, ped->m_nPedType == PEDTYPE_COP ? VR_COP_HIDDEN_GRACE_MS : VR_PED_HIDDEN_GRACE_MS);
++			} else if (!IsVrPedTimerActive(now, ped->m_nExtendedRangeTimer)) {
++				pedIsFarAway = true;
++			}
++#else
+ 			if (PedCreationDistMultiplier() * (PED_REMOVE_DIST_SPECIAL * TheCamera.GenerationDistMultiplier) < dist ||
+ 				(!ped->bCullExtraFarAway && PedCreationDistMultiplier() * PED_REMOVE_DIST * TheCamera.GenerationDistMultiplier < dist)) {
+ 				pedIsFarAway = true;
+ 
+ 			}
+-#if !defined(GTA_VR_OCULUS) && !defined(GTA_VR_WEAPONS)
+ 			else if (PedCreationDistMultiplier() * (MIN_CREATION_DIST + CREATION_RANGE) * OFFSCREEN_CREATION_MULT < dist) {
+ 				if (CTimer::GetTimeInMilliseconds() > ped->m_nExtendedRangeTimer && !ped->GetIsOnScreen()) {
+ 					if (TheCamera.Cams[TheCamera.ActiveCam].Mode != CCam::MODE_SNIPER
+@@ -1159,10 +1476,10 @@ CPopulation::ManagePopulation(void)
+ 					}
+ 				}
+ 			}
+-#endif
+ 			else {
+ 				ped->m_nExtendedRangeTimer = ped->m_nPedType == PEDTYPE_COP ? CTimer::GetTimeInMilliseconds() + 10000 : CTimer::GetTimeInMilliseconds() + 4000;
+ 			}
++#endif
+ 
+ 			if (!pedIsFarAway)
+ 				continue;
+@@ -1214,6 +1531,8 @@ CPopulation::AddDeadPedInFrontOfCar(const CVector& pos, CVehicle* pCulprit)
+ 	if (!CModelInfo::GetModelInfo(MI_MALE01)->GetRwObject())
+ 		return nil;
+ 	CPed* pPed = CPopulation::AddPed(PEDTYPE_CIVMALE, MI_MALE01, pos);
++	if (pPed == nil)
++		return nil;
+ 	pPed->SetDie();
+ 	pPed->m_nPedMoney = 0;
+ 	pPed->bDeadPedInFrontOfCar = true;
+@@ -1258,8 +1577,54 @@ CPopulation::CanJeerAtStripper(int32 model)
+ void
+ CPopulation::RemovePedsIfThePoolGetsFull(void)
+ {
+-	if ((CTimer::GetFrameCounter() & 7) == 5) {
+-		if (CPools::GetPedPool()->GetNoOfFreeSpaces() < 8) {
++	const int32 freeSpacesNow = CPools::GetPedPool()->GetNoOfFreeSpaces();
++	// The normal recycler remains staggered, but at the critical edge service it
++	// every frame.  It still only removes hidden, deletable ambient peds.
++	if ((CTimer::GetFrameCounter() & 7) == 5 || freeSpacesNow < 2) {
++		if (freeSpacesNow < 8) {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			CPed *recyclePed = nil;
++			float bestScore = -1.0f;
++			const int32 freeSpaces = CPools::GetPedPool()->GetNoOfFreeSpaces();
++			const float safeDistance = freeSpaces < 2 ? 18.0f : VR_PED_POOL_SAFE_DISTANCE;
++			const uint32 now = CTimer::GetTimeInMilliseconds();
++			const int poolSize = CPools::GetPedPool()->GetSize();
++
++			for (int i = poolSize - 1; i >= 0; i--) {
++				CPed *ped = CPools::GetPedPool()->GetSlot(i);
++				// Restrict emergency recycling to genuinely ambient walkers.
++				// CanBeDeleted protects mission actors, while the explicit vehicle
++				// checks cover drivers/passengers and enter/exit transitions.
++				if (!ped || ped->IsPlayer() || ped->CharCreatedBy != RANDOM_CHAR ||
++					!ped->CanBeDeleted() || ped->bInVehicle || ped->m_pMyVehicle ||
++					ped->bCullExtraFarAway ||
++					(ped->bDeadPedInFrontOfCar && ped->m_vehicleInAccident) ||
++					IsVrPedTimerActive(now, ped->m_nExtendedRangeTimer))
++					continue;
++
++				const float dist = (TheCamera.GetPosition() - ped->GetPosition()).Magnitude();
++				if (dist < safeDistance || IsVrPedObservable(ped))
++					continue;
++
++				// Prefer an unloaded area, then corpses/already-fading peds, and
++				// finally the farthest hidden ambient ped.  The old code selected
++				// the closest ped, which guaranteed a visible disappearance.
++				float score = dist;
++				if (ped->m_area != CGame::currArea)
++					score += 500.0f;
++				if (ped->m_nPedState == PED_DEAD)
++					score += 100.0f;
++				if (ped->bFadeOut)
++					score += 50.0f;
++				if (score > bestScore) {
++					bestScore = score;
++					recyclePed = ped;
++				}
++			}
++
++			if (recyclePed)
++				RemovePed(recyclePed);
++#else
+ 			CPed *closestPed = nil;
+ 			float closestDist = 10000000.0;
+ 			int poolSize = CPools::GetPedPool()->GetSize();
+@@ -1276,6 +1641,7 @@ CPopulation::RemovePedsIfThePoolGetsFull(void)
+ 			if (closestPed) {
+ 				RemovePed(closestPed);
+ 			}
++#endif
+ 		}
+ 	}
+ }
+@@ -1711,8 +2077,10 @@ CPopulation::PlaceCouple(ePedType manType, int32 manModel, ePedType womanType, i
+ 								}
+ 								RemovePed(woman);
+ 								RemovePed(man);
+-							}
+-						}
++							} else
++								RemovePed(man);
++						} else
++							RemovePed(man);
+ 					}
+ 				}
+ 			}
+diff --git a/src/render/Shadows.cpp b/src/render/Shadows.cpp
+index 76e0d73..e62de87 100644
+--- a/src/render/Shadows.cpp
++++ b/src/render/Shadows.cpp
+@@ -53,6 +53,7 @@ RwTexture *gpGoalTex;
+ 
+ int16            CShadows::ShadowsStoredToBeRendered;
+ bool             CShadows::PreserveStoredShadowsAfterRender;
++bool             CShadows::RenderEnabled = true;
+ CStoredShadow    CShadows::asShadowsStored  [MAX_STOREDSHADOWS];
+ CPolyBunch       CShadows::aPolyBunches     [MAX_POLYBUNCHES];
+ CStaticShadow    CShadows::aStaticShadows   [MAX_STATICSHADOWS];
+@@ -1070,6 +1071,11 @@ CShadows::SetRenderModeForShadowType(uint8 ShadowType)
+ void
+ CShadows::RenderStoredShadows(void)
+ {
++	if(!RenderEnabled){
++		if(!PreserveStoredShadowsAfterRender)
++			ShadowsStoredToBeRendered = 0;
++		return;
++	}
+ 	PUSH_RENDERGROUP("CShadows::RenderStoredShadows");
+ 
+ 	RenderBuffer::ClearRenderBuffer();
+@@ -1256,6 +1262,18 @@ CShadows::SetPreserveAfterRender(bool preserve)
+ 	PreserveStoredShadowsAfterRender = preserve;
+ }
+ 
++void
++CShadows::SetRenderEnabled(bool enabled)
++{
++	RenderEnabled = enabled;
++}
++
++bool
++CShadows::IsRenderEnabled(void)
++{
++	return RenderEnabled;
++}
++
+ void
+ CShadows::FinishStereoRender(void)
+ {
+@@ -1267,6 +1285,8 @@ CShadows::FinishStereoRender(void)
+ void
+ CShadows::RenderStaticShadows(void)
+ {
++	if(!RenderEnabled)
++		return;
+ 	PUSH_RENDERGROUP("CShadows::RenderStaticShadows");
+ 
+ 	RenderBuffer::ClearRenderBuffer();
+diff --git a/src/render/Shadows.h b/src/render/Shadows.h
+index f5e1943..9e8d657 100644
+--- a/src/render/Shadows.h
++++ b/src/render/Shadows.h
+@@ -146,6 +146,7 @@ class CShadows
+ public:
+ 	static int16            ShadowsStoredToBeRendered;
+ 	static bool             PreserveStoredShadowsAfterRender;
++	static bool             RenderEnabled;
+ 	static CStoredShadow    asShadowsStored  [MAX_STOREDSHADOWS];
+ 	static CPolyBunch       aPolyBunches     [MAX_POLYBUNCHES];
+ 	static CStaticShadow    aStaticShadows   [MAX_STATICSHADOWS];
+@@ -169,6 +170,8 @@ public:
+ 	static void SetRenderModeForShadowType     (uint8 ShadowType);
+ 	static void RenderStoredShadows            (void);
+ 	static void RenderStaticShadows            (void);
++	static void SetRenderEnabled               (bool enabled);
++	static bool IsRenderEnabled                (void);
+ 	static void SetPreserveAfterRender          (bool preserve);
+ 	static void FinishStereoRender              (void);
+ 	

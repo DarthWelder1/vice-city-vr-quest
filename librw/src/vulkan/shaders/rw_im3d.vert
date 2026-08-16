@@ -15,11 +15,15 @@ layout(location = 2) in vec2 inTexCoord;
 layout(location = 0) out vec4 fragColour;
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out float fragFog;
+layout(location = 3) flat out vec2 fragDynamicMotion;
 
 void main()
 {
-	vec4 world = push.model * vec4(inPosition, 1.0);
+	mat4 model = RwModelMatrix();
+	vec4 world = model * vec4(inPosition, 1.0);
 	gl_Position = scene.viewProj[gl_ViewIndex] * world;
+	vec4 rootMotion = RwRootScreenMotion();
+	fragDynamicMotion = gl_ViewIndex == 0 ? rootMotion.xy : rootMotion.zw;
 	fragColour = inColour * push.materialColour;
 	fragTexCoord = inTexCoord;
 	fragFog = scene.fogParams.w > 0.5 ?

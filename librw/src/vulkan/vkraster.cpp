@@ -127,6 +127,8 @@ destroyNativeRaster(void *object, int32 offset, int32)
 			vkFreeMemory(gvk.device, native->stagingMemory, nil);
 		if(native->view || native->image || native->memory)
 			retireImage(native->view, native->image, native->memory);
+		retireTextureDescriptorSets(native->descriptorSet,
+			NUM_FRAME_CONTEXTS);
 	}
 	memset(native, 0, sizeof(VulkanRaster));
 	native->lockedLevel = -1;

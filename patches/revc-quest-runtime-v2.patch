@@ -1,0 +1,226 @@
+diff --git a/src/control/CarCtrl.cpp b/src/control/CarCtrl.cpp
+--- a/src/control/CarCtrl.cpp
++++ b/src/control/CarCtrl.cpp
+@@ -1557,8 +1557,8 @@ CCarCtrl::MarkVrVehicleRendered(CVehicle *pVehicle)
+ 		aVrVehicleLastSeen[slot] = CTimer::GetTimeInMilliseconds();
+ }
+ 
+-static bool
+-WasVrVehicleRecentlySeen(CVehicle *pVehicle, uint32 graceMs)
++bool
++CCarCtrl::WasVrVehicleRenderedRecently(CVehicle *pVehicle, uint32 graceMs)
+ {
+ 	if (pVehicle == nil)
+ 		return false;
+@@ -3188,6 +3188,6 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
+ 			// grace, even if the legacy camera reports it offscreen.
+ 			if (IsVrVehicleVisible(pVehicle) ||
+-				WasVrVehicleRecentlySeen(pVehicle, 3000))
++				WasVrVehicleRenderedRecently(pVehicle, 3000))
+ 				return;
+ #endif
+ 			if (pVehicle->GetIsOnScreen()){
+@@ -3210,7 +3210,7 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
+ 	const bool stalledCarClearance =
+ 		(pVehicle->GetPosition() - vecPlayerPos).Magnitude2D() > 45.0f &&
+ 		!IsVrVehicleVisible(pVehicle) &&
+-		!WasVrVehicleRecentlySeen(pVehicle, 5000);
++		!WasVrVehicleRenderedRecently(pVehicle, 5000);
+ #else
+ 	const bool stalledCarClearance = !pVehicle->GetIsOnScreen() &&
+ 		(pVehicle->GetPosition() - vecPlayerPos).Magnitude2D() > 22.0f;
+@@ -3235,6 +3235,6 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ 		&& !IsVrVehicleVisible(pVehicle) &&
+-		!WasVrVehicleRecentlySeen(pVehicle, 3000)
++		!WasVrVehicleRenderedRecently(pVehicle, 3000)
+ #endif
+ 	){
+ 		if ((pVehicle->GetPosition() - vecPlayerPos).MagnitudeSqr() > SQR(7.5f)){
+diff --git a/src/control/CarCtrl.h b/src/control/CarCtrl.h
+--- a/src/control/CarCtrl.h
++++ b/src/control/CarCtrl.h
+@@ -149,6 +149,7 @@ public:
+ 	// Feed the traffic recycler the ground truth from the render submission
+ 	// path; the legacy camera cone is only a conservative fallback in VR.
+ 	static void MarkVrVehicleRendered(CVehicle *vehicle);
++	static bool WasVrVehicleRenderedRecently(CVehicle *vehicle, uint32 graceMs);
+ 	static int32 NumVrScavengedCars;
+ 	static int32 NumVrEffectiveAmbient;
+ 	static int32 NumVrEffectivePursuit;
+diff --git a/src/peds/PlayerPed.cpp b/src/peds/PlayerPed.cpp
+--- a/src/peds/PlayerPed.cpp
++++ b/src/peds/PlayerPed.cpp
+@@ -44,16 +44,66 @@ const uint32 CPlayerPed::nSaveStructSize =
+ int32 idleAnimBlockIndex;
+ 
+ CPad*
+ GetPadFromPlayer(CPlayerPed*)
+ {
+ 	return CPad::GetPad(0);
+ }
+ 
++static bool
++IsRunWithoutLimitsCheatEnabled(void)
++{
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	return OculusVR::IsRunWithoutLimitsEnabled();
++#else
++	return false;
++#endif
++}
++
++static bool
++IsHeavyWeaponMobilityRestricted(CPlayerPed *player)
++{
++	if(IsRunWithoutLimitsCheatEnabled())
++		return false;
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// In physical-VR mode the inventory's selected slot is not necessarily in
++	// either hand. Rampages select their supplied weapon immediately, which used
++	// to disable sprinting even while that weapon was still in its holster.
++	if(OculusVR::IsPhysicalWeaponInteractionActive()){
++		for(int hand = 0; hand < 2; hand++){
++			const int heldSlot = OculusVR::GetHeldWeaponSlot(hand);
++			if(heldSlot >= 0 && heldSlot < TOTAL_WEAPON_SLOTS &&
++			   CWeaponInfo::GetWeaponInfo(
++				player->GetWeapon(heldSlot).m_eWeaponType)->
++				IsFlagSet(WEAPONFLAG_HEAVY))
++				return true;
++		}
++		return false;
++	}
++#endif
++	return CWeaponInfo::GetWeaponInfo(player->GetWeapon()->m_eWeaponType)->
++		IsFlagSet(WEAPONFLAG_HEAVY);
++}
++
++static bool
++ShouldPlayerSprint(CPlayerPed *player, CPad *pad)
++{
++	if(!pad)
++		return false;
++	if(IsRunWithoutLimitsCheatEnabled()){
++		// This cheat is intentionally an always-run mode, not only infinite
++		// stamina. It therefore remains useful in Rampages whose script-selected
++		// heavy weapon is not physically in either hand.
++		return pad->GetPedWalkLeftRight() != 0 ||
++			pad->GetPedWalkUpDown() != 0;
++	}
++	return !IsHeavyWeaponMobilityRestricted(player) && pad->GetSprint();
++}
++
+ CPlayerPed::~CPlayerPed()
+ {
+ 	delete m_pWanted;
+ }
+ 
+ CPlayerPed::CPlayerPed(void) : CPed(PEDTYPE_PLAYER1)
+ {
+ 	m_fMoveSpeed = 0.0f;
+@@ -203,16 +253,21 @@ void
+ CPlayerPed::ReactivatePlayerPed(int32 index)
+ {
+ 	CWorld::Add(CWorld::Players[index].m_pPed);
+ }
+ 
+ void
+ CPlayerPed::UseSprintEnergy(void)
+ {
++	if(IsRunWithoutLimitsCheatEnabled()){
++		m_fCurrentStamina = m_fMaxStamina;
++		m_fStaminaProgress = 0.0f;
++		return;
++	}
+ 	if (m_fCurrentStamina > -150.0f && !CWorld::Players[CWorld::PlayerInFocus].m_bInfiniteSprint
+ 		&& !m_bAdrenalineActive) {
+ 		m_fCurrentStamina = m_fCurrentStamina - CTimer::GetTimeStep();
+ 		m_fStaminaProgress = m_fStaminaProgress + CTimer::GetTimeStep();
+ 	}
+ 
+ 	if (m_fStaminaProgress >= 500.0f) {
+ 		m_fStaminaProgress = 0;
+@@ -445,7 +500,7 @@ CPlayerPed::SetRealMoveAnim(void)
+ 				curRunAssoc->SetRun();
+ 			}
+ 			if (m_nMoveState == PEDMOVE_SPRINT) {
+-				if (m_fCurrentStamina < 0.0f && (m_fCurrentStamina <= -150.0f || !curSprintAssoc || curSprintAssoc->blendDelta < 0.0f))
++				if (!IsRunWithoutLimitsCheatEnabled() && m_fCurrentStamina < 0.0f && (m_fCurrentStamina <= -150.0f || !curSprintAssoc || curSprintAssoc->blendDelta < 0.0f))
+ 					m_nMoveState = PEDMOVE_STILL;
+ 
+ 				if (curWalkStartAssoc)
+@@ -914,17 +969,17 @@ CPlayerPed::PlayerControlFighter(CPad *padUsed)
+ 
+ 	if (padMove > 0.0f) {
+ 		m_fRotationDest = CGeneral::GetRadianAngleBetweenPoints(0.0f, 0.0f, -leftRight, upDown) - TheCamera.Orientation;
+ 		m_takeAStepAfterAttack = padMove > 2 * PAD_MOVE_TO_GAME_WORLD_MOVE;
+ 		if (padUsed->GetSprint() && padMove > 1 * PAD_MOVE_TO_GAME_WORLD_MOVE)
+ 			bIsAttacking = false;
+ 	}
+ 
+-	if (!CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType)->IsFlagSet(WEAPONFLAG_HEAVY) && padUsed->JumpJustDown()) {
++	if (!IsHeavyWeaponMobilityRestricted(this) && padUsed->JumpJustDown()) {
+ 		if (m_nEvadeAmount != 0 && m_pEvadingFrom) {
+ 			SetEvasiveDive((CPhysical*)m_pEvadingFrom, 1);
+ 			m_nEvadeAmount = 0;
+ 			m_pEvadingFrom = nil;
+ 		} else {
+ 			SetJump();
+ 		}
+ 	}
+@@ -958,23 +1013,23 @@ CPlayerPed::PlayerControl1stPersonRunAround(CPad *padUsed)
+ 		}
+ 	}
+ 
+ 	if (m_nPedState == PED_ANSWER_MOBILE) {
+ 		SetRealMoveAnim();
+ 		return;
+ 	}
+ 
+-	if (!CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType)->IsFlagSet(WEAPONFLAG_HEAVY) && padUsed->GetSprint()) {
++	if (ShouldPlayerSprint(this, padUsed)) {
+ 		m_nMoveState = PEDMOVE_SPRINT;
+ 	}
+ 	if (m_nPedState != PED_FIGHT)
+ 		SetRealMoveAnim();
+ 
+-	if (!bIsInTheAir && !(CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType)->IsFlagSet(WEAPONFLAG_HEAVY)) &&
++	if (!bIsInTheAir && !IsHeavyWeaponMobilityRestricted(this) &&
+ 		padUsed->JumpJustDown() && m_nPedState != PED_JUMP) {
+ 
+ 		ClearAttack();
+ 		ClearWeaponTarget();
+ 		if (m_nEvadeAmount != 0 && m_pEvadingFrom) {
+ 			SetEvasiveDive((CPhysical*)m_pEvadingFrom, 1);
+ 			m_nEvadeAmount = 0;
+ 			m_pEvadingFrom = nil;
+@@ -2348,25 +2403,26 @@ CPlayerPed::PlayerControlZelda(CPad *padUsed)
+ 		}
+ 	}
+ 
+ 	if (m_nPedState == PED_ANSWER_MOBILE) {
+ 		SetRealMoveAnim();
+ 		return;
+ 	}
+ 
+-	if (!CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType)->IsFlagSet(WEAPONFLAG_HEAVY) && padUsed->GetSprint()) {
+-		if (!m_pCurrentPhysSurface || (!m_pCurrentPhysSurface->bInfiniteMass || m_pCurrentPhysSurface->m_phy_flagA08))
++	if (ShouldPlayerSprint(this, padUsed)) {
++		if (IsRunWithoutLimitsCheatEnabled() || !m_pCurrentPhysSurface ||
++		   (!m_pCurrentPhysSurface->bInfiniteMass || m_pCurrentPhysSurface->m_phy_flagA08))
+ 			m_nMoveState = PEDMOVE_SPRINT;
+ 	}
+ 
+ 	if (m_nPedState != PED_FIGHT)
+ 		SetRealMoveAnim();
+ 
+-	if (!bIsInTheAir && !CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType)->IsFlagSet(WEAPONFLAG_HEAVY)
++	if (!bIsInTheAir && !IsHeavyWeaponMobilityRestricted(this)
+ 		&& padUsed->JumpJustDown() && m_nPedState != PED_JUMP) {
+ 		ClearAttack();
+ 		ClearWeaponTarget();
+ 		if (m_nEvadeAmount != 0 && m_pEvadingFrom) {
+ 			SetEvasiveDive((CPhysical*)m_pEvadingFrom, 1);
+ 			m_nEvadeAmount = 0;
+ 			m_pEvadingFrom = nil;
+ 		} else {

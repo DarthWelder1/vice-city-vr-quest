@@ -73,6 +73,18 @@ struct PostFxPushConstants
 {
 	float32 blurColour[4];
 	uint32 mode[4];
+	// x/y = native OpenXR output extent, z = active SGSR mode.
+	uint32 upscale[4];
+};
+
+struct MotionUniformData
+{
+	float32 clipToPrevClip[2][16];
+	// xy = scene size, z = history valid, w = temporal mode.
+	float32 temporalParams[4];
+	// xy = current SGSR2 Halton jitter in render pixels,
+	// z = horizontal tan-half-FOV approximation, w = history reset.
+	float32 sgsrParams[4];
 };
 
 // Everything the GPU may still be reading after a frame is submitted lives
@@ -94,8 +106,37 @@ struct FrameContext
 	VkImage sceneColourImage;
 	VkDeviceMemory sceneColourMemory;
 	VkImageView sceneColourView;
+	VkImage sceneMsaaImage;
+	VkDeviceMemory sceneMsaaMemory;
+	VkImageView sceneMsaaView;
 	VkFramebuffer sceneFramebuffer;
 	VkDescriptorSet postFxDescriptor;
+	bool32 sceneColourInitialised;
+
+	// V3 temporal history stores the already resolved (but not colour-filtered)
+	// result. It is allocated only for SGSR2_RESOLVED_TEMPORAL_V3.
+	VkImage resolvedHistoryImage;
+	VkDeviceMemory resolvedHistoryMemory;
+	VkImageView resolvedHistoryView;
+	bool32 resolvedHistoryInitialised;
+
+	// Official SGSR2 Convert output: motion.xy, depth clip and alpha mask.
+	VkImage sgsrConvertImage;
+	VkDeviceMemory sgsrConvertMemory;
+	VkImageView sgsrConvertView;
+	VkFramebuffer sgsrConvertFramebuffer;
+	VkDescriptorSet sgsrConvertDescriptor;
+
+	// SGSR2 foundation. Allocated only for MOTION DEBUG, so normal gameplay
+	// pays neither the memory cost nor the depth writeback cost.
+	VkImage motionImage;
+	VkDeviceMemory motionMemory;
+	VkImageView motionView;
+	VkFramebuffer motionFramebuffer;
+	VkDescriptorSet motionDescriptor;
+	VkBuffer motionBuffer;
+	VkDeviceMemory motionBufferMemory;
+	void *motionMapped;
 
 	VkImageView framebufferColourViews[MAX_FRAMEBUFFERS_PER_CONTEXT];
 	VkFramebuffer framebuffers[MAX_FRAMEBUFFERS_PER_CONTEXT];
@@ -137,12 +178,29 @@ struct Globals
 	VkDescriptorSetLayout postFxDescriptorLayout;
 	VkDescriptorPool postFxDescriptorPool;
 	VkSampler postFxSampler;
+	VkSampler motionDepthSampler;
 	VkPipelineLayout postFxPipelineLayout;
 	VkPipeline postFxPipeline;
 	PostFxPushConstants postFxConstants;
+	VkRenderPass motionRenderPass;
+	VkFormat motionFormat;
+	VkDescriptorSetLayout motionDescriptorLayout;
+	VkDescriptorPool motionDescriptorPool;
+	VkPipelineLayout motionPipelineLayout;
+	VkPipeline motionPipeline;
+	VkRenderPass sgsrConvertRenderPass;
+	VkDescriptorSetLayout sgsrConvertDescriptorLayout;
+	VkDescriptorPool sgsrConvertDescriptorPool;
+	VkPipelineLayout sgsrConvertPipelineLayout;
+	VkPipeline sgsrConvertPipeline;
 
 	uint32 width;
 	uint32 height;
+	float32 renderScaleEffectivePercent;
+	uint32 sceneWidth;
+	uint32 sceneHeight;
+	uint32 sgsrMode;
+	VkSampleCountFlagBits sceneSamples;
 	uint32 viewCount;
 	VkFormat colourFormat;
 
@@ -151,6 +209,19 @@ struct Globals
 	bool32 supportsBC;
 
 	float32 stereoViewProjection[2][16];
+	// Exact OpenXR matrices before temporal projection jitter. SGSR2 motion
+	// reconstruction and dynamic-object velocity must use these; jitter is
+	// supplied separately to the official upscaler.
+	float32 stereoViewProjectionUnjittered[2][16];
+	float32 previousStereoViewProjection[2][16];
+	float32 previousStereoViewProjectionUnjittered[2][16];
+	float32 previousWorldClip[2][16];
+	bool32 temporalHistoryValid;
+	uint64 motionFrameSerial;
+	float32 sgsrJitter[2];
+	float32 sgsrHorizontalTanHalfFov;
+	float32 stereoCullPlanes[2][5][4];
+	bool32 stereoCullPlanesValid;
 	// Game world space to OpenXR play space, rebuilt from the camera in
 	// beginUpdate and folded into each draw's model matrix. Captured when the
 	// draw is recorded, so a frame that switches cameras stays correct.
@@ -159,6 +230,9 @@ struct Globals
 	float32 headPosition[3];
 	float32 headYaw;
 	float32 headQuat[4];
+	float32 eyePosition[2][3];
+	float32 eyeQuat[2][4];
+	bool32 eyePosesValid;
 	// Render pass clear colour; carries the timecycle sky. See beginFrame.
 	float32 clearColour[3];
 
@@ -233,6 +307,10 @@ struct SceneData
 	// Play space (OpenXR, metres, Y up) to clip. World geometry gets there
 	// through the game camera transform folded into PushConstants::model.
 	float32 viewProj[2][16];
+	// Previous submitted-eye projection. Dynamic atomics use this together
+	// with their cached root translation; static geometry falls back to the
+	// exact depth reconstruction in the post pass.
+	float32 previousViewProj[2][16];
 	float32 fogColour[4];
 	float32 fogParams[4];
 	float32 ambient[4];
@@ -294,6 +372,7 @@ bool32 uploadStaticBuffer(const void *data, VkDeviceSize size,
 // triangle shows the background through the model.
 void drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
                       const uint32 *boneOffset);
+void resetAtomicMotionHistory(void);
 
 bool32 stateInit(void);
 void stateShutdown(void);
@@ -339,6 +418,12 @@ void resetDynamic(void);
 // them instead of invalidating commands already executing on the GPU.
 void retireBuffer(VkBuffer buffer, VkDeviceMemory memory);
 void retireImage(VkImageView view, VkImage image, VkDeviceMemory memory);
+// Texture descriptor sets leak permanently without this: every destroyed
+// raster must hand its sets back or the fixed-size pool exhausts and all
+// later textures draw white.
+void retireTextureDescriptorSets(VkDescriptorSet *sets, uint32 count);
+// Implemented in vkstate.cpp, which owns the descriptor pool.
+void freeTextureDescriptorSets(VkDescriptorSet *sets, uint32 count);
 
 // Shared helpers used by both the device and the raster implementation.
 bool32 findMemoryType(uint32 typeBits, VkMemoryPropertyFlags properties,

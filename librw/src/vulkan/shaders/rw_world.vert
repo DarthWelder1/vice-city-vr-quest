@@ -11,14 +11,18 @@ layout(location = 3) in vec2 inTexCoord;
 layout(location = 0) out vec4 fragColour;
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out float fragFog;
+layout(location = 3) flat out vec2 fragDynamicMotion;
 
 // Lighting is evaluated per vertex, matching what the original fixed-function
 // RenderWare pipeline did. Moving it to the fragment stage would look slightly
 // better and cost noticeably more on a tiler at 1680x1760 per eye.
 void main()
 {
-	vec4 world = push.model * vec4(inPosition, 1.0);
+	mat4 model = RwModelMatrix();
+	vec4 world = model * vec4(inPosition, 1.0);
 	gl_Position = scene.viewProj[gl_ViewIndex] * world;
+	vec4 rootMotion = RwRootScreenMotion();
+	fragDynamicMotion = gl_ViewIndex == 0 ? rootMotion.xy : rootMotion.zw;
 
 	// RenderWare's fixed-function sum: prelight, plus ambient scaled by the
 	// material's ambient coefficient, plus the directional term -- additive,
@@ -28,7 +32,7 @@ void main()
 	// push.model carries the game camera as well as the object transform, so
 	// the normal lands in play space; the light direction was rotated into the
 	// same space on the CPU, keeping the dot product honest.
-	vec3 normal = normalize(mat3(push.model) * inNormal);
+	vec3 normal = normalize(mat3(model) * inNormal);
 	vec3 colour = inColour.rgb + push.ambientLight.rgb * push.surfaceProps.x;
 	vec4 dirColour = unpackUnorm4x8(floatBitsToUint(push.lightDirColour.w));
 	colour += dirColour.rgb *

@@ -12,10 +12,11 @@ furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
-This license covers the original code in this repository: the contents of
-overlay/ and patches/, and the Vulkan backend additions inside librw/. It does
-not and cannot cover the reVC source tree this project builds against, which
-is provided by the user, nor any game content.
+This license covers this project's original contributions in `overlay/`,
+`patches/`, the build tools and the Vulkan backend additions inside `librw/`.
+Third-party files retain the licenses identified in `NOTICE.md` and alongside
+those files. This license does not cover the reVC source tree supplied by the
+user, upstream context shown in patch files, or any original game content.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

@@ -117,6 +117,11 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 		memcpy(push.model, model, sizeof(push.model));
 	else
 		multiplyMatrix(push.model, gvk.worldToPlay, model);
+	if(gvk.sgsrMode != SGSR_OFF){
+		// Immediate geometry has no persistent object identity/history. Keep its
+		// packed root vector at zero so the post pass uses depth reconstruction.
+		push.model[3] = push.model[7] = push.model[11] = push.model[15] = 0.0f;
+	}
 	push.materialColour[0] = push.materialColour[1] =
 	push.materialColour[2] = push.materialColour[3] = 1.0f;
 	push.surfaceProps[0] = 1.0f;

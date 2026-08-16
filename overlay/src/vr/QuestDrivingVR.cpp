@@ -15,6 +15,7 @@
 #include "main.h"
 #include "ModelInfo.h"
 #include "ModelIndices.h"
+#include "ModelSets.h"
 #include "Pad.h"
 #include "PlayerInfo.h"
 #include "PlayerPed.h"
@@ -22,10 +23,12 @@
 #include "VehicleModelInfo.h"
 #include "WeaponType.h"
 #include "crossplatform.h"
+#include "vulkan/rwvk.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern CVehicle *FindPlayerVehicle(void);
 extern const char *GetVrVehicleModelName(int model);
@@ -38,7 +41,21 @@ enum {
 	VR_HAND_COUNT = 2,
 	VEHICLE_CALIBRATION_VALUE_SCALE = 2,
 	VR_BIKE_MODEL_COUNT = 6,
-	VR_CAR_MODEL_COUNT = MI_LAST_VEHICLE-MI_FIRST_VEHICLE+1
+	VR_CAR_MODEL_COUNT = MI_LAST_VEHICLE-MI_FIRST_VEHICLE+1,
+	VR_CAR_WHEEL_DEFAULT_RADIUS_CM = 18,
+	VR_CAR_WHEEL_MIN_RADIUS_CM = 8,
+	VR_CAR_WHEEL_MAX_RADIUS_CM = 40,
+	VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG = 180
+};
+
+enum eVrVehicleCategory
+{
+	VR_VEHICLE_CATEGORY_CAR = 0,
+	VR_VEHICLE_CATEGORY_BIKE,
+	VR_VEHICLE_CATEGORY_BOAT,
+	VR_VEHICLE_CATEGORY_HELI,
+	VR_VEHICLE_CATEGORY_COUNT,
+	VR_VEHICLE_CATEGORY_INVALID = -1
 };
 
 enum eVrDrivingType
@@ -69,9 +86,36 @@ struct HandleCalibration
 struct VehicleViewCalibration
 {
 	int seatDistanceCm;
+	int seatHeightCm;
+	int wheelCenterXCm, wheelCenterYCm, wheelCenterZCm;
+	int carWheelRadiusCm;
+	int wheelRadiusCm;
+	int carWheelPitchHalfDeg, carWheelYawHalfDeg, carWheelRollHalfDeg;
+	int carWheelVisibilityOverride;
 	bool valid;
 
-	VehicleViewCalibration() : seatDistanceCm(0), valid(false) {}
+	VehicleViewCalibration() : seatDistanceCm(0), seatHeightCm(0),
+		wheelCenterXCm(0), wheelCenterYCm(0), wheelCenterZCm(0),
+		carWheelRadiusCm(0), wheelRadiusCm(0),
+		carWheelPitchHalfDeg(0), carWheelYawHalfDeg(0),
+		carWheelRollHalfDeg(0), carWheelVisibilityOverride(-1),
+		valid(false) {}
+};
+
+struct VehicleCategoryCalibration
+{
+	int seatDistanceCm;
+	int seatHeightCm;
+	int wheelCenterXCm, wheelCenterYCm, wheelCenterZCm;
+	int carWheelRadiusCm;
+	int wheelRadiusCm;
+	int carWheelPitchHalfDeg, carWheelYawHalfDeg, carWheelRollHalfDeg;
+	bool valid;
+	VehicleCategoryCalibration() : seatDistanceCm(0), seatHeightCm(15),
+		wheelCenterXCm(0), wheelCenterYCm(0), wheelCenterZCm(0),
+		carWheelRadiusCm(VR_CAR_WHEEL_DEFAULT_RADIUS_CM), wheelRadiusCm(0),
+		carWheelPitchHalfDeg(0), carWheelYawHalfDeg(0),
+		carWheelRollHalfDeg(0), valid(false) {}
 };
 
 struct BikeLeanCalibration
@@ -86,11 +130,12 @@ struct BikeLeanCalibration
 };
 
 static bool gSettingsLoaded;
-static int gDrivingType;
+static int gCarDrivingType;
+static int gBikeDrivingType;
 static int gMotionSteeringHand = 1;
 static bool gHandleHighlightsEnabled = true;
 static bool gBikeHorizonLocked = true;
-static int gDrivingYOffsetCm = 15;
+static bool gImmersiveCarWheelVisible = true;
 static bool gCalibrationPreview;
 
 static HandleCalibration
@@ -99,6 +144,24 @@ static HandleCalibration
 	gCarCalibration[VR_CAR_MODEL_COUNT][VR_HAND_COUNT];
 static VehicleViewCalibration
 	gVehicleViewCalibration[VR_CAR_MODEL_COUNT];
+static VehicleCategoryCalibration
+	gVehicleCategoryCalibration[VR_VEHICLE_CATEGORY_COUNT];
+enum eDefaultVehicleViewType
+{
+	VR_DEFAULT_VIEW_CAR = 0,
+	VR_DEFAULT_VIEW_BIKE,
+	VR_DEFAULT_VIEW_COUNT
+};
+struct DefaultVehicleViewOffset
+{
+	int seatDistanceCm;
+	int seatHeightCm;
+	DefaultVehicleViewOffset() : seatDistanceCm(0), seatHeightCm(15) {}
+};
+// DEFAULT car and DEFAULT bike camera placement are independent from each
+// other and from the physical Immersive/Motion calibration layers.
+static DefaultVehicleViewOffset
+	gDefaultVehicleViewOffset[VR_DEFAULT_VIEW_COUNT];
 static BikeLeanCalibration
 	gBikeLeanCalibration[VR_BIKE_MODEL_COUNT];
 
@@ -108,10 +171,14 @@ static float gBikeHandleDistance[VR_HAND_COUNT] = {
 	1000.0f, 1000.0f
 };
 static float gImmersiveBikeSteering;
+static float gImmersiveBikePhysicalAngle;
+static float gImmersiveBikeDesiredAngle;
+static float gImmersiveBikeSteeringOverflow;
 static float gImmersiveBikeThrottle;
 static float gImmersiveBikeLean;
+static bool gBikeThrottleGestureActive;
 static bool gBikeThrottleReferenceValid;
-static CVector gBikeThrottleReference;
+static float gBikeThrottleReferenceOrientation[4];
 static bool gBikeLeanReferenceValid[VR_HAND_COUNT];
 static float gBikeLeanReferenceTrackingY[VR_HAND_COUNT];
 static int gBikeLeanGestureState;
@@ -145,6 +212,45 @@ static float gMotionVehiclePhysicalAngle;
 static bool gMotionSteeringReferenceValid;
 static float gMotionSteeringReferenceHeading;
 
+struct ImmersiveSteeringChordState
+{
+	CVehicle *vehicle;
+	uint32 realHandMask;
+	bool valid;
+	bool referenceActive;
+	bool rebaseOnNextValid;
+	float referenceAngle;
+	float continuousAngle;
+	float lastDelta;
+	uint32 pointValidMask;
+	uint32 captureCount;
+	ImmersiveSteeringChordState() : vehicle(nil), realHandMask(0),
+		valid(false), referenceActive(false), rebaseOnNextValid(false),
+		referenceAngle(0.0f), continuousAngle(0.0f), lastDelta(0.0f),
+		pointValidMask(0), captureCount(0) {}
+};
+
+struct BikeOneHandSteeringState
+{
+	CVehicle *vehicle;
+	uint32 realHandMask;
+	bool valid;
+	CVector referenceHandTracking;
+	CVector seedChordTracking;
+	CVector rightTracking;
+	CVector forwardTracking;
+	float referencePhysicalAngle;
+	BikeOneHandSteeringState() : vehicle(nil), realHandMask(0), valid(false),
+		referenceHandTracking(0.0f, 0.0f, 0.0f),
+		seedChordTracking(0.0f, 0.0f, 0.0f),
+		rightTracking(0.0f, 0.0f, 0.0f),
+		forwardTracking(0.0f, 0.0f, 0.0f),
+		referencePhysicalAngle(0.0f) {}
+};
+
+static ImmersiveSteeringChordState gBikeSteeringChordState;
+static BikeOneHandSteeringState gBikeOneHandSteeringState;
+
 static const char *const kSettingsPath = ".\\vr_settings.ini";
 
 static void
@@ -155,6 +261,8 @@ SaveSetting(const char *name, int value)
 	WritePrivateProfileStringA("VR", name, text, kSettingsPath);
 }
 
+static void ReloadVehicleCalibration();
+
 static void
 LoadDrivingSettings()
 {
@@ -163,15 +271,22 @@ LoadDrivingSettings()
 	char drivingType[16] = {};
 	GetPrivateProfileStringA("VR", "DrivingType", "", drivingType,
 		sizeof(drivingType), kSettingsPath);
+	int legacyDrivingType;
 	if(drivingType[0] != '\0')
-		gDrivingType = atoi(drivingType);
+		legacyDrivingType = atoi(drivingType);
 	else
-		gDrivingType =
+		legacyDrivingType =
 			GetPrivateProfileIntA("VR", "ImmersiveDriving", 0,
 				kSettingsPath) != 0 ?
 				VR_DRIVING_IMMERSIVE : VR_DRIVING_DEFAULT;
-	gDrivingType = clamp(gDrivingType, (int)VR_DRIVING_DEFAULT,
+	legacyDrivingType = clamp(legacyDrivingType, (int)VR_DRIVING_DEFAULT,
 		(int)VR_DRIVING_TYPE_COUNT-1);
+	gCarDrivingType = clamp((int)(int32)GetPrivateProfileIntA(
+		"VR", "CarDrivingType", legacyDrivingType, kSettingsPath),
+		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
+	gBikeDrivingType = clamp((int)(int32)GetPrivateProfileIntA(
+		"VR", "BikeDrivingType", legacyDrivingType, kSettingsPath),
+		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
 	gMotionSteeringHand = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "MotionSteeringHand", 1, kSettingsPath), 0,
 		VR_HAND_COUNT-1);
@@ -179,8 +294,9 @@ LoadDrivingSettings()
 		"VR", "BikeHandleHighlights", 1, kSettingsPath) != 0;
 	gBikeHorizonLocked = GetPrivateProfileIntA(
 		"VR", "BikeLockHorizon", 1, kSettingsPath) != 0;
-	gDrivingYOffsetCm = clamp((int)(int32)GetPrivateProfileIntA(
-		"VR", "DrivingYOffsetCm", 15, kSettingsPath), -100, 150);
+	gImmersiveCarWheelVisible = GetPrivateProfileIntA(
+		"VR", "ImmersiveCarWheelVisible", 1, kSettingsPath) != 0;
+	ReloadVehicleCalibration();
 	gSettingsLoaded = true;
 }
 
@@ -221,11 +337,24 @@ GetActivePlayerCar()
 			(CAutomobile*)vehicle : nil;
 }
 
+static int
+GetDrivingTypeForVehicle(CVehicle *vehicle)
+{
+	if(!vehicle)
+		return VR_DRIVING_DEFAULT;
+	if(vehicle->IsBike())
+		return gBikeDrivingType;
+	if(vehicle->IsCar() && !vehicle->IsRealHeli() && !vehicle->IsRealPlane())
+		return gCarDrivingType;
+	return VR_DRIVING_DEFAULT;
+}
+
 static bool
 IsDrivingEnvironmentActive()
 {
 	LoadDrivingSettings();
-	if(gDrivingType == VR_DRIVING_DEFAULT ||
+	CVehicle *vehicle = FindPlayerVehicle();
+	if(GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ||
 	   !gVrFirstPersonActive ||
 	   gGameState != GS_PLAYING_GAME ||
 	   FrontEndMenuManager.m_bGameNotLoaded ||
@@ -237,7 +366,6 @@ IsDrivingEnvironmentActive()
 	   TheCamera.m_WideScreenOn)
 		return false;
 	CPlayerPed *player = FindPlayerPed();
-	CVehicle *vehicle = FindPlayerVehicle();
 	return player && !player->DyingOrDead() && vehicle &&
 		vehicle->pDriver == player;
 }
@@ -245,14 +373,16 @@ IsDrivingEnvironmentActive()
 static bool
 IsImmersiveEnvironmentActive()
 {
-	return gDrivingType == VR_DRIVING_IMMERSIVE &&
+	return GetDrivingTypeForVehicle(FindPlayerVehicle()) ==
+		VR_DRIVING_IMMERSIVE &&
 		IsDrivingEnvironmentActive();
 }
 
 static bool
 IsMotionEnvironmentActive()
 {
-	return gDrivingType == VR_DRIVING_MOTION &&
+	return GetDrivingTypeForVehicle(FindPlayerVehicle()) ==
+		VR_DRIVING_MOTION &&
 		IsDrivingEnvironmentActive();
 }
 
@@ -379,7 +509,9 @@ GetBikeCalibration(int model, int hand)
 	if(calibration.valid)
 		return &calibration;
 	char section[64];
-	sprintf(section, "BikeHandle_%d_%s", model,
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"BikeHandleModern_%d_%s" : "BikeHandle_%d_%s", model,
 		hand == 0 ? "Left" : "Right");
 	HandleCalibration defaults;
 	if(!GetBuiltInBikeHandleCalibration(model, hand, &defaults))
@@ -415,7 +547,9 @@ GetCarCalibration(int model, int hand)
 	if(calibration.valid)
 		return &calibration;
 	char section[64];
-	sprintf(section, "CarWheelV2_%d_%s", model,
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"CarWheelV2Modern_%d_%s" : "CarWheelV2_%d_%s", model,
 		hand == 0 ? "Left" : "Right");
 	const int defaultX = 18*VEHICLE_CALIBRATION_VALUE_SCALE*
 		(hand == 0 ? -1 : 1);
@@ -445,7 +579,9 @@ GetBikeLeanCalibration(int model)
 	if(calibration.valid)
 		return &calibration;
 	char section[64];
-	sprintf(section, "BikeControl_%d", model);
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"BikeControlModern_%d" : "BikeControl_%d", model);
 	calibration.wheelieHeightCm = clamp((int)(int32)
 		GetPrivateProfileIntA(section, "WheelieHeightCm", 20,
 			kSettingsPath), 5, 100);
@@ -454,6 +590,260 @@ GetBikeLeanCalibration(int model)
 			kSettingsPath), 5, 100);
 	calibration.valid = true;
 	return &calibration;
+}
+
+static int
+GetVehicleCategory(CVehicle *vehicle)
+{
+	if(!vehicle) return VR_VEHICLE_CATEGORY_INVALID;
+	if(vehicle->IsBike()) return VR_VEHICLE_CATEGORY_BIKE;
+	if(vehicle->IsBoat()) return VR_VEHICLE_CATEGORY_BOAT;
+	if(vehicle->IsHeli() || vehicle->IsRealHeli())
+		return VR_VEHICLE_CATEGORY_HELI;
+	if(vehicle->IsCar() && !vehicle->IsRealPlane())
+		return VR_VEHICLE_CATEGORY_CAR;
+	return VR_VEHICLE_CATEGORY_INVALID;
+}
+
+static VehicleCategoryCalibration *
+GetCategoryCalibration(CVehicle *vehicle)
+{
+	const int category = GetVehicleCategory(vehicle);
+	return category >= 0 && category < VR_VEHICLE_CATEGORY_COUNT ?
+		&gVehicleCategoryCalibration[category] : nil;
+}
+
+struct BuiltInVehicleCategoryDefaults
+{
+	ModelSets::eModelSet modelSet;
+	int category;
+	int value[10];
+};
+
+static const BuiltInVehicleCategoryDefaults gBuiltInVehicleCategoryDefaults[] = {
+	{ ModelSets::MODEL_SET_CLASSIC, VR_VEHICLE_CATEGORY_CAR,
+		{ 0,0, -1,4,8, 18,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_CLASSIC, VR_VEHICLE_CATEGORY_BIKE,
+		{ 0,0, 0,0,0, 18,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_CLASSIC, VR_VEHICLE_CATEGORY_BOAT,
+		{ 0,15, 0,0,0, 18,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_CLASSIC, VR_VEHICLE_CATEGORY_HELI,
+		{ 0,15, 0,0,0, 18,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_MODERN, VR_VEHICLE_CATEGORY_CAR,
+		{ 0,5, 0,0,0, 17,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_MODERN, VR_VEHICLE_CATEGORY_BIKE,
+		{ 0,0, 0,0,0, 18,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_MODERN, VR_VEHICLE_CATEGORY_BOAT,
+		{ 0,10, 0,0,0, 18,0, 0,0,0 } },
+	{ ModelSets::MODEL_SET_MODERN, VR_VEHICLE_CATEGORY_HELI,
+		{ 0,10, 0,0,0, 18,0, 0,0,0 } },
+};
+
+static void
+GetDefaultCategoryCalibration(ModelSets::eModelSet modelSet, int category,
+	VehicleCategoryCalibration *calibration)
+{
+	if(!calibration) return;
+	*calibration = VehicleCategoryCalibration();
+	for(int i = 0; i < (int)ARRAY_SIZE(gBuiltInVehicleCategoryDefaults); i++){
+		const BuiltInVehicleCategoryDefaults &entry =
+			gBuiltInVehicleCategoryDefaults[i];
+		if(entry.modelSet != modelSet || entry.category != category)
+			continue;
+		calibration->seatDistanceCm = entry.value[0];
+		calibration->seatHeightCm = entry.value[1];
+		calibration->wheelCenterXCm = entry.value[2];
+		calibration->wheelCenterYCm = entry.value[3];
+		calibration->wheelCenterZCm = entry.value[4];
+		calibration->carWheelRadiusCm = entry.value[5];
+		calibration->wheelRadiusCm = entry.value[6];
+		calibration->carWheelPitchHalfDeg = entry.value[7];
+		calibration->carWheelYawHalfDeg = entry.value[8];
+		calibration->carWheelRollHalfDeg = entry.value[9];
+		return;
+	}
+}
+
+static bool
+ReadProfileInt(const char *section, const char *name, int *value)
+{
+	char text[32] = {};
+	if(!value || GetPrivateProfileStringA(section, name, "", text,
+	   sizeof(text), kSettingsPath) == 0 || text[0] == '\0')
+		return false;
+	*value = atoi(text);
+	return true;
+}
+
+static const char *const gCategoryPrefixes[VR_VEHICLE_CATEGORY_COUNT] = {
+	"Car", "Bike", "Boat", "Heli"
+};
+
+static int
+ReadCategoryValue(int category, const char *suffix, int fallback,
+	int minimum, int maximum)
+{
+	char key[64];
+	int value;
+	if(ModelSets::GetActiveForCategory(ModelSets::MODEL_CATEGORY_VEHICLES) ==
+	   ModelSets::MODEL_SET_MODERN){
+		sprintf(key, "%s%s", gCategoryPrefixes[category], suffix);
+		if(ReadProfileInt("VR", key, &value)) fallback = value;
+		sprintf(key, "Modern%s%s", gCategoryPrefixes[category], suffix);
+		if(ReadProfileInt("VR", key, &value)) fallback = value;
+	}else{
+		sprintf(key, "%s%s", gCategoryPrefixes[category], suffix);
+		if(ReadProfileInt("VR", key, &value)) fallback = value;
+	}
+	return clamp(fallback, minimum, maximum);
+}
+
+static void
+ReloadVehicleCalibration()
+{
+	int legacyHeight = 15;
+	ReadProfileInt("VR", "DrivingYOffsetCm", &legacyHeight);
+	legacyHeight = clamp(legacyHeight, -100, 150);
+	static const char *heightKeys[VR_DEFAULT_VIEW_COUNT] = {
+		"DefaultCarSeatHeightCm", "DefaultBikeSeatHeightCm"
+	};
+	static const char *distanceKeys[VR_DEFAULT_VIEW_COUNT] = {
+		"DefaultCarSeatDistanceCm", "DefaultBikeSeatDistanceCm"
+	};
+	for(int type = 0; type < VR_DEFAULT_VIEW_COUNT; type++){
+		gDefaultVehicleViewOffset[type].seatHeightCm = clamp(
+			(int)(int32)GetPrivateProfileIntA("VR", heightKeys[type],
+				legacyHeight, kSettingsPath), -100, 150);
+		gDefaultVehicleViewOffset[type].seatDistanceCm = clamp(
+			(int)(int32)GetPrivateProfileIntA("VR", distanceKeys[type],
+				0, kSettingsPath), -100, 100);
+	}
+	const ModelSets::eModelSet modelSet = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES);
+	for(int category = 0; category < VR_VEHICLE_CATEGORY_COUNT; category++){
+		VehicleCategoryCalibration defaults;
+		GetDefaultCategoryCalibration(modelSet, category, &defaults);
+		VehicleCategoryCalibration &calibration =
+			gVehicleCategoryCalibration[category];
+		calibration.seatDistanceCm = ReadCategoryValue(category,
+			"SeatDistanceCm", defaults.seatDistanceCm, -100, 100);
+		calibration.seatHeightCm = ReadCategoryValue(category,
+			"SeatHeightCm", legacyHeight, -100, 150);
+		calibration.wheelCenterXCm = ReadCategoryValue(category,
+			"WheelCenterXCm", defaults.wheelCenterXCm, -100, 100);
+		calibration.wheelCenterYCm = ReadCategoryValue(category,
+			"WheelCenterYCm", defaults.wheelCenterYCm, -100, 100);
+		calibration.wheelCenterZCm = ReadCategoryValue(category,
+			"WheelCenterZCm", defaults.wheelCenterZCm, -100, 100);
+		calibration.carWheelRadiusCm = ReadCategoryValue(category,
+			"WheelRadiusV2Cm", defaults.carWheelRadiusCm,
+			VR_CAR_WHEEL_MIN_RADIUS_CM, VR_CAR_WHEEL_MAX_RADIUS_CM);
+		calibration.wheelRadiusCm = ReadCategoryValue(category,
+			"WheelRadiusCm", defaults.wheelRadiusCm, -20, 40);
+		calibration.carWheelPitchHalfDeg = ReadCategoryValue(category,
+			"WheelPitchHalfDeg", defaults.carWheelPitchHalfDeg,
+			-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+			 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+		calibration.carWheelYawHalfDeg = ReadCategoryValue(category,
+			"WheelYawHalfDeg", defaults.carWheelYawHalfDeg,
+			-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+			 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+		calibration.carWheelRollHalfDeg = ReadCategoryValue(category,
+			"WheelRollHalfDeg", defaults.carWheelRollHalfDeg,
+			-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+			 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+		calibration.valid = true;
+	}
+}
+
+static void
+SaveCategoryCalibrationValue(int category, const char *suffix, int value)
+{
+	if(category < 0 || category >= VR_VEHICLE_CATEGORY_COUNT || !suffix)
+		return;
+	char key[64], text[32];
+	sprintf(key, "%s%s%s",
+		ModelSets::GetActiveForCategory(ModelSets::MODEL_CATEGORY_VEHICLES) ==
+			ModelSets::MODEL_SET_MODERN ? "Modern" : "",
+		gCategoryPrefixes[category], suffix);
+	sprintf(text, "%d", value);
+	WritePrivateProfileStringA("VR", key, text, kSettingsPath);
+}
+
+struct BuiltInVehicleViewDefaults
+{
+	int model;
+	ModelSets::eModelSet modelSet;
+	int value[11];
+};
+
+static const BuiltInVehicleViewDefaults gBuiltInVehicleViewDefaults[] = {
+	{ MI_PIZZABOY, ModelSets::MODEL_SET_CLASSIC,
+		{ -15,-12, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_PCJ600, ModelSets::MODEL_SET_CLASSIC,
+		{ -8,0, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_FAGGIO, ModelSets::MODEL_SET_CLASSIC,
+		{ -7,-22, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_SANCHEZ, ModelSets::MODEL_SET_CLASSIC,
+		{ -15,-15, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_STINGER, ModelSets::MODEL_SET_MODERN,
+		{ 0,0, 0,13,12, 21,0, -60,0,0, 0 } },
+	{ MI_INFERNUS, ModelSets::MODEL_SET_MODERN,
+		{ 0,0, 2,-6,4, 0,0, 0,0,0, -1 } },
+	{ MI_BANSHEE, ModelSets::MODEL_SET_MODERN,
+		{ 0,6, 0,2,12, 18,0, -50,0,0, 0 } },
+	{ MI_ADMIRAL, ModelSets::MODEL_SET_MODERN,
+		{ 0,8, 3,6,7, 26,0, 0,0,0, 0 } },
+	{ MI_PIZZABOY, ModelSets::MODEL_SET_MODERN,
+		{ 0,-33, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_FAGGIO, ModelSets::MODEL_SET_MODERN,
+		{ 0,-38, 0,0,0, 0,0, 0,0,0, -1 } },
+};
+
+static VehicleViewCalibration
+GetDefaultViewCalibration(int model)
+{
+	VehicleViewCalibration calibration;
+	calibration.seatDistanceCm = model == MI_SANCHEZ ? -23 : 0;
+	const ModelSets::eModelSet set = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES);
+	const BuiltInVehicleViewDefaults *found = nil;
+	for(int pass = 0; pass < 2 && !found; pass++){
+		const ModelSets::eModelSet wanted = pass == 0 ? set :
+			ModelSets::MODEL_SET_CLASSIC;
+		for(int i = 0; i < (int)ARRAY_SIZE(gBuiltInVehicleViewDefaults); i++)
+			if(gBuiltInVehicleViewDefaults[i].model == model &&
+			   gBuiltInVehicleViewDefaults[i].modelSet == wanted){
+				found = &gBuiltInVehicleViewDefaults[i];
+				break;
+			}
+		if(set == ModelSets::MODEL_SET_CLASSIC) break;
+	}
+	if(found){
+		const int *v = found->value;
+		calibration.seatDistanceCm=v[0]; calibration.seatHeightCm=v[1];
+		calibration.wheelCenterXCm=v[2]; calibration.wheelCenterYCm=v[3];
+		calibration.wheelCenterZCm=v[4]; calibration.carWheelRadiusCm=v[5];
+		calibration.wheelRadiusCm=v[6]; calibration.carWheelPitchHalfDeg=v[7];
+		calibration.carWheelYawHalfDeg=v[8]; calibration.carWheelRollHalfDeg=v[9];
+		calibration.carWheelVisibilityOverride=v[10];
+	}
+	return calibration;
+}
+
+static int
+ReadViewValue(int model, const char *name, int fallback)
+{
+	char classic[64], active[64];
+	sprintf(classic, "VehicleView_%d", model);
+	sprintf(active, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"VehicleViewModern_%d" : "VehicleView_%d", model);
+	int value;
+	if(strcmp(active, classic) != 0 && ReadProfileInt(classic, name, &value))
+		fallback = value;
+	if(ReadProfileInt(active, name, &value)) fallback = value;
+	return fallback;
 }
 
 static VehicleViewCalibration *
@@ -465,14 +855,49 @@ GetViewCalibration(int model)
 		gVehicleViewCalibration[model-MI_FIRST_VEHICLE];
 	if(calibration.valid)
 		return &calibration;
-	char section[64];
-	sprintf(section, "VehicleView_%d", model);
-	const int defaultSeatDistanceCm = model == MI_SANCHEZ ? -23 : 0;
-	calibration.seatDistanceCm = clamp((int)(int32)
-		GetPrivateProfileIntA(section, "SeatDistanceCm",
-			defaultSeatDistanceCm, kSettingsPath), -100, 100);
+	const VehicleViewCalibration defaults = GetDefaultViewCalibration(model);
+	calibration.seatDistanceCm = clamp(ReadViewValue(model,
+		"SeatDistanceCm", defaults.seatDistanceCm), -100, 100);
+	calibration.seatHeightCm = clamp(ReadViewValue(model,
+		"SeatHeightCm", defaults.seatHeightCm), -100, 100);
+	calibration.wheelCenterXCm = clamp(ReadViewValue(model,
+		"WheelCenterXCm", defaults.wheelCenterXCm), -100, 100);
+	calibration.wheelCenterYCm = clamp(ReadViewValue(model,
+		"WheelCenterYCm", defaults.wheelCenterYCm), -100, 100);
+	calibration.wheelCenterZCm = clamp(ReadViewValue(model,
+		"WheelCenterZCm", defaults.wheelCenterZCm), -100, 100);
+	calibration.carWheelRadiusCm = clamp(ReadViewValue(model,
+		"WheelRadiusV2Cm", defaults.carWheelRadiusCm), 0,
+		VR_CAR_WHEEL_MAX_RADIUS_CM);
+	calibration.wheelRadiusCm = clamp(ReadViewValue(model,
+		"WheelRadiusCm", defaults.wheelRadiusCm), -20, 40);
+	calibration.carWheelPitchHalfDeg = clamp(ReadViewValue(model,
+		"WheelPitchHalfDeg", defaults.carWheelPitchHalfDeg),
+		-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+		 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+	calibration.carWheelYawHalfDeg = clamp(ReadViewValue(model,
+		"WheelYawHalfDeg", defaults.carWheelYawHalfDeg),
+		-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+		 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+	calibration.carWheelRollHalfDeg = clamp(ReadViewValue(model,
+		"WheelRollHalfDeg", defaults.carWheelRollHalfDeg),
+		-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+		 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+	calibration.carWheelVisibilityOverride = ReadViewValue(model,
+		"VirtualWheelVisibility", defaults.carWheelVisibilityOverride) == 0 ? 0 : -1;
 	calibration.valid = true;
 	return &calibration;
+}
+
+static void
+SaveViewCalibrationValue(int model, const char *name, int value)
+{
+	char section[64], text[32];
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"VehicleViewModern_%d" : "VehicleView_%d", model);
+	sprintf(text, "%d", value);
+	WritePrivateProfileStringA(section, name, text, kSettingsPath);
 }
 
 static void
@@ -482,7 +907,9 @@ SaveCalibrationValue(const char *prefix, int model, int hand,
 	if(!prefix || !name || hand < 0 || hand >= VR_HAND_COUNT)
 		return;
 	char section[64], text[32];
-	sprintf(section, "%s_%d_%s", prefix, model,
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"%sModern_%d_%s" : "%s_%d_%s", prefix, model,
 		hand == 0 ? "Left" : "Right");
 	sprintf(text, "%d", value);
 	WritePrivateProfileStringA(section, name, text, kSettingsPath);
@@ -492,7 +919,9 @@ static void
 SaveBikeLeanValue(int model, const char *name, int value)
 {
 	char section[64], text[32];
-	sprintf(section, "BikeControl_%d", model);
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN ?
+		"BikeControlModern_%d" : "BikeControl_%d", model);
 	sprintf(text, "%d", value);
 	WritePrivateProfileStringA(section, name, text, kSettingsPath);
 }
@@ -542,6 +971,67 @@ ApplyHandleRotation(CMatrix *matrix,
 	matrix->GetUp().Normalise();
 }
 
+struct BikeHandlePose
+{
+	CVector center;
+	CVector right;
+	CVector forward;
+	CVector up;
+};
+
+static void
+GetVehicleControlAdjustment(CVehicle *vehicle, CVector *centerOffset,
+	float *radiusOffset)
+{
+	if(centerOffset)
+		*centerOffset = CVector(0.0f, 0.0f, 0.0f);
+	if(radiusOffset)
+		*radiusOffset = 0.0f;
+	if(!vehicle)
+		return;
+	VehicleCategoryCalibration *category = GetCategoryCalibration(vehicle);
+	VehicleViewCalibration *model = GetViewCalibration(vehicle->GetModelIndex());
+	if(!category || !model)
+		return;
+	if(centerOffset)
+		*centerOffset = CVector(
+			(float)(category->wheelCenterXCm+model->wheelCenterXCm)/100.0f,
+			(float)(category->wheelCenterYCm+model->wheelCenterYCm)/100.0f,
+			(float)(category->wheelCenterZCm+model->wheelCenterZCm)/100.0f);
+	if(radiusOffset)
+		*radiusOffset = (float)(category->wheelRadiusCm+
+			model->wheelRadiusCm)/100.0f;
+}
+
+static bool
+BuildBikeHandlePose(CBike *bike, BikeHandlePose *pose)
+{
+	if(!bike || !pose)
+		return false;
+	pose->right = bike->GetRight();
+	pose->forward = bike->GetForward();
+	pose->up = bike->GetUp();
+	if(pose->right.MagnitudeSqr() < 0.0001f ||
+	   pose->forward.MagnitudeSqr() < 0.0001f ||
+	   pose->up.MagnitudeSqr() < 0.0001f)
+		return false;
+	pose->right.Normalise();
+	pose->forward.Normalise();
+	pose->up.Normalise();
+	pose->center = bike->GetPosition()+pose->forward*0.30f+pose->up*0.82f;
+	if(bike->m_aBikeNodes[BIKE_HANDLEBARS]){
+		RwMatrix *handle = RwFrameGetLTM(bike->m_aBikeNodes[BIKE_HANDLEBARS]);
+		if(handle)
+			pose->center = CVector(handle->pos);
+	}
+	CVector controlCenterOffset;
+	GetVehicleControlAdjustment(bike, &controlCenterOffset, nil);
+	pose->center += pose->right*controlCenterOffset.x+
+		pose->forward*controlCenterOffset.y+
+		pose->up*controlCenterOffset.z;
+	return true;
+}
+
 static bool
 BuildBikeHandleMatrix(int hand, CMatrix *matrix, bool applySteering)
 {
@@ -553,49 +1043,53 @@ BuildBikeHandleMatrix(int hand, CMatrix *matrix, bool applySteering)
 		GetBikeCalibration(bike->GetModelIndex(), hand);
 	if(!calibration)
 		return false;
-	CVector bikeRight = bike->GetRight();
-	CVector bikeForward = bike->GetForward();
-	CVector bikeUp = bike->GetUp();
-	bikeRight.Normalise();
-	bikeForward.Normalise();
-	bikeUp.Normalise();
-	CVector center =
-		bike->GetPosition()+bikeForward*0.30f+bikeUp*0.82f;
-	if(bike->m_aBikeNodes[BIKE_HANDLEBARS]){
-		RwMatrix *handle =
-			RwFrameGetLTM(bike->m_aBikeNodes[BIKE_HANDLEBARS]);
-		if(handle)
-			center = CVector(handle->pos);
-	}
+	BikeHandlePose pose;
+	if(!BuildBikeHandlePose(bike, &pose))
+		return false;
+	float controlRadiusOffset = 0.0f;
+	GetVehicleControlAdjustment(bike, nil, &controlRadiusOffset);
 	matrix->SetUnity();
-	matrix->GetRight() = bikeUp*(hand == 0 ? -1.0f : 1.0f);
-	matrix->GetForward() = bikeForward;
+	matrix->GetRight() = pose.up*(hand == 0 ? -1.0f : 1.0f);
+	matrix->GetForward() = pose.forward;
 	matrix->GetUp() =
 		CrossProduct(matrix->GetRight(), matrix->GetForward());
 	matrix->GetUp().Normalise();
-	matrix->GetPosition() = center+
-		bikeRight*((float)calibration->offsetX/200.0f)+
-		bikeForward*((float)calibration->offsetY/200.0f)+
-		bikeUp*((float)calibration->offsetZ/200.0f);
+	float lateral = (float)calibration->offsetX/200.0f+
+		(hand == 0 ? -controlRadiusOffset : controlRadiusOffset);
+	lateral = hand == 0 ? Min(lateral, -0.08f) : Max(lateral, 0.08f);
+	matrix->GetPosition() = pose.center+
+		pose.right*lateral+
+		pose.forward*((float)calibration->offsetY/200.0f)+
+		pose.up*((float)calibration->offsetZ/200.0f);
 	ApplyHandleRotation(matrix, *calibration);
-	if(applySteering && bike->m_fWheelAngle != 0.0f){
-		const float angle = bike->m_fWheelAngle;
-		matrix->GetPosition() = center+RotateAroundAxis(
-			matrix->GetPosition()-center, bikeUp, angle);
+	const float steeringAngle = IsImmersiveBikeActive(bike) ?
+		gImmersiveBikePhysicalAngle : bike->m_fWheelAngle;
+	if(applySteering && steeringAngle != 0.0f){
+		matrix->GetPosition() = pose.center+RotateAroundAxis(
+			matrix->GetPosition()-pose.center, pose.up, steeringAngle);
 		matrix->GetRight() = RotateAroundAxis(
-			matrix->GetRight(), bikeUp, angle);
+			matrix->GetRight(), pose.up, steeringAngle);
 		matrix->GetForward() = RotateAroundAxis(
-			matrix->GetForward(), bikeUp, angle);
+			matrix->GetForward(), pose.up, steeringAngle);
 		matrix->GetUp() = RotateAroundAxis(
-			matrix->GetUp(), bikeUp, angle);
+			matrix->GetUp(), pose.up, steeringAngle);
 	}
 	return true;
 }
 
-static bool
-BuildCarWheelCenter(CAutomobile *car, CVector *center, CVector *axis)
+struct CarWheelPose
 {
-	if(!car || !center || !axis)
+	CVector center;
+	CVector right;
+	CVector up;
+	CVector normal;
+	float radius;
+};
+
+static bool
+BuildCarWheelPose(CAutomobile *car, CarWheelPose *pose)
+{
+	if(!car || !pose)
 		return false;
 	CVehicleModelInfo *model = (CVehicleModelInfo*)
 		CModelInfo::GetModelInfo(car->GetModelIndex());
@@ -605,12 +1099,80 @@ BuildCarWheelCenter(CAutomobile *car, CVector *center, CVector *axis)
 	local.x = -local.x;
 	local.y += 0.33f;
 	local.z += 0.30f;
-	*center = car->GetPosition()+
-		Multiply3x3(car->GetMatrix(), local);
-	*axis = car->GetForward();
-	if(axis->MagnitudeSqr() < 0.0001f)
+	CVector controlCenterOffset;
+	GetVehicleControlAdjustment(car, &controlCenterOffset, nil);
+	local += controlCenterOffset;
+	pose->center = car->GetPosition()+Multiply3x3(car->GetMatrix(), local);
+	pose->normal = car->GetForward();
+	pose->right = car->GetRight();
+	if(pose->normal.MagnitudeSqr() < 0.0001f ||
+	   pose->right.MagnitudeSqr() < 0.0001f)
 		return false;
-	axis->Normalise();
+	pose->normal.Normalise();
+	pose->right -= pose->normal*DotProduct(pose->right, pose->normal);
+	if(pose->right.MagnitudeSqr() < 0.0001f)
+		return false;
+	pose->right.Normalise();
+	pose->up = CrossProduct(pose->right, pose->normal);
+	if(pose->up.MagnitudeSqr() < 0.0001f)
+		return false;
+	pose->up.Normalise();
+	VehicleCategoryCalibration *category = GetCategoryCalibration(car);
+	VehicleViewCalibration *view = GetViewCalibration(car->GetModelIndex());
+	const int pitchHalfDeg = clamp(
+		(category ? category->carWheelPitchHalfDeg : 0)+
+		(view ? view->carWheelPitchHalfDeg : 0),
+		-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+		 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+	const int yawHalfDeg = clamp(
+		(category ? category->carWheelYawHalfDeg : 0)+
+		(view ? view->carWheelYawHalfDeg : 0),
+		-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+		 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+	const int rollHalfDeg = clamp(
+		(category ? category->carWheelRollHalfDeg : 0)+
+		(view ? view->carWheelRollHalfDeg : 0),
+		-VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG,
+		 VR_CAR_WHEEL_MAX_ROTATION_HALF_DEG);
+	const float pitch = DEGTORAD((float)pitchHalfDeg/2.0f);
+	const float yaw = DEGTORAD((float)yawHalfDeg/2.0f);
+	const float roll = DEGTORAD((float)rollHalfDeg/2.0f);
+	if(pitch != 0.0f){
+		pose->normal = RotateAroundAxis(pose->normal, pose->right, pitch);
+		pose->up = RotateAroundAxis(pose->up, pose->right, pitch);
+	}
+	if(yaw != 0.0f){
+		pose->right = RotateAroundAxis(pose->right, pose->up, yaw);
+		pose->normal = RotateAroundAxis(pose->normal, pose->up, yaw);
+	}
+	if(roll != 0.0f){
+		pose->right = RotateAroundAxis(pose->right, pose->normal, roll);
+		pose->up = RotateAroundAxis(pose->up, pose->normal, roll);
+	}
+	pose->normal.Normalise();
+	pose->right -= pose->normal*DotProduct(pose->right, pose->normal);
+	if(pose->right.MagnitudeSqr() < 0.0001f)
+		return false;
+	pose->right.Normalise();
+	pose->up = CrossProduct(pose->right, pose->normal);
+	pose->up.Normalise();
+	int radiusCm = category ? category->carWheelRadiusCm :
+		VR_CAR_WHEEL_DEFAULT_RADIUS_CM;
+	if(view && view->carWheelRadiusCm != 0)
+		radiusCm = view->carWheelRadiusCm;
+	pose->radius = (float)clamp(radiusCm,
+		VR_CAR_WHEEL_MIN_RADIUS_CM, VR_CAR_WHEEL_MAX_RADIUS_CM)/100.0f;
+	return true;
+}
+
+static bool
+BuildCarWheelCenter(CAutomobile *car, CVector *center, CVector *axis)
+{
+	CarWheelPose pose;
+	if(!center || !axis || !BuildCarWheelPose(car, &pose))
+		return false;
+	*center = pose.center;
+	*axis = pose.normal;
 	return true;
 }
 
@@ -621,44 +1183,90 @@ BuildCarWheelMatrix(int hand, CMatrix *matrix, bool applySteering)
 	   !IsVrCarActive())
 		return false;
 	CAutomobile *car = GetActivePlayerCar();
-	HandleCalibration *calibration =
-		GetCarCalibration(car->GetModelIndex(), hand);
-	if(!calibration)
+	CarWheelPose pose;
+	if(!BuildCarWheelPose(car, &pose))
 		return false;
-	CVector center, axis;
-	if(!BuildCarWheelCenter(car, &center, &axis))
-		return false;
-	CVector carRight = car->GetRight();
-	CVector carForward = car->GetForward();
-	CVector carUp = car->GetUp();
-	carRight.Normalise();
-	carForward.Normalise();
-	carUp.Normalise();
 	matrix->SetUnity();
-	matrix->GetRight() = carUp*(hand == 0 ? -1.0f : 1.0f);
-	matrix->GetForward() = carForward;
+	matrix->GetRight() = pose.right;
+	matrix->GetForward() = pose.normal;
 	matrix->GetUp() =
 		CrossProduct(matrix->GetRight(), matrix->GetForward());
 	matrix->GetUp().Normalise();
-	matrix->GetPosition() = center+
-		carRight*((float)calibration->offsetX/200.0f)+
-		carForward*((float)calibration->offsetY/200.0f)+
-		carUp*((float)calibration->offsetZ/200.0f);
-	ApplyHandleRotation(matrix, *calibration);
+	matrix->GetPosition() = pose.center+
+		pose.right*((hand == 0 ? -1.0f : 1.0f)*pose.radius);
 	const float physicalAngle = IsImmersiveCarActive() ?
 		gImmersiveCarPhysicalAngle : gMotionVehiclePhysicalAngle;
 	if(applySteering && physicalAngle != 0.0f){
 		const float angle = -physicalAngle;
-		matrix->GetPosition() = center+RotateAroundAxis(
-			matrix->GetPosition()-center, axis, angle);
+		matrix->GetPosition() = pose.center+RotateAroundAxis(
+			matrix->GetPosition()-pose.center, pose.normal, angle);
 		matrix->GetRight() = RotateAroundAxis(
-			matrix->GetRight(), axis, angle);
+			matrix->GetRight(), pose.normal, angle);
 		matrix->GetForward() = RotateAroundAxis(
-			matrix->GetForward(), axis, angle);
+			matrix->GetForward(), pose.normal, angle);
 		matrix->GetUp() = RotateAroundAxis(
-			matrix->GetUp(), axis, angle);
+			matrix->GetUp(), pose.normal, angle);
 	}
 	return true;
+}
+
+static void
+UpdateImmersiveCarModelSteeringWheelInternal(CVehicle *vehicle)
+{
+	if(!vehicle || !vehicle->IsCar())
+		return;
+	CAutomobile *car = (CAutomobile*)vehicle;
+	RwFrame *wheelFrame = car->m_aCarNodes[CAR_STEERING_WHEEL];
+	if(!wheelFrame || !car->m_bVrSteeringWheelNeutralValid)
+		return;
+
+	float physicalAngle = 0.0f;
+	if(IsImmersiveCarActive(car))
+		physicalAngle = gImmersiveCarPhysicalAngle;
+	else if(IsMotionEnvironmentActive() && IsVrCarActive(car))
+		physicalAngle = gMotionVehiclePhysicalAngle;
+	const float visualAngle = -physicalAngle;
+	if(Abs(visualAngle-car->m_fVrSteeringWheelAppliedAngle) < 0.0001f)
+		return;
+
+	CMatrix wheelMatrix(RwFrameGetMatrix(wheelFrame), false);
+	wheelMatrix.CopyOnlyMatrix(car->m_vrSteeringWheelNeutralMatrix);
+	if(visualAngle != 0.0f){
+		RwFrame *parent = RwFrameGetParent(wheelFrame);
+		CarWheelPose wheelPose;
+		if(!parent || !BuildCarWheelPose(car, &wheelPose)){
+			wheelMatrix.UpdateRW();
+			car->m_fVrSteeringWheelAppliedAngle = 0.0f;
+			return;
+		}
+		// Candidate atomics do not share a common authored local axis or pivot.
+		// Convert the authoritative calibrated wheel centre and normal into the
+		// frame parent's space, then rotate both basis and origin around that pivot.
+		// This also handles DFFs whose isolated wheel geometry is authored in car
+		// coordinates with a zero frame origin; rotating the frame at its own origin
+		// would otherwise swing the wheel through the dashboard.
+		CMatrix parentWorld(RwFrameGetLTM(parent), false);
+		CMatrix inverseParent;
+		Invert(parentWorld, inverseParent);
+		CVector localAxis = Multiply3x3(inverseParent, wheelPose.normal);
+		if(localAxis.MagnitudeSqr() < 0.0001f){
+			wheelMatrix.UpdateRW();
+			car->m_fVrSteeringWheelAppliedAngle = 0.0f;
+			return;
+		}
+		localAxis.Normalise();
+		const CVector localPivot = inverseParent*wheelPose.center;
+		wheelMatrix.GetPosition() = localPivot+RotateAroundAxis(
+			wheelMatrix.GetPosition()-localPivot, localAxis, visualAngle);
+		wheelMatrix.GetRight() = RotateAroundAxis(
+			wheelMatrix.GetRight(), localAxis, visualAngle);
+		wheelMatrix.GetForward() = RotateAroundAxis(
+			wheelMatrix.GetForward(), localAxis, visualAngle);
+		wheelMatrix.GetUp() = RotateAroundAxis(
+			wheelMatrix.GetUp(), localAxis, visualAngle);
+	}
+	wheelMatrix.UpdateRW();
+	car->m_fVrSteeringWheelAppliedAngle = visualAngle;
 }
 
 static float
@@ -684,6 +1292,148 @@ PlanarAngle(const CVector &vector, const CVector &right,
 	return atan2f(DotProduct(vector, up), DotProduct(vector, right));
 }
 
+static bool
+WorldVectorToTracking(const CVector &world, CVector *tracking)
+{
+	if(!tracking)
+		return false;
+	const float source[3] = { world.x, world.y, world.z };
+	float result[3];
+	if(!rw::vulkan::firstPersonWorldVectorToPlay(source, result))
+		return false;
+	*tracking = CVector(result[0], result[1], result[2]);
+	return true;
+}
+
+static bool
+GetTrackingHandPosition(const androidgame::PadInput &input, int hand,
+	CVector *position)
+{
+	if(!position || hand < 0 || hand >= VR_HAND_COUNT ||
+	   !input.gripPose[hand].valid)
+		return false;
+	*position = CVector(input.gripPose[hand].position[0],
+		input.gripPose[hand].position[1],
+		input.gripPose[hand].position[2]);
+	return isfinite(position->x) && isfinite(position->y) &&
+		isfinite(position->z);
+}
+
+static bool
+CaptureBikeOneHandSteering(CBike *bike, uint32 realHandMask,
+	const CVector &neutralChord, const BikeHandlePose &pose,
+	float physicalAngle, const androidgame::PadInput &input)
+{
+	if(!bike || (realHandMask != 1u && realHandMask != 2u))
+		return false;
+	gBikeOneHandSteeringState = BikeOneHandSteeringState();
+	const int hand = realHandMask == 1u ? 0 : 1;
+	CVector handTracking;
+	if(!GetTrackingHandPosition(input, hand, &handTracking))
+		return false;
+
+	CVector rightTracking, forwardTracking;
+	if(!WorldVectorToTracking(pose.right, &rightTracking) ||
+	   !WorldVectorToTracking(pose.forward, &forwardTracking) ||
+	   rightTracking.MagnitudeSqr() < 0.0001f ||
+	   forwardTracking.MagnitudeSqr() < 0.0001f)
+		return false;
+	rightTracking.Normalise();
+	forwardTracking -= rightTracking*
+		DotProduct(forwardTracking, rightTracking);
+	if(forwardTracking.MagnitudeSqr() < 0.0001f)
+		return false;
+	forwardTracking.Normalise();
+
+	CVector seedChord = neutralChord;
+	if(physicalAngle != 0.0f)
+		seedChord = RotateAroundAxis(seedChord, pose.up, physicalAngle);
+	CVector seedTracking;
+	if(!WorldVectorToTracking(seedChord, &seedTracking))
+		return false;
+	const float seedRight = DotProduct(seedTracking, rightTracking);
+	const float seedForward = DotProduct(seedTracking, forwardTracking);
+	if(seedRight*seedRight+seedForward*seedForward <= 0.0001f)
+		return false;
+
+	gBikeOneHandSteeringState.vehicle = bike;
+	gBikeOneHandSteeringState.realHandMask = realHandMask;
+	gBikeOneHandSteeringState.valid = true;
+	gBikeOneHandSteeringState.referenceHandTracking = handTracking;
+	gBikeOneHandSteeringState.seedChordTracking = seedTracking;
+	gBikeOneHandSteeringState.rightTracking = rightTracking;
+	gBikeOneHandSteeringState.forwardTracking = forwardTracking;
+	gBikeOneHandSteeringState.referencePhysicalAngle = physicalAngle;
+	return true;
+}
+
+static bool
+RebaseBikeOneHandSteering(CBike *bike, uint32 realHandMask,
+	float appliedAngle, const androidgame::PadInput &input)
+{
+	if(!bike || !gBikeOneHandSteeringState.valid ||
+	   gBikeOneHandSteeringState.vehicle != bike ||
+	   gBikeOneHandSteeringState.realHandMask != realHandMask ||
+	   (realHandMask != 1u && realHandMask != 2u))
+		return false;
+	const int hand = realHandMask == 1u ? 0 : 1;
+	CVector currentHandTracking;
+	if(!GetTrackingHandPosition(input, hand, &currentHandTracking))
+		return false;
+	CVector steeringAxis = CrossProduct(
+		gBikeOneHandSteeringState.rightTracking,
+		gBikeOneHandSteeringState.forwardTracking);
+	if(steeringAxis.MagnitudeSqr() < 0.0001f)
+		return false;
+	steeringAxis.Normalise();
+	const float appliedDelta = WrapAngle(appliedAngle-
+		gBikeOneHandSteeringState.referencePhysicalAngle);
+	gBikeOneHandSteeringState.seedChordTracking = RotateAroundAxis(
+		gBikeOneHandSteeringState.seedChordTracking, steeringAxis,
+		appliedDelta);
+	gBikeOneHandSteeringState.referenceHandTracking = currentHandTracking;
+	gBikeOneHandSteeringState.referencePhysicalAngle = appliedAngle;
+	return true;
+}
+
+static bool
+SolveBikeOneHandSteering(CBike *bike, uint32 realHandMask,
+	float *desiredAngle, const androidgame::PadInput &input)
+{
+	if(!bike || !desiredAngle || !gBikeOneHandSteeringState.valid ||
+	   gBikeOneHandSteeringState.vehicle != bike ||
+	   gBikeOneHandSteeringState.realHandMask != realHandMask ||
+	   (realHandMask != 1u && realHandMask != 2u))
+		return false;
+	const int hand = realHandMask == 1u ? 0 : 1;
+	CVector currentHandTracking;
+	if(!GetTrackingHandPosition(input, hand, &currentHandTracking))
+		return false;
+	const float handSign = realHandMask == 2u ? 2.0f : -2.0f;
+	const CVector actualChord =
+		gBikeOneHandSteeringState.seedChordTracking+
+		(currentHandTracking-
+		 gBikeOneHandSteeringState.referenceHandTracking)*handSign;
+	const float actualRight = DotProduct(actualChord,
+		gBikeOneHandSteeringState.rightTracking);
+	const float actualForward = DotProduct(actualChord,
+		gBikeOneHandSteeringState.forwardTracking);
+	if(actualRight*actualRight+actualForward*actualForward <= 0.0001f ||
+	   !isfinite(actualChord.x) || !isfinite(actualChord.y) ||
+	   !isfinite(actualChord.z))
+		return false;
+	const float seedAngle = PlanarAngle(
+		gBikeOneHandSteeringState.seedChordTracking,
+		gBikeOneHandSteeringState.rightTracking,
+		gBikeOneHandSteeringState.forwardTracking);
+	const float currentAngle = PlanarAngle(actualChord,
+		gBikeOneHandSteeringState.rightTracking,
+		gBikeOneHandSteeringState.forwardTracking);
+	*desiredAngle = gBikeOneHandSteeringState.referencePhysicalAngle+
+		WrapAngle(currentAngle-seedAngle);
+	return isfinite(*desiredAngle);
+}
+
 static void
 ResetBikeInteraction()
 {
@@ -695,10 +1445,16 @@ ResetBikeInteraction()
 		gBikeLeanReferenceTrackingY[hand] = 0.0f;
 	}
 	gImmersiveBikeSteering = 0.0f;
+	gImmersiveBikePhysicalAngle = 0.0f;
+	gImmersiveBikeDesiredAngle = 0.0f;
+	gImmersiveBikeSteeringOverflow = 0.0f;
 	gImmersiveBikeThrottle = 0.0f;
 	gImmersiveBikeLean = 0.0f;
 	gBikeLeanGestureState = 0;
+	gBikeThrottleGestureActive = false;
 	gBikeThrottleReferenceValid = false;
+	gBikeSteeringChordState = ImmersiveSteeringChordState();
+	gBikeOneHandSteeringState = BikeOneHandSteeringState();
 }
 
 static void
@@ -1003,63 +1759,113 @@ UpdateMotionInput(const androidgame::PadInput &input, bool blocked)
 }
 
 static bool
-GetThrottleOrientation(CVector *orientation, const CVector &axis)
+NormalizeQuaternion(const float input[4], float output[4])
 {
-	CMatrix hand;
-	if(!orientation ||
-	   !GetQuestRawTrackedHandAimMatrix(1, &hand))
+	if(!input || !output)
 		return false;
-	*orientation = hand.GetForward();
-	*orientation -= axis*DotProduct(*orientation, axis);
-	if(orientation->MagnitudeSqr() < 0.01f){
-		*orientation = hand.GetUp();
-		*orientation -= axis*DotProduct(*orientation, axis);
-	}
-	if(orientation->MagnitudeSqr() < 0.01f)
+	const float lengthSqr = input[0]*input[0]+input[1]*input[1]+
+		input[2]*input[2]+input[3]*input[3];
+	if(!isfinite(lengthSqr) || lengthSqr < 0.000001f)
 		return false;
-	orientation->Normalise();
+	const float inverseLength = 1.0f/sqrtf(lengthSqr);
+	for(int i = 0; i < 4; i++)
+		output[i] = input[i]*inverseLength;
 	return true;
 }
 
-static void
-UpdateBikeThrottle(CBike *bike, bool rightGrabbed, float trigger)
+static float
+DotQuaternion(const float a[4], const float b[4])
 {
-	if(!bike || !rightGrabbed || trigger < 0.45f){
+	return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];
+}
+
+static void
+MultiplyQuaternion(const float a[4], const float b[4], float result[4])
+{
+	result[0] = a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1];
+	result[1] = a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0];
+	result[2] = a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3];
+	result[3] = a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2];
+}
+
+static bool
+CaptureBikeThrottleReference(const androidgame::PadInput &input)
+{
+	return input.gripPose[1].valid &&
+		NormalizeQuaternion(input.gripPose[1].orientation,
+			gBikeThrottleReferenceOrientation);
+}
+
+static bool
+GetBikeThrottleTwistAngle(const androidgame::PadInput &input, float *angle)
+{
+	if(!angle || !input.gripPose[1].valid)
+		return false;
+	float current[4];
+	if(!NormalizeQuaternion(input.gripPose[1].orientation, current))
+		return false;
+	if(DotQuaternion(gBikeThrottleReferenceOrientation, current) < 0.0f)
+		for(int i = 0; i < 4; i++) current[i] = -current[i];
+	const float inverseReference[4] = {
+		-gBikeThrottleReferenceOrientation[0],
+		-gBikeThrottleReferenceOrientation[1],
+		-gBikeThrottleReferenceOrientation[2],
+		 gBikeThrottleReferenceOrientation[3]
+	};
+	float relative[4], normalizedRelative[4];
+	MultiplyQuaternion(inverseReference, current, relative);
+	if(!NormalizeQuaternion(relative, normalizedRelative))
+		return false;
+	float twist[4] = { 0.0f, 0.0f, normalizedRelative[2],
+		normalizedRelative[3] };
+	float normalizedTwist[4];
+	if(!NormalizeQuaternion(twist, normalizedTwist))
+		return false;
+	*angle = WrapAngle(2.0f*atan2f(normalizedTwist[2],
+		normalizedTwist[3]));
+	return isfinite(*angle);
+}
+
+static void
+UpdateBikeThrottle(CBike *bike, bool rightGrabbed,
+	const androidgame::PadInput &input)
+{
+	if(!bike || !rightGrabbed || input.rightTrigger < 0.45f){
 		gImmersiveBikeThrottle = 0.0f;
+		gBikeThrottleGestureActive = false;
 		gBikeThrottleReferenceValid = false;
 		return;
 	}
-	CVector axis = bike->GetRight();
-	CVector bikeUp = bike->GetUp();
-	axis = RotateAroundAxis(axis, bikeUp, bike->m_fWheelAngle);
-	axis.Normalise();
-	CVector current;
-	if(!GetThrottleOrientation(&current, axis)){
+	if(!gBikeThrottleGestureActive){
+		gBikeThrottleReferenceValid = CaptureBikeThrottleReference(input);
+		gBikeThrottleGestureActive = gBikeThrottleReferenceValid;
 		gImmersiveBikeThrottle = 0.0f;
-		gBikeThrottleReferenceValid = false;
 		return;
 	}
 	if(!gBikeThrottleReferenceValid){
-		gBikeThrottleReference = current;
-		gBikeThrottleReferenceValid = true;
 		gImmersiveBikeThrottle = 0.0f;
 		return;
 	}
-	const float twist = atan2f(DotProduct(axis,
-		CrossProduct(gBikeThrottleReference, current)),
-		clamp(DotProduct(gBikeThrottleReference, current),
-			-1.0f, 1.0f));
-	const float throttleAngle =
-		Max(twist-DEGTORAD(2.0f), 0.0f);
-	gImmersiveBikeThrottle =
-		clamp(throttleAngle/DEGTORAD(43.0f), 0.0f, 1.0f);
+	float delta;
+	if(!GetBikeThrottleTwistAngle(input, &delta)){
+		gImmersiveBikeThrottle = 0.0f;
+		return;
+	}
+	const float deadZone = DEGTORAD(1.5f);
+	const float fullThrottleAngle = DEGTORAD(43.0f);
+	gImmersiveBikeThrottle = delta <= deadZone ? 0.0f :
+		clamp((delta-deadZone)/(fullThrottleAngle-deadZone),
+			0.0f, 1.0f);
 }
 
 static void
 UpdateBikeLean(CBike *bike, const androidgame::PadInput &input,
 	bool left, bool right)
 {
-	if(!bike || (!left && !right)){
+	// One-hand steering and ordinary reaching must never become a wheelie or
+	// stoppie gesture. Match the PC solver: deliberate lean gestures require
+	// both real hands on the bars.
+	if(!bike || !left || !right){
 		gImmersiveBikeLean = 0.0f;
 		gBikeLeanGestureState = 0;
 		for(int hand = 0; hand < VR_HAND_COUNT; hand++)
@@ -1133,6 +1939,7 @@ UpdateImmersiveBikeInput(const float *grips,
 	CVector positions[VR_HAND_COUNT];
 	bool anchorValid[VR_HAND_COUNT] = {};
 	bool poseValid[VR_HAND_COUNT] = {};
+	bool justGrabbed[VR_HAND_COUNT] = {};
 	for(int hand = 0; hand < VR_HAND_COUNT; hand++){
 		anchorValid[hand] =
 			BuildBikeHandleMatrix(hand, &anchors[hand], false);
@@ -1156,6 +1963,7 @@ UpdateImmersiveBikeInput(const float *grips,
 		   grips[hand] >= 0.65f && !gBikeHandleGripDown[hand] &&
 		   gBikeHandleDistance[hand] <= 0.17f){
 			gBikeHandleGrabbed[hand] = true;
+			justGrabbed[hand] = true;
 			gBikeLeanReferenceValid[hand] = false;
 		}
 		if(grips[hand] <= 0.30f)
@@ -1167,31 +1975,126 @@ UpdateImmersiveBikeInput(const float *grips,
 		gBikeHandleGrabbed[0] && anchorValid[0];
 	const bool right =
 		gBikeHandleGrabbed[1] && anchorValid[1];
-	float steeringAngle = 0.0f;
-	CVector bikeRight = bike->GetRight();
-	CVector bikeForward = bike->GetForward();
-	bikeRight.Normalise();
-	bikeForward.Normalise();
-	if(left && right){
-		const CVector neutral =
-			anchors[1].GetPosition()-anchors[0].GetPosition();
-		const CVector actual = positions[1]-positions[0];
-		steeringAngle = WrapAngle(
-			PlanarAngle(actual, bikeRight, bikeForward)-
-			PlanarAngle(neutral, bikeRight, bikeForward));
-	}else if(left || right){
-		const int hand = left ? 0 : 1;
-		const CVector center =
-			(anchors[0].GetPosition()+
-			 anchors[1].GetPosition())*0.5f;
-		const CVector neutral =
-			anchors[hand].GetPosition()-center;
-		const CVector actual = positions[hand]-center;
-		steeringAngle = WrapAngle(
-			PlanarAngle(actual, bikeRight, bikeForward)-
-			PlanarAngle(neutral, bikeRight, bikeForward));
+	const uint32 realHandMask =
+		(left ? 1u : 0u) | (right ? 2u : 0u);
+	BikeHandlePose handlePose;
+	if(!BuildBikeHandlePose(bike, &handlePose)){
+		ResetBikeInteraction();
+		return 0;
 	}
 	const float maxSteering = DEGTORAD(35.0f);
+	gImmersiveBikeDesiredAngle = 0.0f;
+	gImmersiveBikeSteeringOverflow = 0.0f;
+	float steeringAngle = 0.0f;
+	if(realHandMask != 0u){
+		const CVector neutral =
+			anchors[1].GetPosition()-anchors[0].GetPosition();
+		if(realHandMask == 3u){
+			gBikeOneHandSteeringState = BikeOneHandSteeringState();
+			const CVector actual = positions[1]-positions[0];
+			const float neutralRight = DotProduct(neutral, handlePose.right);
+			const float neutralForward = DotProduct(neutral, handlePose.forward);
+			const float actualRight = DotProduct(actual, handlePose.right);
+			const float actualForward = DotProduct(actual, handlePose.forward);
+			const bool pointValid =
+				neutralRight*neutralRight+neutralForward*neutralForward > 0.0001f &&
+				actualRight*actualRight+actualForward*actualForward > 0.0001f &&
+				isfinite(actual.x) && isfinite(actual.y) && isfinite(actual.z);
+			float rawAngle = 0.0f;
+			if(pointValid)
+				rawAngle = WrapAngle(
+					PlanarAngle(actual, handlePose.right, handlePose.forward)-
+					PlanarAngle(neutral, handlePose.right, handlePose.forward));
+			if(pointValid){
+				const bool ownershipChanged =
+					!gBikeSteeringChordState.valid ||
+					gBikeSteeringChordState.vehicle != bike ||
+					gBikeSteeringChordState.realHandMask != realHandMask ||
+					justGrabbed[0] || justGrabbed[1];
+				if(ownershipChanged){
+					const uint32 captures =
+						gBikeSteeringChordState.captureCount+1;
+					gBikeSteeringChordState = ImmersiveSteeringChordState();
+					gBikeSteeringChordState.vehicle = bike;
+					gBikeSteeringChordState.realHandMask = realHandMask;
+					gBikeSteeringChordState.captureCount = captures;
+					gBikeSteeringChordState.valid = true;
+					// A newly added second hand owns a new chord. Latch it to the
+					// angle already applied by the one-hand solver, otherwise the
+					// first two-hand frame can become an instant steering impulse.
+					gBikeSteeringChordState.referenceActive = true;
+					gBikeSteeringChordState.referenceAngle =
+						WrapAngle(rawAngle-gImmersiveBikePhysicalAngle);
+				}
+				steeringAngle = gBikeSteeringChordState.referenceActive ?
+					WrapAngle(rawAngle-gBikeSteeringChordState.referenceAngle) :
+					rawAngle;
+				const float physicalDelta = WrapAngle(
+					steeringAngle-gImmersiveBikePhysicalAngle);
+				const bool discontinuity = !isfinite(steeringAngle) ||
+					Abs(physicalDelta) > DEGTORAD(45.0f);
+				const float desiredAngle = steeringAngle;
+				steeringAngle = discontinuity ? gImmersiveBikePhysicalAngle :
+					clamp(desiredAngle, -maxSteering, maxSteering);
+				if(discontinuity || steeringAngle != desiredAngle){
+					gBikeSteeringChordState.referenceAngle =
+						WrapAngle(rawAngle-steeringAngle);
+					gBikeSteeringChordState.referenceActive = true;
+				}
+			}else{
+				const uint32 captures = gBikeSteeringChordState.captureCount;
+				gBikeSteeringChordState = ImmersiveSteeringChordState();
+				gBikeSteeringChordState.captureCount = captures;
+				gBikeSteeringChordState.rebaseOnNextValid = true;
+				steeringAngle = gImmersiveBikePhysicalAngle;
+			}
+		}else{
+			const bool ownershipChanged =
+				!gBikeOneHandSteeringState.valid ||
+				gBikeOneHandSteeringState.vehicle != bike ||
+				gBikeOneHandSteeringState.realHandMask != realHandMask ||
+				!gBikeSteeringChordState.valid ||
+				gBikeSteeringChordState.vehicle != bike ||
+				gBikeSteeringChordState.realHandMask != realHandMask ||
+				justGrabbed[realHandMask == 1u ? 0 : 1];
+			if(ownershipChanged){
+				const uint32 captures = gBikeSteeringChordState.captureCount+1;
+				gBikeSteeringChordState = ImmersiveSteeringChordState();
+				gBikeSteeringChordState.vehicle = bike;
+				gBikeSteeringChordState.realHandMask = realHandMask;
+				gBikeSteeringChordState.captureCount = captures;
+				gBikeSteeringChordState.valid = CaptureBikeOneHandSteering(
+					bike, realHandMask, neutral, handlePose,
+					gImmersiveBikePhysicalAngle, input);
+				gBikeSteeringChordState.referenceActive = true;
+			}
+			float desiredAngle = gImmersiveBikePhysicalAngle;
+			const bool pointValid = gBikeSteeringChordState.valid &&
+				SolveBikeOneHandSteering(bike, realHandMask,
+					&desiredAngle, input);
+			steeringAngle = desiredAngle;
+			gImmersiveBikeDesiredAngle = desiredAngle;
+			const float physicalDelta = WrapAngle(
+				desiredAngle-gImmersiveBikePhysicalAngle);
+			const bool discontinuity = !pointValid || !isfinite(desiredAngle) ||
+				Abs(physicalDelta) > DEGTORAD(45.0f);
+			steeringAngle = discontinuity ? gImmersiveBikePhysicalAngle :
+				clamp(desiredAngle, -maxSteering, maxSteering);
+			gImmersiveBikeSteeringOverflow =
+				WrapAngle(desiredAngle-steeringAngle);
+			if(discontinuity || steeringAngle != desiredAngle){
+				gBikeSteeringChordState.valid = RebaseBikeOneHandSteering(
+					bike, realHandMask, steeringAngle, input);
+				gBikeSteeringChordState.captureCount++;
+			}
+		}
+		gImmersiveBikePhysicalAngle = clamp(
+			steeringAngle, -maxSteering, maxSteering);
+	}else{
+		gBikeSteeringChordState = ImmersiveSteeringChordState();
+		gBikeOneHandSteeringState = BikeOneHandSteeringState();
+		gImmersiveBikePhysicalAngle = 0.0f;
+	}
 	float steering =
 		clamp(steeringAngle/maxSteering, -1.0f, 1.0f);
 	const float deadZone = 0.035f;
@@ -1202,7 +2105,7 @@ UpdateImmersiveBikeInput(const float *grips,
 			(Abs(steering)-deadZone)/(1.0f-deadZone);
 	gImmersiveBikeSteering = steering;
 	UpdateBikeLean(bike, input, left, right);
-	UpdateBikeThrottle(bike, right, input.rightTrigger);
+	UpdateBikeThrottle(bike, right, input);
 	return (left ? 1u : 0u) | (right ? 2u : 0u);
 }
 
@@ -1228,12 +2131,30 @@ MapHornToPad(CControllerState *state)
 }
 
 static void
+MapHandbrakeToPad(CControllerState *state, bool pressed)
+{
+	if(!state || !pressed)
+		return;
+	switch(CPad::GetPad(0)->GetMode()){
+	case 2:
+		state->Triangle = Max(state->Triangle, (int16)255);
+		break;
+	case 3:
+		state->LeftShoulder1 = Max(state->LeftShoulder1, (int16)255);
+		break;
+	default:
+		state->RightShoulder1 = Max(state->RightShoulder1, (int16)255);
+		break;
+	}
+}
+
+static void
 MapDefaultDriveBy(CControllerState *state,
 	const androidgame::PadInput &input, bool blocked)
 {
 	CVehicle *vehicle = FindPlayerVehicle();
 	if(!state || blocked || !vehicle ||
-	   gDrivingType != VR_DRIVING_DEFAULT)
+	   GetDrivingTypeForVehicle(vehicle) != VR_DRIVING_DEFAULT)
 		return;
 	const bool left = input.b &&
 		input.leftGrip >= 0.55f && input.rightGrip < 0.55f;
@@ -1282,11 +2203,15 @@ UpdateQuestDrivingInput(CControllerState *state, bool blocked)
 	gVrRadioButtonDown = radioPressed;
 	if(vehicle && !blocked){
 		// X is a dedicated radio edge in VR. Preserve L2 brake/reverse, but
-		// remove CapturePad's face-X contribution to Square. CapturePad already
+		// remove CapturePad's face-X contribution to Square. A is the dedicated
+		// VR handbrake; acceleration remains on R2, so remove its legacy Cross
+		// contribution too. CapturePad already
 		// cleared every game input while the VR menu owns the controllers, so
 		// never reconstruct L2 from the raw state in that case.
 		state->Square = (int16)(clamp(
 			input.leftTrigger, 0.0f, 1.0f)*255.0f);
+		state->Cross = (int16)(clamp(
+			input.rightTrigger, 0.0f, 1.0f)*255.0f);
 	}
 	MapDefaultDriveBy(state, input, blocked);
 
@@ -1311,6 +2236,9 @@ UpdateQuestDrivingInput(CControllerState *state, bool blocked)
 			state->RightShoulder1 = 0;
 	}
 	MapHornToPad(state);
+	// Apply this after physical-grip cleanup: grabbed steering hands must not
+	// erase the explicit face-button handbrake.
+	MapHandbrakeToPad(state, vehicle && !blocked && input.a);
 	return captured;
 }
 
@@ -1322,6 +2250,12 @@ ResetQuestDrivingInteraction()
 	ResetMotionInteraction();
 	gVrRadioButtonDown = false;
 	gVrRadioChangeJustPressed = false;
+}
+
+void
+UpdateImmersiveCarModelSteeringWheel(CVehicle *vehicle)
+{
+	UpdateImmersiveCarModelSteeringWheelInternal(vehicle);
 }
 
 bool IsImmersiveDrivingActive() { return IsVrDrivingActive(); }
@@ -1473,49 +2407,133 @@ IsImmersiveVehicleSidearm(int weaponType)
 	}
 }
 
-int
-GetQuestDrivingType()
+static const char *
+DrivingTypeName(int type)
 {
-	LoadDrivingSettings();
-	return gDrivingType;
-}
-
-const char *
-GetQuestDrivingTypeName()
-{
-	LoadDrivingSettings();
-	switch(gDrivingType){
+	switch(type){
 	case VR_DRIVING_IMMERSIVE: return "IMMERSIVE";
 	case VR_DRIVING_MOTION: return "MOTION";
 	default: return "DEFAULT";
 	}
 }
 
-void
-CycleQuestDrivingType(int direction)
+const char *
+GetQuestCarDrivingTypeName()
 {
 	LoadDrivingSettings();
-	gDrivingType =
-		(gDrivingType+VR_DRIVING_TYPE_COUNT+
+	return DrivingTypeName(gCarDrivingType);
+}
+
+const char *
+GetQuestBikeDrivingTypeName()
+{
+	LoadDrivingSettings();
+	return DrivingTypeName(gBikeDrivingType);
+}
+
+void
+CycleQuestCarDrivingType(int direction)
+{
+	LoadDrivingSettings();
+	gCarDrivingType =
+		(gCarDrivingType+VR_DRIVING_TYPE_COUNT+
 		 (direction < 0 ? -1 : 1)) % VR_DRIVING_TYPE_COUNT;
-	SaveSetting("DrivingType", gDrivingType);
+	SaveSetting("CarDrivingType", gCarDrivingType);
 	ResetQuestDrivingInteraction();
 }
 
-int
-GetQuestDrivingYOffsetCm()
+void
+CycleQuestBikeDrivingType(int direction)
 {
 	LoadDrivingSettings();
-	return gDrivingYOffsetCm;
+	gBikeDrivingType =
+		(gBikeDrivingType+VR_DRIVING_TYPE_COUNT+
+		 (direction < 0 ? -1 : 1)) % VR_DRIVING_TYPE_COUNT;
+	SaveSetting("BikeDrivingType", gBikeDrivingType);
+	ResetQuestDrivingInteraction();
+}
+
+static int
+GetDefaultVehicleViewTypeForCurrentVehicle()
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	if(!vehicle || GetDrivingTypeForVehicle(vehicle) != VR_DRIVING_DEFAULT)
+		return -1;
+	if(vehicle->IsBike())
+		return VR_DEFAULT_VIEW_BIKE;
+	if(vehicle->IsCar() && !vehicle->IsRealHeli() && !vehicle->IsRealPlane())
+		return VR_DEFAULT_VIEW_CAR;
+	return -1;
+}
+
+bool
+HasQuestDefaultVehicleViewOffsetTarget()
+{
+	LoadDrivingSettings();
+	return GetDefaultVehicleViewTypeForCurrentVehicle() >= 0;
+}
+
+const char *
+GetQuestDefaultVehicleViewOffsetName()
+{
+	LoadDrivingSettings();
+	return GetDefaultVehicleViewTypeForCurrentVehicle() ==
+		VR_DEFAULT_VIEW_BIKE ? "BIKE" : "CAR";
+}
+
+int
+GetQuestDefaultVehicleSeatHeightCm()
+{
+	LoadDrivingSettings();
+	const int type = GetDefaultVehicleViewTypeForCurrentVehicle();
+	return type >= 0 ? gDefaultVehicleViewOffset[type].seatHeightCm : 0;
+}
+
+int
+GetQuestDefaultVehicleSeatDistanceCm()
+{
+	LoadDrivingSettings();
+	const int type = GetDefaultVehicleViewTypeForCurrentVehicle();
+	return type >= 0 ? gDefaultVehicleViewOffset[type].seatDistanceCm : 0;
 }
 
 void
-AdjustQuestDrivingYOffsetCm(int direction)
+AdjustQuestDefaultVehicleSeatHeightCm(int direction)
 {
 	LoadDrivingSettings();
-	gDrivingYOffsetCm = clamp(
-		gDrivingYOffsetCm+(direction < 0 ? -5 : 5), -100, 150);
-	SaveSetting("DrivingYOffsetCm", gDrivingYOffsetCm);
+	const int type = GetDefaultVehicleViewTypeForCurrentVehicle();
+	if(type < 0 || direction == 0)
+		return;
+	DefaultVehicleViewOffset &offset = gDefaultVehicleViewOffset[type];
+	offset.seatHeightCm = clamp(offset.seatHeightCm+direction, -100, 150);
+	SaveSetting(type == VR_DEFAULT_VIEW_BIKE ?
+		"DefaultBikeSeatHeightCm" : "DefaultCarSeatHeightCm",
+		offset.seatHeightCm);
+}
+
+void
+AdjustQuestDefaultVehicleSeatDistanceCm(int direction)
+{
+	LoadDrivingSettings();
+	const int type = GetDefaultVehicleViewTypeForCurrentVehicle();
+	if(type < 0 || direction == 0)
+		return;
+	DefaultVehicleViewOffset &offset = gDefaultVehicleViewOffset[type];
+	offset.seatDistanceCm = clamp(offset.seatDistanceCm+direction, -100, 100);
+	SaveSetting(type == VR_DEFAULT_VIEW_BIKE ?
+		"DefaultBikeSeatDistanceCm" : "DefaultCarSeatDistanceCm",
+		offset.seatDistanceCm);
+}
+
+const char *
+GetQuestVehicleCategoryName()
+{
+	static const char *const names[VR_VEHICLE_CATEGORY_COUNT] = {
+		"CAR", "BIKE", "BOAT", "HELI"
+	};
+	const int category = GetVehicleCategory(FindPlayerVehicle());
+	return category >= 0 && category < VR_VEHICLE_CATEGORY_COUNT ?
+		names[category] : "VEHICLE";
 }
 
 bool
@@ -1526,8 +2544,29 @@ HasQuestVehicleSeatCalibrationTarget()
 		vehicle->GetModelIndex()) != nil;
 }
 
-int
-GetQuestVehicleSeatDistanceCm()
+int GetQuestVehicleGlobalSeatHeightCm()
+{
+	VehicleCategoryCalibration *calibration =
+		GetCategoryCalibration(FindPlayerVehicle());
+	return calibration ? calibration->seatHeightCm : 0;
+}
+
+int GetQuestVehicleGlobalSeatDistanceCm()
+{
+	VehicleCategoryCalibration *calibration =
+		GetCategoryCalibration(FindPlayerVehicle());
+	return calibration ? calibration->seatDistanceCm : 0;
+}
+
+int GetQuestVehicleModelSeatHeightCm()
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	VehicleViewCalibration *calibration = vehicle ?
+		GetViewCalibration(vehicle->GetModelIndex()) : nil;
+	return calibration ? calibration->seatHeightCm : 0;
+}
+
+int GetQuestVehicleModelSeatDistanceCm()
 {
 	CVehicle *vehicle = FindPlayerVehicle();
 	VehicleViewCalibration *calibration = vehicle ?
@@ -1535,22 +2574,62 @@ GetQuestVehicleSeatDistanceCm()
 	return calibration ? calibration->seatDistanceCm : 0;
 }
 
-void
-AdjustQuestVehicleSeatDistanceCm(int direction)
+static void
+AdjustQuestVehicleCategorySeat(const char *suffix, int *value, int direction,
+	int minimum, int maximum)
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	const int category = GetVehicleCategory(vehicle);
+	if(!value || category < 0 || direction == 0)
+		return;
+	*value = clamp(*value+direction, minimum, maximum);
+	SaveCategoryCalibrationValue(category, suffix, *value);
+}
+
+void AdjustQuestVehicleGlobalSeatHeightCm(int direction)
+{
+	VehicleCategoryCalibration *calibration =
+		GetCategoryCalibration(FindPlayerVehicle());
+	if(calibration) AdjustQuestVehicleCategorySeat("SeatHeightCm",
+		&calibration->seatHeightCm, direction, -100, 150);
+}
+
+void AdjustQuestVehicleGlobalSeatDistanceCm(int direction)
+{
+	VehicleCategoryCalibration *calibration =
+		GetCategoryCalibration(FindPlayerVehicle());
+	if(calibration) AdjustQuestVehicleCategorySeat("SeatDistanceCm",
+		&calibration->seatDistanceCm, direction, -100, 100);
+}
+
+static void
+AdjustQuestVehicleModelSeat(const char *key, int *value, int direction)
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	if(!vehicle || !value || direction == 0)
+		return;
+	*value = clamp(*value+direction, -100, 100);
+	SaveViewCalibrationValue(vehicle->GetModelIndex(), key, *value);
+}
+
+void AdjustQuestVehicleModelSeatHeightCm(int direction)
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	VehicleViewCalibration *calibration = vehicle ?
+		GetViewCalibration(vehicle->GetModelIndex()) : nil;
+	if(calibration) AdjustQuestVehicleModelSeat("SeatHeightCm",
+		&calibration->seatHeightCm, direction);
+}
+
+void AdjustQuestVehicleModelSeatDistanceCm(int direction)
 {
 	CVehicle *vehicle = FindPlayerVehicle();
 	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
 	if(!calibration)
 		return;
-	calibration->seatDistanceCm = clamp(
-		calibration->seatDistanceCm+
-		(direction < 0 ? -1 : 1), -100, 100);
-	char section[64], value[32];
-	sprintf(section, "VehicleView_%d", vehicle->GetModelIndex());
-	sprintf(value, "%d", calibration->seatDistanceCm);
-	WritePrivateProfileStringA(section, "SeatDistanceCm",
-		value, kSettingsPath);
+	AdjustQuestVehicleModelSeat("SeatDistanceCm",
+		&calibration->seatDistanceCm, direction);
 }
 
 int
@@ -1567,6 +2646,50 @@ ToggleQuestMotionSteeringHand()
 	gMotionSteeringHand = 1-gMotionSteeringHand;
 	SaveSetting("MotionSteeringHand", gMotionSteeringHand);
 	ResetMotionInteraction();
+}
+
+bool IsQuestImmersiveCarWheelVisible()
+{
+	LoadDrivingSettings();
+	return gImmersiveCarWheelVisible;
+}
+
+bool ShouldRenderQuestImmersiveCarWheel()
+{
+	LoadDrivingSettings();
+	CVehicle *vehicle = FindPlayerVehicle();
+	VehicleViewCalibration *calibration = vehicle && vehicle->IsCar() ?
+		GetViewCalibration(vehicle->GetModelIndex()) : nil;
+	return gImmersiveCarWheelVisible &&
+		(!calibration || calibration->carWheelVisibilityOverride != 0);
+}
+
+void ToggleQuestImmersiveCarWheelVisible()
+{
+	LoadDrivingSettings();
+	gImmersiveCarWheelVisible = !gImmersiveCarWheelVisible;
+	SaveSetting("ImmersiveCarWheelVisible", gImmersiveCarWheelVisible);
+}
+
+const char *GetQuestVehicleModelWheelVisibilityName()
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	VehicleViewCalibration *calibration = vehicle && vehicle->IsCar() ?
+		GetViewCalibration(vehicle->GetModelIndex()) : nil;
+	if(!calibration) return "ENTER CAR";
+	return calibration->carWheelVisibilityOverride == 0 ? "HIDE" : "INHERIT";
+}
+
+void ToggleQuestVehicleModelWheelVisibility()
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	VehicleViewCalibration *calibration = vehicle && vehicle->IsCar() ?
+		GetViewCalibration(vehicle->GetModelIndex()) : nil;
+	if(!calibration) return;
+	calibration->carWheelVisibilityOverride =
+		calibration->carWheelVisibilityOverride == 0 ? -1 : 0;
+	SaveViewCalibrationValue(vehicle->GetModelIndex(), "VirtualWheelVisibility",
+		calibration->carWheelVisibilityOverride);
 }
 
 bool
@@ -1623,7 +2746,82 @@ int
 GetQuestVehicleCalibrationItemCount()
 {
 	// Editable rows only. The menu owns its trailing Back row.
-	return IsImmersiveCarActive() ? 7 : 9;
+	return IsImmersiveCarActive() ? 14 : 17;
+}
+
+int
+GetQuestVehicleCalibrationItemForRow(int row)
+{
+	static const int bikeItems[] = {
+		QUEST_VEHICLE_CAL_HAND,
+		QUEST_VEHICLE_CAL_OFFSET_X, QUEST_VEHICLE_CAL_OFFSET_Y,
+		QUEST_VEHICLE_CAL_OFFSET_Z, QUEST_VEHICLE_CAL_ROT_X,
+		QUEST_VEHICLE_CAL_ROT_Y, QUEST_VEHICLE_CAL_ROT_Z,
+		QUEST_VEHICLE_CAL_GLOBAL_CENTER_X,
+		QUEST_VEHICLE_CAL_GLOBAL_CENTER_Y,
+		QUEST_VEHICLE_CAL_GLOBAL_CENTER_Z,
+		QUEST_VEHICLE_CAL_GLOBAL_RADIUS,
+		QUEST_VEHICLE_CAL_MODEL_CENTER_X,
+		QUEST_VEHICLE_CAL_MODEL_CENTER_Y,
+		QUEST_VEHICLE_CAL_MODEL_CENTER_Z,
+		QUEST_VEHICLE_CAL_MODEL_RADIUS,
+		QUEST_VEHICLE_CAL_WHEELIE_HEIGHT,
+		QUEST_VEHICLE_CAL_STAND_HEIGHT
+	};
+	static const int carItems[] = {
+		QUEST_VEHICLE_CAL_GLOBAL_CENTER_X,
+		QUEST_VEHICLE_CAL_GLOBAL_CENTER_Y,
+		QUEST_VEHICLE_CAL_GLOBAL_CENTER_Z,
+		QUEST_VEHICLE_CAL_GLOBAL_RADIUS,
+		QUEST_VEHICLE_CAL_GLOBAL_PITCH,
+		QUEST_VEHICLE_CAL_GLOBAL_YAW,
+		QUEST_VEHICLE_CAL_GLOBAL_ROLL,
+		QUEST_VEHICLE_CAL_MODEL_CENTER_X,
+		QUEST_VEHICLE_CAL_MODEL_CENTER_Y,
+		QUEST_VEHICLE_CAL_MODEL_CENTER_Z,
+		QUEST_VEHICLE_CAL_MODEL_RADIUS,
+		QUEST_VEHICLE_CAL_MODEL_PITCH,
+		QUEST_VEHICLE_CAL_MODEL_YAW,
+		QUEST_VEHICLE_CAL_MODEL_ROLL
+	};
+	if(IsImmersiveCarActive())
+		return row >= 0 && row < (int)ARRAY_SIZE(carItems) ?
+			carItems[row] : -1;
+	return row >= 0 && row < (int)ARRAY_SIZE(bikeItems) ?
+		bikeItems[row] : -1;
+}
+
+const char *
+GetQuestVehicleCalibrationItemName(int item)
+{
+	static const char *const names[QUEST_VEHICLE_CAL_ITEM_COUNT] = {
+		"EDIT HANDLE", "LOCAL X OFFSET", "LOCAL Y OFFSET",
+		"LOCAL Z OFFSET", "LOCAL ROT X", "LOCAL ROT Y", "LOCAL ROT Z",
+		"GLOBAL CENTER X", "GLOBAL CENTER Y", "GLOBAL CENTER Z",
+		"GLOBAL RADIUS", "MODEL CENTER X", "MODEL CENTER Y",
+		"MODEL CENTER Z", "MODEL RADIUS", "GLOBAL WHEEL PITCH",
+		"GLOBAL WHEEL YAW", "GLOBAL WHEEL ROLL", "MODEL WHEEL PITCH",
+		"MODEL WHEEL YAW", "MODEL WHEEL ROLL", "WHEELIE HAND HEIGHT",
+		"STAND HAND DROP"
+	};
+	return item >= 0 && item < QUEST_VEHICLE_CAL_ITEM_COUNT ?
+		names[item] : "VALUE";
+}
+
+bool IsQuestVehicleCalibrationRotation(int item)
+{
+	return (item >= QUEST_VEHICLE_CAL_ROT_X &&
+		item <= QUEST_VEHICLE_CAL_ROT_Z) ||
+		(item >= QUEST_VEHICLE_CAL_GLOBAL_PITCH &&
+		 item <= QUEST_VEHICLE_CAL_MODEL_ROLL);
+}
+
+bool IsQuestVehicleCalibrationWholeCentimeters(int item)
+{
+	return (item >= QUEST_VEHICLE_CAL_GLOBAL_CENTER_X &&
+		item <= QUEST_VEHICLE_CAL_MODEL_RADIUS) ||
+		item == QUEST_VEHICLE_CAL_WHEELIE_HEIGHT ||
+		item == QUEST_VEHICLE_CAL_STAND_HEIGHT;
 }
 
 int
@@ -1635,20 +2833,36 @@ GetQuestVehicleCalibrationValue(int hand, int item)
 	const bool bike = vehicle->IsBike();
 	HandleCalibration *calibration = bike ?
 		GetBikeCalibration(vehicle->GetModelIndex(), hand) :
-		GetCarCalibration(vehicle->GetModelIndex(), hand);
+		nil;
 	BikeLeanCalibration *lean = bike ?
 		GetBikeLeanCalibration(vehicle->GetModelIndex()) : nil;
+	VehicleCategoryCalibration *category = GetCategoryCalibration(vehicle);
+	VehicleViewCalibration *view = GetViewCalibration(vehicle->GetModelIndex());
 	if(item == QUEST_VEHICLE_CAL_HAND)
 		return hand;
-	if(!calibration)
-		return 0;
 	switch(item){
-	case QUEST_VEHICLE_CAL_OFFSET_X: return calibration->offsetX;
-	case QUEST_VEHICLE_CAL_OFFSET_Y: return calibration->offsetY;
-	case QUEST_VEHICLE_CAL_OFFSET_Z: return calibration->offsetZ;
-	case QUEST_VEHICLE_CAL_ROT_X: return calibration->rotationX;
-	case QUEST_VEHICLE_CAL_ROT_Y: return calibration->rotationY;
-	case QUEST_VEHICLE_CAL_ROT_Z: return calibration->rotationZ;
+	case QUEST_VEHICLE_CAL_OFFSET_X: return calibration ? calibration->offsetX : 0;
+	case QUEST_VEHICLE_CAL_OFFSET_Y: return calibration ? calibration->offsetY : 0;
+	case QUEST_VEHICLE_CAL_OFFSET_Z: return calibration ? calibration->offsetZ : 0;
+	case QUEST_VEHICLE_CAL_ROT_X: return calibration ? calibration->rotationX : 0;
+	case QUEST_VEHICLE_CAL_ROT_Y: return calibration ? calibration->rotationY : 0;
+	case QUEST_VEHICLE_CAL_ROT_Z: return calibration ? calibration->rotationZ : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_CENTER_X: return category ? category->wheelCenterXCm : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_CENTER_Y: return category ? category->wheelCenterYCm : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_CENTER_Z: return category ? category->wheelCenterZCm : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_RADIUS: return category ?
+		(bike ? category->wheelRadiusCm : category->carWheelRadiusCm) : 0;
+	case QUEST_VEHICLE_CAL_MODEL_CENTER_X: return view ? view->wheelCenterXCm : 0;
+	case QUEST_VEHICLE_CAL_MODEL_CENTER_Y: return view ? view->wheelCenterYCm : 0;
+	case QUEST_VEHICLE_CAL_MODEL_CENTER_Z: return view ? view->wheelCenterZCm : 0;
+	case QUEST_VEHICLE_CAL_MODEL_RADIUS: return view ?
+		(bike ? view->wheelRadiusCm : view->carWheelRadiusCm) : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_PITCH: return category ? category->carWheelPitchHalfDeg : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_YAW: return category ? category->carWheelYawHalfDeg : 0;
+	case QUEST_VEHICLE_CAL_GLOBAL_ROLL: return category ? category->carWheelRollHalfDeg : 0;
+	case QUEST_VEHICLE_CAL_MODEL_PITCH: return view ? view->carWheelPitchHalfDeg : 0;
+	case QUEST_VEHICLE_CAL_MODEL_YAW: return view ? view->carWheelYawHalfDeg : 0;
+	case QUEST_VEHICLE_CAL_MODEL_ROLL: return view ? view->carWheelRollHalfDeg : 0;
 	case QUEST_VEHICLE_CAL_WHEELIE_HEIGHT:
 		return lean ? lean->wheelieHeightCm : 0;
 	case QUEST_VEHICLE_CAL_STAND_HEIGHT:
@@ -1669,32 +2883,65 @@ AdjustQuestVehicleCalibrationValue(int hand, int item, int direction)
 	const int model = vehicle->GetModelIndex();
 	HandleCalibration *calibration = bike ?
 		GetBikeCalibration(model, hand) :
-		GetCarCalibration(model, hand);
+		nil;
 	BikeLeanCalibration *lean = bike ?
 		GetBikeLeanCalibration(model) : nil;
-	if(!calibration)
-		return;
-	const int step = direction < 0 ? -1 : 1;
+	VehicleCategoryCalibration *category = GetCategoryCalibration(vehicle);
+	VehicleViewCalibration *view = GetViewCalibration(model);
+	const int categoryIndex = GetVehicleCategory(vehicle);
+	const int step = direction;
 	const char *key = nil;
 	int *value = nil;
 	int minimum = -300;
 	int maximum = 300;
 	switch(item){
 	case QUEST_VEHICLE_CAL_OFFSET_X:
-		key = "OffsetX"; value = &calibration->offsetX; break;
+		if(calibration){ key = "OffsetX"; value = &calibration->offsetX; } break;
 	case QUEST_VEHICLE_CAL_OFFSET_Y:
-		key = "OffsetY"; value = &calibration->offsetY; break;
+		if(calibration){ key = "OffsetY"; value = &calibration->offsetY; } break;
 	case QUEST_VEHICLE_CAL_OFFSET_Z:
-		key = "OffsetZ"; value = &calibration->offsetZ; break;
+		if(calibration){ key = "OffsetZ"; value = &calibration->offsetZ; } break;
 	case QUEST_VEHICLE_CAL_ROT_X:
-		key = "RotationX"; value = &calibration->rotationX;
+		if(calibration){ key = "RotationX"; value = &calibration->rotationX; }
 		minimum = -720; maximum = 720; break;
 	case QUEST_VEHICLE_CAL_ROT_Y:
-		key = "RotationY"; value = &calibration->rotationY;
+		if(calibration){ key = "RotationY"; value = &calibration->rotationY; }
 		minimum = -720; maximum = 720; break;
 	case QUEST_VEHICLE_CAL_ROT_Z:
-		key = "RotationZ"; value = &calibration->rotationZ;
+		if(calibration){ key = "RotationZ"; value = &calibration->rotationZ; }
 		minimum = -720; maximum = 720; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_CENTER_X:
+		key="WheelCenterXCm"; value=category ? &category->wheelCenterXCm:nil; minimum=-100; maximum=100; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_CENTER_Y:
+		key="WheelCenterYCm"; value=category ? &category->wheelCenterYCm:nil; minimum=-100; maximum=100; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_CENTER_Z:
+		key="WheelCenterZCm"; value=category ? &category->wheelCenterZCm:nil; minimum=-100; maximum=100; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_RADIUS:
+		key=bike?"WheelRadiusCm":"WheelRadiusV2Cm";
+		value=category ? (bike?&category->wheelRadiusCm:&category->carWheelRadiusCm):nil;
+		minimum=bike?-20:VR_CAR_WHEEL_MIN_RADIUS_CM; maximum=40; break;
+	case QUEST_VEHICLE_CAL_MODEL_CENTER_X:
+		key="WheelCenterXCm"; value=view?&view->wheelCenterXCm:nil; minimum=-100; maximum=100; break;
+	case QUEST_VEHICLE_CAL_MODEL_CENTER_Y:
+		key="WheelCenterYCm"; value=view?&view->wheelCenterYCm:nil; minimum=-100; maximum=100; break;
+	case QUEST_VEHICLE_CAL_MODEL_CENTER_Z:
+		key="WheelCenterZCm"; value=view?&view->wheelCenterZCm:nil; minimum=-100; maximum=100; break;
+	case QUEST_VEHICLE_CAL_MODEL_RADIUS:
+		key=bike?"WheelRadiusCm":"WheelRadiusV2Cm";
+		value=view?(bike?&view->wheelRadiusCm:&view->carWheelRadiusCm):nil;
+		minimum=bike?-20:0; maximum=40; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_PITCH:
+		key="WheelPitchHalfDeg"; value=category?&category->carWheelPitchHalfDeg:nil; minimum=-180; maximum=180; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_YAW:
+		key="WheelYawHalfDeg"; value=category?&category->carWheelYawHalfDeg:nil; minimum=-180; maximum=180; break;
+	case QUEST_VEHICLE_CAL_GLOBAL_ROLL:
+		key="WheelRollHalfDeg"; value=category?&category->carWheelRollHalfDeg:nil; minimum=-180; maximum=180; break;
+	case QUEST_VEHICLE_CAL_MODEL_PITCH:
+		key="WheelPitchHalfDeg"; value=view?&view->carWheelPitchHalfDeg:nil; minimum=-180; maximum=180; break;
+	case QUEST_VEHICLE_CAL_MODEL_YAW:
+		key="WheelYawHalfDeg"; value=view?&view->carWheelYawHalfDeg:nil; minimum=-180; maximum=180; break;
+	case QUEST_VEHICLE_CAL_MODEL_ROLL:
+		key="WheelRollHalfDeg"; value=view?&view->carWheelRollHalfDeg:nil; minimum=-180; maximum=180; break;
 	case QUEST_VEHICLE_CAL_WHEELIE_HEIGHT:
 		if(lean){
 			lean->wheelieHeightCm = clamp(
@@ -1714,9 +2961,28 @@ AdjustQuestVehicleCalibrationValue(int hand, int item, int direction)
 	default:
 		return;
 	}
+	if(!value || !key)
+		return;
 	*value = clamp(*value+step, minimum, maximum);
-	SaveCalibrationValue(bike ? "BikeHandle" : "CarWheelV2",
-		model, hand, key, *value);
+	if(item >= QUEST_VEHICLE_CAL_OFFSET_X &&
+	   item <= QUEST_VEHICLE_CAL_ROT_Z)
+		SaveCalibrationValue("BikeHandle", model, hand, key, *value);
+	else if(item == QUEST_VEHICLE_CAL_GLOBAL_CENTER_X ||
+	        item == QUEST_VEHICLE_CAL_GLOBAL_CENTER_Y ||
+	        item == QUEST_VEHICLE_CAL_GLOBAL_CENTER_Z ||
+	        item == QUEST_VEHICLE_CAL_GLOBAL_RADIUS ||
+	        item == QUEST_VEHICLE_CAL_GLOBAL_PITCH ||
+	        item == QUEST_VEHICLE_CAL_GLOBAL_YAW ||
+	        item == QUEST_VEHICLE_CAL_GLOBAL_ROLL)
+		SaveCategoryCalibrationValue(categoryIndex, key, *value);
+	else
+		SaveViewCalibrationValue(model, key, *value);
+	if(vehicle->IsCar()){
+		// The isolated DFF wheel caches the last steering angle. Rebuild it from
+		// its authored neutral frame after any live centre/radius/axis edit so the
+		// new calibration is visible even while the steering angle is unchanged.
+		((CAutomobile*)vehicle)->m_fVrSteeringWheelAppliedAngle = 1000.0f;
+	}
 }
 
 void
@@ -1734,13 +3000,30 @@ ApplyQuestVehicleViewOffset(CMatrix *eyeCamera)
 	CVehicle *vehicle = FindPlayerVehicle();
 	if(!vehicle)
 		return;
-	eyeCamera->GetPosition().z +=
-		(float)gDrivingYOffsetCm/100.0f;
+	const int categoryIndex = GetVehicleCategory(vehicle);
+	if(GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT &&
+	   (categoryIndex == VR_VEHICLE_CATEGORY_CAR ||
+	    categoryIndex == VR_VEHICLE_CATEGORY_BIKE)){
+		const int type = categoryIndex == VR_VEHICLE_CATEGORY_BIKE ?
+			VR_DEFAULT_VIEW_BIKE : VR_DEFAULT_VIEW_CAR;
+		const DefaultVehicleViewOffset &offset =
+			gDefaultVehicleViewOffset[type];
+		eyeCamera->GetPosition().z +=
+			(float)offset.seatHeightCm/100.0f;
+		eyeCamera->GetPosition() += vehicle->GetForward()*
+			((float)offset.seatDistanceCm/100.0f);
+		return;
+	}
+	VehicleCategoryCalibration *category = GetCategoryCalibration(vehicle);
 	VehicleViewCalibration *calibration =
 		GetViewCalibration(vehicle->GetModelIndex());
-	if(calibration)
+	if(category && calibration){
+		eyeCamera->GetPosition().z +=
+			(float)(category->seatHeightCm+calibration->seatHeightCm)/100.0f;
 		eyeCamera->GetPosition() += vehicle->GetForward()*
-			((float)calibration->seatDistanceCm/100.0f);
+			((float)(category->seatDistanceCm+
+			 calibration->seatDistanceCm)/100.0f);
+	}
 }
 
 void

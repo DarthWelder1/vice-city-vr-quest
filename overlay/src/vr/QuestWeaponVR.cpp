@@ -15,9 +15,11 @@
 #include "ProjectileInfo.h"
 #include "Timer.h"
 #include "Vehicle.h"
+#include "VRHandModel.h"
 #include "WeaponInfo.h"
 #include "WeaponType.h"
 #include "World.h"
+#include "ModelSets.h"
 #include "vulkan/rwvk.h"
 
 #include <android/log.h>
@@ -33,7 +35,17 @@ namespace {
 
 enum {
 	VR_HAND_COUNT = 2,
-	WEAPON_VALUE_SCALE = 2
+	WEAPON_VALUE_SCALE = 2,
+	SUPPORT_GRIP_LEGACY_VERSION = 3,
+	SUPPORT_GRIP_MODEL_BOUND_V4 = 4,
+	SUPPORT_GRIP_POSE_VERSION = 5,
+	WEAPON_AIM_ALIGNMENT_SCALE = 1000000
+};
+
+enum SupportGripType {
+	SUPPORT_GRIP_MAGAZINE = 0,
+	SUPPORT_GRIP_FROM_BELOW,
+	SUPPORT_GRIP_TYPE_COUNT
 };
 
 enum {
@@ -54,6 +66,8 @@ struct WeaponCalibration
 	int aimRotationX, aimRotationY, aimRotationZ;
 	int rotationX, rotationY, rotationZ;
 	int supportX, supportY, supportZ;
+	int supportRotationX, supportRotationY, supportRotationZ;
+	int supportGripType, supportPoseVersion;
 	bool valid;
 
 	WeaponCalibration() :
@@ -61,7 +75,10 @@ struct WeaponCalibration
 		aimOffsetX(0), aimOffsetY(8), aimOffsetZ(0),
 		aimRotationX(0), aimRotationY(0), aimRotationZ(0),
 		rotationX(0), rotationY(18), rotationZ(14),
-		supportX(0), supportY(60), supportZ(-10), valid(false)
+		supportX(0), supportY(60), supportZ(-10),
+		supportRotationX(0), supportRotationY(360), supportRotationZ(0),
+		supportGripType(SUPPORT_GRIP_MAGAZINE),
+		supportPoseVersion(SUPPORT_GRIP_POSE_VERSION), valid(false)
 	{}
 };
 
@@ -75,6 +92,22 @@ struct BuiltInWeaponDefaults
 {
 	int weaponType;
 	BuiltInHandCalibration hand[VR_HAND_COUNT];
+};
+
+struct BuiltInWeaponSetDefaults
+{
+	int weaponType;
+	ModelSets::eModelSet modelSet;
+	BuiltInHandCalibration hand[VR_HAND_COUNT];
+};
+
+struct BuiltInSupportGripDefaults
+{
+	int weaponType;
+	ModelSets::eModelSet modelSet;
+	int offset[3];
+	int rotation[3];
+	int gripType;
 };
 
 // Stable v0.3.1 release baselines captured from the desktop project's
@@ -168,6 +201,173 @@ static const BuiltInWeaponDefaults gBuiltInWeaponDefaults[] = {
 		{ { -3,0,-39, 0,8,0, 0,0,0, 0,37,12 }, { 0,60,-10 } } } },
 };
 
+// Desktop v0.5.0 calibration corrections which are independent of the
+// graphics backend. Keeping them as an override table makes the Quest update
+// explicit while preserving its original fallback rows for untouched weapons.
+static const BuiltInWeaponDefaults gBuiltInWeaponV050Overrides[] = {
+	{ WEAPONTYPE_SCREWDRIVER, {
+		{ { 0,-8,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 0,-8,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_GOLFCLUB, {
+		{ { 0,-3,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 0,-3,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_NIGHTSTICK, {
+		{ { 2,-6,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 2,-6,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_KNIFE, {
+		{ { -3,-9,-9, 0,8,0, 0,0,0, 0,6,12 }, { 0,60,-10 } },
+		{ { -3,-9,-9, 0,8,0, 0,0,0, 0,6,12 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_HAMMER, {
+		{ { -4,-10,-12, 0,8,0, 0,0,0, 0,38,12 }, { 0,60,-10 } },
+		{ { -4,-10,-12, 0,8,0, 0,0,0, 0,38,12 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_CLEAVER, {
+		{ { 4,-6,-12, 0,8,0, 0,0,0, 0,37,14 }, { 0,60,-10 } },
+		{ { 4,-6,-12, 0,8,0, 0,0,0, 0,37,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_MACHETE, {
+		{ { 7,-5,-8, 0,8,0, 0,0,0, 0,24,14 }, { 0,60,-10 } },
+		{ { 7,-5,-8, 0,8,0, 0,0,0, 0,24,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_COLT45, {
+		{ { 0,-3,-7, 2,10,-8, 0,0,0, -4,16,-8 }, { 0,60,-10 } },
+		{ { 0,-3,-7, -2,10,-8, 0,0,0, -4,16,-8 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_PYTHON, {
+		{ { 0,-6,-11, 2,15,10, 7,-4,-2, 0,0,0 }, { 0,60,-10 } },
+		{ { 0,-6,-8, -2,15,10, 7,4,2, 0,0,0 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_SHOTGUN, {
+		{ { 3,1,-10, 4,12,0, 0,0,0, 2,19,11 }, { 0,60,-10 } },
+		{ { 3,1,-10, -4,12,0, 0,0,0, 2,19,11 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_SPAS12_SHOTGUN, {
+		{ { 0,0,-11, 3,18,20, 17,-4,-1, 0,0,8 }, { 11,60,-13 } },
+		{ { 0,0,-11, -3,18,20, 17,4,1, 0,0,8 }, { 9,60,-12 } } } },
+	{ WEAPONTYPE_STUBBY_SHOTGUN, {
+		{ { 0,-5,-10, 10,14,0, -14,-1,0, 2,33,11 }, { 0,60,-16 } },
+		{ { 0,-5,-10, -10,14,0, -14,1,0, 2,33,11 }, { 0,60,-17 } } } },
+	{ WEAPONTYPE_UZI, {
+		{ { 0,-3,-10, 2,8,0, -10,2,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 0,-3,-10, -2,8,0, -10,-2,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_SILENCED_INGRAM, {
+		{ { 0,0,-16, 8,14,0, 5,-2,0, 0,0,0 }, { 0,60,-10 } },
+		{ { 0,0,-16, -8,14,0, 5,2,0, 0,0,0 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_MP5, {
+		{ { -4,-7,-8, 5,23,20, 13,-7,-1, 0,0,8 }, { 0,45,-19 } },
+		{ { -4,-7,-8, -5,23,20, 13,7,1, 0,0,8 }, { 0,39,-13 } } } },
+	{ WEAPONTYPE_RUGER, {
+		{ { -1,0,-11, 0,20,0, 0,0,0, 0,8,11 }, { 0,51,-7 } },
+		{ { -1,0,-11, 0,20,0, 0,0,0, 0,8,11 }, { 0,50,-6 } } } },
+	{ WEAPONTYPE_SNIPERRIFLE, {
+		{ { -2,-5,-9, 0,10,100, 0,0,0, 0,10,0 }, { 0,60,-10 } },
+		{ { -2,-5,-9, 0,10,100, 0,0,0, 0,10,0 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_LASERSCOPE, {
+		{ { 5,0,-11, 6,25,100, 0,0,0, 0,0,13 }, { 0,60,-10 } },
+		{ { 5,0,-11, -6,25,100, 0,0,0, 0,0,13 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_ROCKETLAUNCHER, {
+		{ { -2,26,-11, 8,21,71, 0,0,0, 0,0,0 }, { 0,60,-10 } },
+		{ { -2,26,-11, -8,21,71, 0,0,0, 0,0,0 }, { 0,45,-10 } } } },
+	{ WEAPONTYPE_M60, {
+		{ { 0,0,-12, 9,18,0, 7,5,-75, -10,8,12 }, { 5,60,0 } },
+		{ { 0,0,-12, -9,18,0, 7,-5,75, -10,8,12 }, { 5,60,0 } } } },
+	{ WEAPONTYPE_MINIGUN, {
+		{ { 25,6,-18, 6,-19,47, -10,-5,0, 0,67,4 }, { 0,60,-10 } },
+		{ { 25,6,-18, -6,-19,47, -10,5,0, 0,67,4 }, { 0,60,-10 } } } },
+};
+
+// Model-specific v0.5.0 baselines. Missing rows fall back to the corrected
+// Classic table above; user INI data still has higher priority.
+static const BuiltInWeaponSetDefaults gBuiltInWeaponSetDefaults[] = {
+	{ WEAPONTYPE_SCREWDRIVER, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,-8,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 0,-8,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_GOLFCLUB, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,-3,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 0,-3,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_NIGHTSTICK, ModelSets::MODEL_SET_MODERN, {
+		{ { 2,-6,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 2,-6,-10, 0,8,0, 0,0,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_KNIFE, ModelSets::MODEL_SET_MODERN, {
+		{ { -3,-9,-9, 0,8,0, 0,0,0, 0,6,12 }, { 0,60,-10 } },
+		{ { -3,-9,-9, 0,8,0, 0,0,0, 0,6,12 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_HAMMER, ModelSets::MODEL_SET_MODERN, {
+		{ { -4,-10,-12, 0,8,0, 0,0,0, 0,38,12 }, { 0,60,-10 } },
+		{ { -4,-10,-12, 0,8,0, 0,0,0, 0,38,12 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_CLEAVER, ModelSets::MODEL_SET_MODERN, {
+		{ { 4,-6,-12, 0,8,0, 0,0,0, 0,37,14 }, { 0,60,-10 } },
+		{ { 4,-6,-12, 0,8,0, 0,0,0, 0,37,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_MACHETE, ModelSets::MODEL_SET_MODERN, {
+		{ { 7,-5,-8, 0,8,0, 0,0,0, 0,24,14 }, { 0,60,-10 } },
+		{ { 7,-5,-8, 0,8,0, 0,0,0, 0,24,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_COLT45, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,-3,-7, 2,10,-8, 0,0,0, -4,16,-8 }, { 0,60,-10 } },
+		{ { 0,-3,-7, -2,10,-8, 0,0,0, -4,16,-8 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_PYTHON, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,-6,-11, 3,13,8, 7,-4,-2, 0,0,0 }, { 0,60,-10 } },
+		{ { 0,-6,-11, -3,13,8, 7,4,2, 0,0,0 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_SHOTGUN, ModelSets::MODEL_SET_MODERN, {
+		{ { 3,1,-10, 0,7,0, 0,0,0, 2,19,11 }, { 0,60,-10 } },
+		{ { 3,1,-10, 0,7,0, 0,0,0, 2,19,11 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_STUBBY_SHOTGUN, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,-5,-10, 4,9,0, -15,-6,0, 2,33,11 }, { 0,60,-16 } },
+		{ { 0,-5,-10, -4,9,0, -15,6,0, 2,33,11 }, { 0,60,-17 } } } },
+	{ WEAPONTYPE_TEC9, ModelSets::MODEL_SET_MODERN, {
+		{ { 1,-4,-9, 0,16,0, 7,0,0, -2,8,6 }, { 0,60,-10 } },
+		{ { 1,-4,-9, 0,16,0, 7,0,0, -2,8,6 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_UZI, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,-3,-10, 2,9,0, -10,-1,0, 0,18,14 }, { 0,60,-10 } },
+		{ { 0,-3,-10, -2,9,0, -10,1,0, 0,18,14 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_SILENCED_INGRAM, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,0,-16, 1,10,-10, 5,5,0, 0,0,0 }, { 0,60,-10 } },
+		{ { -3,-4,-11, -1,10,-10, 5,-5,0, 0,0,0 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_MP5, ModelSets::MODEL_SET_MODERN, {
+		{ { -4,-7,-8, 3,14,20, 13,-7,-1, 0,0,8 }, { 0,45,-19 } },
+		{ { -4,-7,-8, -3,14,20, 13,7,1, 0,0,8 }, { 0,39,-13 } } } },
+	{ WEAPONTYPE_M4, ModelSets::MODEL_SET_MODERN, {
+		{ { 5,0,-12, 2,16,48, 2,0,0, 0,0,11 }, { -1,41,-20 } },
+		{ { 1,-5,-8, -2,16,48, 2,0,0, 0,0,11 }, { -1,41,-20 } } } },
+	{ WEAPONTYPE_RUGER, ModelSets::MODEL_SET_MODERN, {
+		{ { -1,0,-11, 2,8,87, 1,-3,0, 0,8,11 }, { 0,51,-7 } },
+		{ { 1,-6,-12, -2,8,87, 1,3,0, 0,8,11 }, { 0,50,-6 } } } },
+	{ WEAPONTYPE_LASERSCOPE, ModelSets::MODEL_SET_MODERN, {
+		{ { 5,0,-11, 6,25,100, 0,0,0, 0,0,13 }, { 0,60,-10 } },
+		{ { -1,-8,-11, -6,25,100, 0,0,0, 0,0,13 }, { 0,60,-10 } } } },
+	{ WEAPONTYPE_ROCKETLAUNCHER, ModelSets::MODEL_SET_MODERN, {
+		{ { -2,26,-11, 4,15,71, 0,0,0, 0,0,0 }, { 0,60,-10 } },
+		{ { -2,26,-11, -4,15,71, 0,0,0, 0,0,0 }, { 0,45,-10 } } } },
+	{ WEAPONTYPE_M60, ModelSets::MODEL_SET_MODERN, {
+		{ { 0,0,-12, 11,11,41, 7,5,-75, -10,8,12 }, { 5,60,0 } },
+		{ { 0,0,-12, -11,11,41, 7,-5,75, -10,8,12 }, { 5,60,0 } } } },
+};
+
+// PC v0.5.0 support-hand profiles. The socket is RIGHT-canonical and bound to
+// the visible weapon model: X=lateral, Y=barrel, Z=top. LEFT-primary gameplay
+// derives the mirrored pose at runtime, so both hands and both model sets share
+// one authoritative calibration.
+static const BuiltInSupportGripDefaults gBuiltInSupportGripDefaults[] = {
+	{ WEAPONTYPE_SHOTGUN, ModelSets::MODEL_SET_CLASSIC,
+		{ -13,80,-6 }, { -32,320,-360 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_SPAS12_SHOTGUN, ModelSets::MODEL_SET_CLASSIC,
+		{ -13,79,-8 }, { 0,297,-354 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_STUBBY_SHOTGUN, ModelSets::MODEL_SET_CLASSIC,
+		{ -12,76,-9 }, { -13,339,353 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_MP5, ModelSets::MODEL_SET_CLASSIC,
+		{ -7,39,-10 }, { -64,360,32 }, SUPPORT_GRIP_MAGAZINE },
+	{ WEAPONTYPE_M4, ModelSets::MODEL_SET_CLASSIC,
+		{ 8,38,-6 }, { -66,360,14 }, SUPPORT_GRIP_MAGAZINE },
+	{ WEAPONTYPE_RUGER, ModelSets::MODEL_SET_CLASSIC,
+		{ 6,49,-7 }, { -54,360,13 }, SUPPORT_GRIP_MAGAZINE },
+	{ WEAPONTYPE_SNIPERRIFLE, ModelSets::MODEL_SET_CLASSIC,
+		{ -15,71,-4 }, { -47,300,-332 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_LASERSCOPE, ModelSets::MODEL_SET_CLASSIC,
+		{ -5,47,-8 }, { -70,360,0 }, SUPPORT_GRIP_MAGAZINE },
+	{ WEAPONTYPE_ROCKETLAUNCHER, ModelSets::MODEL_SET_CLASSIC,
+		{ -7,12,-1 }, { -75,-360,0 }, SUPPORT_GRIP_MAGAZINE },
+	{ WEAPONTYPE_FLAMETHROWER, ModelSets::MODEL_SET_CLASSIC,
+		{ -30,48,0 }, { 0,234,0 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_M60, ModelSets::MODEL_SET_CLASSIC,
+		{ -12,62,-2 }, { 0,360,347 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_MINIGUN, ModelSets::MODEL_SET_CLASSIC,
+		{ -37,53,3 }, { -22,268,22 }, SUPPORT_GRIP_FROM_BELOW },
+	{ WEAPONTYPE_SPAS12_SHOTGUN, ModelSets::MODEL_SET_MODERN,
+		{ -18,79,-8 }, { 0,297,-354 }, SUPPORT_GRIP_FROM_BELOW },
+};
+
 struct DroppedWeapon
 {
 	int slot;
@@ -201,11 +401,19 @@ struct MeleeMotion
 {
 	bool valid, armed;
 	int slot, weaponType;
+	bool usedContact;
 	CVector previousTip, previousRoot;
+	CVector previousTrackingTip, previousTrackingRoot;
 	uint32 previousFrame, lastStrikeTime, calmSince;
+	bool strikeInProgress;
+	float strikePeakSpeed;
+	uint32 strikeContinueUntil;
 
 	MeleeMotion() : valid(false), armed(false), slot(-1), weaponType(-1),
-		previousFrame(0), lastStrikeTime(0), calmSince(0)
+		usedContact(false),
+		previousFrame(0), lastStrikeTime(0), calmSince(0),
+		strikeInProgress(false), strikePeakSpeed(0.0f),
+		strikeContinueUntil(0)
 	{}
 };
 
@@ -270,6 +478,9 @@ static bool gWeaponLaser;
 static bool gManualReload;
 static bool gScopeAim = true;
 static bool gGripLock;
+static bool gRunWithoutLimits;
+static CVector gBodyForward(0.0f, 1.0f, 0.0f);
+static bool gBodyForwardValid;
 
 static bool gActiveFire;
 static int gActiveFireHand = -1;
@@ -367,6 +578,8 @@ LoadSettings()
 		kSettingsPath) != 0;
 	gGripLock = GetPrivateProfileIntA("VR", "WeaponGripLock", 0,
 		kSettingsPath) != 0;
+	gRunWithoutLimits = GetPrivateProfileIntA("VR", "RunWithoutLimits", 0,
+		kSettingsPath) != 0;
 	static const char *keys[HOLSTER_POINT_COUNT] = {
 		"HolsterWaistLeftSlot", "HolsterWaistRightSlot",
 		"HolsterChestLeftSlot", "HolsterChestRightSlot",
@@ -418,8 +631,113 @@ SupportCalibrationConfigured(const char *section, int hand)
 		"SupportGripConfigured", 0) != 0;
 }
 
+static bool
+SectionHasCalibration(const char *section)
+{
+	return CalibrationConfigured(section, 0) ||
+		CalibrationConfigured(section, 1) ||
+		SupportCalibrationConfigured(section, 0) ||
+		SupportCalibrationConfigured(section, 1);
+}
+
 static void
-GetDefaultCalibration(int weaponType, int hand,
+ApplyBuiltInHandCalibration(const BuiltInHandCalibration &value,
+	WeaponCalibration *calibration)
+{
+	calibration->offsetX = value.main[0];
+	calibration->offsetY = value.main[1];
+	calibration->offsetZ = value.main[2];
+	calibration->aimOffsetX = value.main[3];
+	calibration->aimOffsetY = value.main[4];
+	calibration->aimOffsetZ = value.main[5];
+	calibration->aimRotationX = value.main[6];
+	calibration->aimRotationY = value.main[7];
+	calibration->aimRotationZ = value.main[8];
+	calibration->rotationX = value.main[9];
+	calibration->rotationY = value.main[10];
+	calibration->rotationZ = value.main[11];
+	calibration->supportX = value.support[0];
+	calibration->supportY = value.support[1];
+	calibration->supportZ = value.support[2];
+}
+
+static const BuiltInSupportGripDefaults *
+FindBuiltInSupportGripDefaults(int weaponType, ModelSets::eModelSet modelSet)
+{
+	for(int index = 0; index < (int)ARRAY_SIZE(gBuiltInSupportGripDefaults);
+	    index++){
+		const BuiltInSupportGripDefaults &value =
+			gBuiltInSupportGripDefaults[index];
+		if(value.weaponType == weaponType && value.modelSet == modelSet)
+			return &value;
+	}
+	return nil;
+}
+
+static void
+ApplyMirroredSupportGrip(const WeaponCalibration &source,
+	WeaponCalibration *mirrored)
+{
+	if(!mirrored)
+		return;
+	// V5 socket reflection is lateral only. Wrist Euler values are axial and
+	// use the proven PC v0.5.0 local-basis conjugation (-X,+Y,-Z).
+	mirrored->supportX = -source.supportX;
+	mirrored->supportY = source.supportY;
+	mirrored->supportZ = source.supportZ;
+	mirrored->supportRotationX = -source.supportRotationX;
+	mirrored->supportRotationY = source.supportRotationY;
+	mirrored->supportRotationZ = -source.supportRotationZ;
+	mirrored->supportGripType = source.supportGripType;
+	mirrored->supportPoseVersion = source.supportPoseVersion;
+}
+
+static void
+ApplyDefaultSupportGrip(int weaponType, int hand,
+	ModelSets::eModelSet modelSet, WeaponCalibration *calibration)
+{
+	if(!calibration)
+		return;
+	const BuiltInSupportGripDefaults *value =
+		FindBuiltInSupportGripDefaults(weaponType, modelSet);
+	if(!value && modelSet == ModelSets::MODEL_SET_MODERN)
+		value = FindBuiltInSupportGripDefaults(weaponType,
+			ModelSets::MODEL_SET_CLASSIC);
+	WeaponCalibration canonical = *calibration;
+	if(value){
+		canonical.supportX = value->offset[0];
+		canonical.supportY = value->offset[1];
+		canonical.supportZ = value->offset[2];
+		canonical.supportRotationX = value->rotation[0];
+		canonical.supportRotationY = value->rotation[1];
+		canonical.supportRotationZ = value->rotation[2];
+		canonical.supportGripType = value->gripType;
+	}else{
+		// Untuned weapons keep their established RIGHT support coordinates, but
+		// enter the deterministic model-bound v5 contract.
+		canonical.supportRotationX = 0;
+		canonical.supportRotationY = 360;
+		canonical.supportRotationZ = 0;
+		canonical.supportGripType = SUPPORT_GRIP_MAGAZINE;
+	}
+	canonical.supportPoseVersion = SUPPORT_GRIP_POSE_VERSION;
+	if(hand == 0)
+		ApplyMirroredSupportGrip(canonical, calibration);
+	else{
+		calibration->supportX = canonical.supportX;
+		calibration->supportY = canonical.supportY;
+		calibration->supportZ = canonical.supportZ;
+		calibration->supportRotationX = canonical.supportRotationX;
+		calibration->supportRotationY = canonical.supportRotationY;
+		calibration->supportRotationZ = canonical.supportRotationZ;
+		calibration->supportGripType = canonical.supportGripType;
+		calibration->supportPoseVersion = canonical.supportPoseVersion;
+	}
+}
+
+static void
+GetDefaultCalibrationForSet(int weaponType, int hand,
+	ModelSets::eModelSet modelSet,
 	WeaponCalibration *calibration)
 {
 	if(!calibration)
@@ -435,25 +753,41 @@ GetDefaultCalibration(int weaponType, int hand,
 			gBuiltInWeaponDefaults[index];
 		if(defaults.weaponType != weaponType)
 			continue;
-		const BuiltInHandCalibration &value = defaults.hand[hand];
-		calibration->offsetX = value.main[0];
-		calibration->offsetY = value.main[1];
-		calibration->offsetZ = value.main[2];
-		calibration->aimOffsetX = value.main[3];
-		calibration->aimOffsetY = value.main[4];
-		calibration->aimOffsetZ = value.main[5];
-		calibration->aimRotationX = value.main[6];
-		calibration->aimRotationY = value.main[7];
-		calibration->aimRotationZ = value.main[8];
-		calibration->rotationX = value.main[9];
-		calibration->rotationY = value.main[10];
-		calibration->rotationZ = value.main[11];
-		calibration->supportX = value.support[0];
-		calibration->supportY = value.support[1];
-		calibration->supportZ = value.support[2];
+		ApplyBuiltInHandCalibration(defaults.hand[hand], calibration);
 		break;
 	}
+	for(int index = 0;
+	    index < (int)ARRAY_SIZE(gBuiltInWeaponV050Overrides); index++){
+		const BuiltInWeaponDefaults &defaults =
+			gBuiltInWeaponV050Overrides[index];
+		if(defaults.weaponType == weaponType){
+			ApplyBuiltInHandCalibration(defaults.hand[hand], calibration);
+			break;
+		}
+	}
+	if(modelSet == ModelSets::MODEL_SET_MODERN){
+		for(int index = 0;
+		    index < (int)ARRAY_SIZE(gBuiltInWeaponSetDefaults); index++){
+			const BuiltInWeaponSetDefaults &defaults =
+				gBuiltInWeaponSetDefaults[index];
+			if(defaults.weaponType == weaponType &&
+			   defaults.modelSet == modelSet){
+				ApplyBuiltInHandCalibration(defaults.hand[hand], calibration);
+				break;
+			}
+		}
+	}
+	ApplyDefaultSupportGrip(weaponType, hand, modelSet, calibration);
 	calibration->valid = true;
+}
+
+static void
+GetDefaultCalibration(int weaponType, int hand,
+	WeaponCalibration *calibration)
+{
+	GetDefaultCalibrationForSet(weaponType, hand,
+		ModelSets::GetActiveForCategory(ModelSets::MODEL_CATEGORY_WEAPONS),
+		calibration);
 }
 
 static WeaponCalibration *
@@ -466,9 +800,23 @@ GetCalibration(int hand, int weaponType)
 	if(calibration.valid)
 		return &calibration;
 	char section[96];
-	sprintf(section, "VRWeapon_%02d_%s", weaponType,
-		GetVrWeaponName(weaponType));
-	GetDefaultCalibration(weaponType, hand, &calibration);
+	const bool modern = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_WEAPONS) == ModelSets::MODEL_SET_MODERN;
+	ModelSets::eModelSet calibrationSet = modern ?
+		ModelSets::MODEL_SET_MODERN : ModelSets::MODEL_SET_CLASSIC;
+	sprintf(section, modern ? "VRWeaponModern_%02d_%s" :
+		"VRWeapon_%02d_%s", weaponType, GetVrWeaponName(weaponType));
+	if(modern && !SectionHasCalibration(section)){
+		char classicSection[96];
+		sprintf(classicSection, "VRWeapon_%02d_%s", weaponType,
+			GetVrWeaponName(weaponType));
+		if(SectionHasCalibration(classicSection)){
+			strcpy(section, classicSection);
+			calibrationSet = ModelSets::MODEL_SET_CLASSIC;
+		}
+	}
+	GetDefaultCalibrationForSet(weaponType, hand, calibrationSet,
+		&calibration);
 
 	int readHand = hand;
 	bool configured = CalibrationConfigured(section, hand);
@@ -478,7 +826,8 @@ GetCalibration(int hand, int weaponType)
 	}
 	if(configured){
 		WeaponCalibration defaults;
-		GetDefaultCalibration(weaponType, readHand, &defaults);
+		GetDefaultCalibrationForSet(weaponType, readHand, calibrationSet,
+			&defaults);
 		const int storedScale =
 			ReadCalibrationValue(section, readHand, "ValueScale", 1);
 		const int conversion =
@@ -523,15 +872,18 @@ GetCalibration(int hand, int weaponType)
 	}
 
 	int supportHand = hand;
+	bool mirrorSupportFromRight = false;
 	bool supportConfigured = SupportCalibrationConfigured(section, hand);
 	if(!supportConfigured && hand == 0 &&
 	   SupportCalibrationConfigured(section, 1)){
 		supportHand = 1;
 		supportConfigured = true;
+		mirrorSupportFromRight = true;
 	}
 	if(supportConfigured){
 		WeaponCalibration defaults;
-		GetDefaultCalibration(weaponType, supportHand, &defaults);
+		GetDefaultCalibrationForSet(weaponType, supportHand, calibrationSet,
+			&defaults);
 		const int storedScale = ReadCalibrationValue(section, supportHand,
 			"SupportGripValueScale", 1);
 		const int conversion =
@@ -546,6 +898,34 @@ GetCalibration(int hand, int weaponType)
 		calibration.supportZ = clamp(ReadCalibrationValue(section, supportHand,
 			"SupportGripOffsetZ",
 			defaults.supportZ/fallbackDivisor)*conversion, -200, 200);
+		calibration.supportRotationX = clamp(ReadCalibrationValue(section,
+			supportHand, "SupportGripRotationX",
+			defaults.supportRotationX/fallbackDivisor)*conversion, -360, 360);
+		calibration.supportRotationY = clamp(ReadCalibrationValue(section,
+			supportHand, "SupportGripRotationY",
+			defaults.supportRotationY/fallbackDivisor)*conversion, -360, 360);
+		calibration.supportRotationZ = clamp(ReadCalibrationValue(section,
+			supportHand, "SupportGripRotationZ",
+			defaults.supportRotationZ/fallbackDivisor)*conversion, -360, 360);
+		calibration.supportPoseVersion = clamp(ReadCalibrationValue(section,
+			supportHand, "SupportGripPoseVersion",
+			SUPPORT_GRIP_LEGACY_VERSION), 1, SUPPORT_GRIP_POSE_VERSION);
+		calibration.supportGripType = clamp((int)(int32)GetPrivateProfileIntA(
+			section, "SupportGripStyle", defaults.supportGripType,
+			kSettingsPath), 0, SUPPORT_GRIP_TYPE_COUNT-1);
+		if(calibration.supportPoseVersion == SUPPORT_GRIP_MODEL_BOUND_V4){
+			const int oldX = calibration.supportX;
+			const int oldY = calibration.supportY;
+			const int oldZ = calibration.supportZ;
+			calibration.supportX = -oldZ;
+			calibration.supportY = oldX;
+			calibration.supportZ = -oldY;
+			calibration.supportPoseVersion = SUPPORT_GRIP_POSE_VERSION;
+		}
+		if(mirrorSupportFromRight){
+			WeaponCalibration canonical = calibration;
+			ApplyMirroredSupportGrip(canonical, &calibration);
+		}
 	}
 	calibration.valid = true;
 	return &calibration;
@@ -673,22 +1053,38 @@ GetBodyFrame(CVector *origin, CVector *right, CVector *up,
 	CPlayerPed *player = FindPlayerPed();
 	if(!player || !origin || !right || !up || !forward)
 		return false;
-	*right = player->GetRight();
-	*up = player->GetUp();
-	*forward = player->GetForward();
-	if(right->MagnitudeSqr() < 0.0001f ||
-	   up->MagnitudeSqr() < 0.0001f ||
-	   forward->MagnitudeSqr() < 0.0001f)
-		return false;
-	right->Normalise();
-	up->Normalise();
-	forward->Normalise();
 	float vrRight[3], vrUp[3], vrAt[3], vrPosition[3];
 	if(rw::vulkan::getFirstPersonViewFrame(
-	   vrRight, vrUp, vrAt, vrPosition))
+	   vrRight, vrUp, vrAt, vrPosition)){
 		*origin = VectorFromArray(vrPosition);
-	else
+		// Body sockets follow the HMD's yaw continuously and stay anchored to
+		// the real room-space head position.  Ignore pitch/roll so looking up
+		// cannot spin the belt or move it in front of the player.
+		CVector headForward = VectorFromArray(vrAt);
+		headForward.z = 0.0f;
+		if(headForward.MagnitudeSqr() >= 0.0001f){
+			headForward.Normalise();
+			gBodyForward = headForward;
+			gBodyForwardValid = true;
+		}
+		*forward = gBodyForwardValid ? gBodyForward :
+			CVector(0.0f, 1.0f, 0.0f);
+		*up = CVector(0.0f, 0.0f, 1.0f);
+		*right = CrossProduct(*forward, *up);
+		right->Normalise();
+	}else{
+		*right = player->GetRight();
+		*up = player->GetUp();
+		*forward = player->GetForward();
+		if(right->MagnitudeSqr() < 0.0001f ||
+		   up->MagnitudeSqr() < 0.0001f ||
+		   forward->MagnitudeSqr() < 0.0001f)
+			return false;
+		right->Normalise();
+		up->Normalise();
+		forward->Normalise();
 		*origin = player->GetPosition()+*up*1.55f;
+	}
 	return true;
 }
 
@@ -699,6 +1095,87 @@ FindHolsterPoint(int slot)
 		if(gHolsterPointSlot[point] == slot)
 			return point;
 	return -1;
+}
+
+static bool
+BuildTrackedWeaponHandBasis(int hand, CVector *position, CVector *right,
+	CVector *up, CVector *forward)
+{
+	if(hand < 0 || hand >= VR_HAND_COUNT || !position || !right || !up ||
+	   !forward || !gPoseValid[hand])
+		return false;
+	*position = gGripMatrix[hand].GetPosition();
+	*forward = gAimMatrix[hand].GetForward();
+	forward->Normalise();
+	const int modelHand = 1-hand;
+	*up = gGripMatrix[hand].GetRight()*(modelHand == 0 ? 1.0f : -1.0f);
+	*up -= *forward*DotProduct(*up, *forward);
+	if(up->MagnitudeSqr() < 0.0001f)
+		return false;
+	up->Normalise();
+	*right = CrossProduct(*up, *forward);
+	if(right->MagnitudeSqr() < 0.0001f)
+		return false;
+	right->Normalise();
+	if(DotProduct(*right, gGripMatrix[hand].GetForward()) < 0.0f)
+		*right *= -1.0f;
+	return true;
+}
+
+static bool
+BuildWeaponModelMatrix(int hand, const WeaponCalibration &calibration,
+	CMatrix *matrix)
+{
+	if(!matrix)
+		return false;
+	CVector position, right, up, forward;
+	if(!BuildTrackedWeaponHandBasis(hand, &position, &right, &up, &forward))
+		return false;
+	matrix->SetUnity();
+	matrix->GetRight() = right*-1.0f;
+	matrix->GetForward() = forward*-1.0f;
+	matrix->GetUp() = up;
+	matrix->GetPosition() = position+
+		right*((float)calibration.offsetX/200.0f)+
+		forward*((float)calibration.offsetY/200.0f)+
+		up*((float)calibration.offsetZ/200.0f);
+	CMatrix base, rotationX, rotationY, rotationZ;
+	base.SetRotate(DEGTORAD(90.0f), 0.0f, DEGTORAD(-90.0f));
+	rotationX.SetRotateX(DEGTORAD((float)calibration.rotationX/
+		WEAPON_VALUE_SCALE));
+	rotationY.SetRotateY(DEGTORAD((float)calibration.rotationY/
+		WEAPON_VALUE_SCALE));
+	rotationZ.SetRotateZ(DEGTORAD((float)calibration.rotationZ/
+		WEAPON_VALUE_SCALE));
+	*matrix = *matrix*base*rotationX*rotationY*rotationZ;
+	return true;
+}
+
+static bool
+BuildCanonicalSupportFrame(const CVector &forwardCandidate,
+	const CVector &upCandidate, CVector *right, CVector *up,
+	CVector *forward)
+{
+	if(!right || !up || !forward ||
+	   !isfinite(forwardCandidate.x) || !isfinite(forwardCandidate.y) ||
+	   !isfinite(forwardCandidate.z) || !isfinite(upCandidate.x) ||
+	   !isfinite(upCandidate.y) || !isfinite(upCandidate.z))
+		return false;
+	*forward = forwardCandidate;
+	if(forward->MagnitudeSqr() < 0.0001f)
+		return false;
+	forward->Normalise();
+	*up = upCandidate-*forward*DotProduct(upCandidate, *forward);
+	if(up->MagnitudeSqr() < 0.0001f)
+		return false;
+	up->Normalise();
+	*right = CrossProduct(*forward, *up);
+	if(right->MagnitudeSqr() < 0.0001f)
+		return false;
+	right->Normalise();
+	*up = CrossProduct(*right, *forward);
+	up->Normalise();
+	return true;
 }
 
 static bool
@@ -738,30 +1215,61 @@ BuildHolsterMatrix(int slot, CMatrix *matrix)
 
 static bool
 BuildSupportVector(int primary, int weaponType, CVector *pivot,
-	CVector *expected)
+	CVector *expected, CVector *frameRight = nil, CVector *frameUp = nil,
+	CVector *frameForward = nil)
 {
 	if(primary < 0 || primary >= VR_HAND_COUNT || !pivot || !expected ||
-	   !gPoseValid[primary] || !IsTwoHanded(weaponType))
+	   !gPoseValid[primary] || !IsTwoHanded(weaponType) ||
+	   ((frameRight || frameUp || frameForward) &&
+	    (!frameRight || !frameUp || !frameForward)))
 		return false;
 	WeaponCalibration *calibration =
 		GetCalibration(primary, weaponType);
 	if(!calibration)
 		return false;
-	CVector position = gGripMatrix[primary].GetPosition();
-	CVector forward = gAimMatrix[primary].GetForward();
-	CVector up = gGripMatrix[primary].GetRight()*
-		(primary == 0 ? -1.0f : 1.0f);
-	forward.Normalise();
-	up -= forward*DotProduct(up, forward);
-	if(up.MagnitudeSqr() < 0.0001f)
-		up = gGripMatrix[primary].GetUp();
-	up.Normalise();
-	CVector right = CrossProduct(up, forward);
-	right.Normalise();
-	*pivot = position;
-	*expected = right*((float)calibration->supportX/200.0f) +
-		forward*((float)calibration->supportY/200.0f) +
-		up*((float)calibration->supportZ/200.0f);
+	CVector rawRight, rawUp, rawForward;
+	if(!BuildTrackedWeaponHandBasis(primary, pivot, &rawRight, &rawUp,
+	   &rawForward))
+		return false;
+	CVector socketRight = rawRight;
+	CVector socketUp = rawUp;
+	CVector socketForward = rawForward;
+	CVector visualRight = rawRight;
+	CVector visualUp = rawUp;
+	CVector visualForward = rawForward;
+	CVector socketOrigin = *pivot;
+	if(calibration->supportPoseVersion >= SUPPORT_GRIP_POSE_VERSION){
+		CMatrix weaponModel;
+		if(!BuildWeaponModelMatrix(primary, *calibration, &weaponModel))
+			return false;
+		CVector barrel = weaponModel.GetRight();
+		CVector top = weaponModel.GetForward();
+		CVector lateral;
+		if(!BuildCanonicalSupportFrame(barrel, top,
+		   &lateral, &top, &barrel))
+			return false;
+		socketRight = lateral;
+		socketForward = barrel;
+		socketUp = top;
+		visualRight = barrel;
+		visualUp = lateral*-1.0f;
+		visualForward = top*-1.0f;
+		socketOrigin = weaponModel.GetPosition();
+	}
+	const CVector socket = socketOrigin+
+		socketRight*((float)calibration->supportX/200.0f)+
+		socketForward*((float)calibration->supportY/200.0f)+
+		socketUp*((float)calibration->supportZ/200.0f);
+	*expected = socket-*pivot;
+	if(frameRight){
+		if(calibration->supportPoseVersion < SUPPORT_GRIP_POSE_VERSION &&
+		   !BuildCanonicalSupportFrame(visualForward, visualUp,
+		   &visualRight, &visualUp, &visualForward))
+			return false;
+		*frameRight = visualRight;
+		*frameUp = visualUp;
+		*frameForward = visualForward;
+	}
 	return expected->MagnitudeSqr() > 0.0001f;
 }
 
@@ -787,11 +1295,12 @@ BuildTwoHandRotation(int primary, int weaponType, CVector *pivot,
 	*axis = CrossProduct(expected, actual);
 	if(axis->MagnitudeSqr() < 0.000001f){
 		*axis = CVector(0.0f, 0.0f, 1.0f);
-		*angle = dot > 0.0f ? 0.0f : PI;
+		*angle = 0.0f;
 		return true;
 	}
-	axis->Normalise();
-	*angle = Acos(dot);
+	const float sine = axis->Magnitude();
+	*axis *= 1.0f/sine;
+	*angle = Min(Atan2(sine, dot), DEGTORAD(90.0f));
 	return true;
 }
 
@@ -1379,13 +1888,20 @@ UpdateHolsterInput(uint32 blockedHands)
 				gGripLatched[hand] = false;
 			continue;
 		}
-		if(gHeldSlot[hand] >= 0 && gGrip[hand] <= 0.30f &&
-		   !gGripLock){
+		if(gHeldSlot[hand] >= 0 && gGrip[hand] <= 0.30f){
 			const int slot = gHeldSlot[hand];
+			CMatrix holster;
+			const bool returnToHolster = gPoseValid[hand] &&
+				BuildHolsterMatrix(slot, &holster) &&
+				(gGripMatrix[hand].GetPosition()-holster.GetPosition()).Magnitude()
+					<= 0.24f;
+			if(gGripLock && !returnToHolster)
+				continue;
 			ClearSupportForHand(hand);
 			gHeldSlot[hand] = -1;
 			gHolsterSelection[hand] = -1;
-			StartDroppedWeapon(hand, slot);
+			if(!returnToHolster)
+				StartDroppedWeapon(hand, slot);
 		}
 		if(gHeldSlot[hand] < 0 && gPoseValid[hand] &&
 		   gGrip[hand] >= 0.65f && !gGripLatched[hand]){
@@ -1461,6 +1977,25 @@ MeleeModelRoot(int weaponType)
 	}
 }
 
+// Express a world point relative to the first-person camera frame. Gesture
+// speeds must come from this space: Tommy's locomotion, snap turns and
+// anchor refreshes move the world-space blade at tens of metres per second,
+// which kept the swing detector permanently above its calm threshold. The
+// desktop implementation measures in the equivalent camera-relative space.
+static CVector
+ToMeleeTrackingSpace(const CVector &worldPoint)
+{
+	float right[3], up[3], at[3], position[3];
+	if(!rw::vulkan::getFirstPersonViewFrame(right, up, at, position))
+		return worldPoint;
+	const CVector r = VectorFromArray(right);
+	const CVector u = VectorFromArray(up);
+	const CVector f = VectorFromArray(at);
+	const CVector relative = worldPoint-VectorFromArray(position);
+	return CVector(DotProduct(relative, r), DotProduct(relative, f),
+		DotProduct(relative, u));
+}
+
 static void
 UpdateMelee()
 {
@@ -1479,6 +2014,7 @@ UpdateMelee()
 		int slot = gHeldSlot[hand];
 		int weaponType = -1;
 		bool enabled = false;
+		bool usedContact = false;
 		CVector root, tip;
 		if(slot >= 0){
 			weaponType = GetVrWeaponTypeForSlot(slot);
@@ -1490,6 +2026,7 @@ UpdateMelee()
 					MeleeModelRoot(weaponType);
 				tip = gWeaponContactMatrix[hand]*
 					MeleeModelTip(weaponType);
+				usedContact = true;
 			}else{
 				root = gGripMatrix[hand].GetPosition();
 				tip = root+gAimMatrix[hand].GetForward()*0.45f;
@@ -1506,22 +2043,31 @@ UpdateMelee()
 			gMeleeMotion[hand] = MeleeMotion();
 			continue;
 		}
+		const CVector trackingRoot = ToMeleeTrackingSpace(root);
+		const CVector trackingTip = ToMeleeTrackingSpace(tip);
 		MeleeMotion &motion = gMeleeMotion[hand];
 		if(!motion.valid || motion.slot != slot ||
 		   motion.weaponType != weaponType ||
+		   motion.usedContact != usedContact ||
 		   frame-motion.previousFrame > 2U || dt > 0.05f){
 			motion = MeleeMotion();
 			motion.valid = true;
 			motion.slot = slot;
 			motion.weaponType = weaponType;
+			motion.usedContact = usedContact;
 			motion.previousRoot = root;
 			motion.previousTip = tip;
+			motion.previousTrackingRoot = trackingRoot;
+			motion.previousTrackingTip = trackingTip;
 			motion.previousFrame = frame;
 			motion.calmSince = now;
 			continue;
 		}
-		const float tipSpeed = (tip-motion.previousTip).Magnitude()/dt;
-		const float rootSpeed = (root-motion.previousRoot).Magnitude()/dt;
+		const float trackingTravel =
+			(trackingTip-motion.previousTrackingTip).Magnitude();
+		const float tipSpeed = trackingTravel/dt;
+		const float rootSpeed =
+			(trackingRoot-motion.previousTrackingRoot).Magnitude()/dt;
 		const float threshold =
 			slot == WEAPONSLOT_UNARMED ? 1.25f : 0.70f;
 		const bool calm = slot == WEAPONSLOT_UNARMED ?
@@ -1538,12 +2084,43 @@ UpdateMelee()
 		if(!motion.armed && motion.lastStrikeTime &&
 		   now-motion.lastStrikeTime >= 450U)
 			motion.armed = true;
+		// Large discontinuities are tracking loss or recenter events, never
+		// superhuman attacks. Keep the new sample but require calm to rearm.
+		if(trackingTravel > 0.65f){
+			motion.armed = false;
+			motion.previousRoot = root;
+			motion.previousTip = tip;
+			motion.previousTrackingRoot = trackingRoot;
+			motion.previousTrackingTip = trackingTip;
+			motion.previousFrame = frame;
+			continue;
+		}
 		const bool deliberate = slot == WEAPONSLOT_UNARMED ?
 			rootSpeed >= 0.75f : rootSpeed >= 0.25f ||
-			(tip-root-motion.previousTip+motion.previousRoot).Magnitude()/dt >=
-				0.50f;
-		if(enabled && motion.armed && tipSpeed >= threshold &&
-		   deliberate && now-motion.lastStrikeTime >= 220U &&
+			(trackingTip-trackingRoot-motion.previousTrackingTip+
+			 motion.previousTrackingRoot).Magnitude()/dt >= 0.50f;
+		if(motion.strikeInProgress && now > motion.strikeContinueUntil){
+			motion.strikeInProgress = false;
+			motion.strikePeakSpeed = 0.0f;
+		}
+		const bool fastStrikeSample = enabled && motion.armed &&
+			tipSpeed >= threshold && deliberate &&
+			now-motion.lastStrikeTime >= 220U;
+		if(fastStrikeSample && weaponType == WEAPONTYPE_KATANA){
+			motion.strikeInProgress = true;
+			motion.strikePeakSpeed =
+				Max(motion.strikePeakSpeed, tipSpeed);
+			motion.strikeContinueUntil = now+180U;
+		}
+		// Once a genuine fast swing has started, keep publishing its slower
+		// tail. The trigger frame's short sweep segment usually hasn't reached
+		// the target yet; the blade must keep dealing contact while it travels.
+		const bool continuationSample =
+			weaponType == WEAPONTYPE_KATANA &&
+			motion.strikeInProgress &&
+			now <= motion.strikeContinueUntil && tipSpeed >= 0.08f;
+		if(enabled && motion.armed &&
+		   (fastStrikeSample || continuationSample) &&
 		   !gMeleeStrike[hand].pending){
 			MeleeStrike &strike = gMeleeStrike[hand];
 			strike.pending = true;
@@ -1553,11 +2130,13 @@ UpdateMelee()
 			strike.tipEnd = tip;
 			strike.rootStart = motion.previousRoot;
 			strike.rootEnd = root;
-			strike.speed = tipSpeed;
+			strike.speed = Max(tipSpeed, motion.strikePeakSpeed);
 			strike.frame = frame;
 		}
 		motion.previousRoot = root;
 		motion.previousTip = tip;
+		motion.previousTrackingRoot = trackingRoot;
+		motion.previousTrackingTip = trackingTip;
 		motion.previousFrame = frame;
 	}
 }
@@ -1578,7 +2157,12 @@ BuildAim(int hand, int weaponType, CVector *source, CVector *direction)
 	forward.Normalise();
 	up -= forward*DotProduct(up, forward);
 	up.Normalise();
-	right = CrossProduct(up, forward);
+	// Preserve the pose's own lateral axis. CrossProduct(up, forward) is
+	// -right in this coordinate system, which mirrored aimOffsetX and
+	// aimRotationX against the shared desktop calibration: every laser sat
+	// beside the barrel, displaced toward the wrong side.
+	right -= forward*DotProduct(right, forward);
+	right -= up*DotProduct(right, up);
 	right.Normalise();
 	const float pitch =
 		DEGTORAD((float)calibration->aimRotationX/WEAPON_VALUE_SCALE);
@@ -1903,6 +2487,35 @@ bool IsTrackedWeaponTriggerJustPressed(int hand)
 	return IsTrackedWeaponTriggerPressed(hand) &&
 		gTriggerJustPressed[hand];
 }
+
+static int
+GetTrackedWeaponFireTriggerHand(int hand, int weaponType)
+{
+	if(hand < 0 || hand >= VR_HAND_COUNT || gHeldSlot[hand] < 0 ||
+	   !gPoseValid[hand] || !IsGameplayAvailable())
+		return -1;
+	if(weaponType != WEAPONTYPE_ROCKETLAUNCHER || FindPlayerVehicle())
+		return hand;
+	const int opposite = 1-hand;
+	// The RPG model is shouldered from the support side: right-held uses L2,
+	// left-held uses R2. Never steal a trigger from another gun/detonator.
+	if(gHeldSlot[opposite] >= 0 || IsTrackedDetonatorActive(opposite))
+		return -1;
+	return opposite;
+}
+
+bool IsTrackedWeaponFireTriggerPressed(int hand, int weaponType)
+{
+	const int triggerHand = GetTrackedWeaponFireTriggerHand(hand, weaponType);
+	return triggerHand >= 0 && gTriggerPressed[triggerHand];
+}
+
+bool IsTrackedWeaponFireTriggerJustPressed(int hand, int weaponType)
+{
+	const int triggerHand = GetTrackedWeaponFireTriggerHand(hand, weaponType);
+	return triggerHand >= 0 && gTriggerPressed[triggerHand] &&
+		gTriggerJustPressed[triggerHand];
+}
 bool IsTrackedWeaponTriggerJustReleased(int hand)
 {
 	return hand >= 0 && hand < VR_HAND_COUNT &&
@@ -2067,6 +2680,20 @@ bool IsTrackedWeaponHeld(int hand)
 		(!FindPlayerVehicle() || IsImmersiveDrivingActive());
 }
 int GetHeldWeaponSlot(int hand) { return hand >= 0 && hand < VR_HAND_COUNT ? gHeldSlot[hand] : -1; }
+
+bool IsRunWithoutLimitsEnabled()
+{
+	LoadSettings();
+	return gRunWithoutLimits;
+}
+
+void SetRunWithoutLimitsEnabled(bool enabled)
+{
+	LoadSettings();
+	gRunWithoutLimits = enabled;
+	WritePrivateProfileStringA("VR", "RunWithoutLimits",
+		enabled ? "1" : "0", kSettingsPath);
+}
 
 bool
 IsQuestDrivingHandUnavailable(int hand)
@@ -2329,6 +2956,8 @@ BeginTrackedWeaponFire(int hand, int weaponType, const CVector &source,
 {
 	gActiveFire = true;
 	gActiveFireHand = hand;
+	// 0.4.1 PC parity: controller kick on every shot.
+	androidgame::TriggerWeaponHaptic(hand, 0.8f);
 	gActiveFireWeaponType = weaponType;
 	gActiveFireSource = source;
 	gActiveFireDirection = direction;
@@ -2415,11 +3044,169 @@ GetQuestRawTrackedHandAimMatrix(int hand, CMatrix *matrix)
 	return true;
 }
 
+static bool
+ApplyTwoHandVisualHandLock(int hand, CMatrix *handMatrix,
+	CVector *aimOrigin, CVector *aimDirection, float *grip, float *trigger)
+{
+	if(hand < 0 || hand >= VR_HAND_COUNT)
+		return false;
+	int primary = -1;
+	int support = -1;
+	int primarySlot = -1;
+	int weaponType = -1;
+	for(int candidate = 0; candidate < VR_HAND_COUNT; candidate++){
+		const int slot = gHeldSlot[candidate];
+		const int candidateSupport = gSupportHand[candidate];
+		if(slot < 0 || candidateSupport < 0 ||
+		   candidateSupport >= VR_HAND_COUNT)
+			continue;
+		const int candidateType = GetVrWeaponTypeForSlot(slot);
+		if(!IsTwoHanded(candidateType) ||
+		   (hand != candidate && hand != candidateSupport))
+			continue;
+		primary = candidate;
+		support = candidateSupport;
+		primarySlot = slot;
+		weaponType = candidateType;
+		break;
+	}
+	if(primary < 0)
+		return false;
+
+	CVector pivot, axis;
+	float angle;
+	if(!BuildTwoHandRotation(primary, weaponType, &pivot, &axis, &angle))
+		return false;
+	if(hand == primary){
+		if(handMatrix && angle != 0.0f){
+			handMatrix->GetRight() = RotateAroundAxis(
+				handMatrix->GetRight(), axis, angle);
+			handMatrix->GetUp() = RotateAroundAxis(
+				handMatrix->GetUp(), axis, angle);
+			handMatrix->GetForward() = RotateAroundAxis(
+				handMatrix->GetForward(), axis, angle);
+			handMatrix->GetPosition() = pivot+RotateAroundAxis(
+				handMatrix->GetPosition()-pivot, axis, angle);
+		}
+		if(aimOrigin && angle != 0.0f)
+			*aimOrigin = pivot+RotateAroundAxis(*aimOrigin-pivot, axis, angle);
+		if(aimDirection && angle != 0.0f){
+			*aimDirection = RotateAroundAxis(*aimDirection, axis, angle);
+			aimDirection->Normalise();
+		}
+		return true;
+	}
+
+	CVector rawPivot, weaponRight, weaponUp, weaponForward, expected;
+	if(hand != support || !BuildSupportVector(primary, weaponType,
+	   &rawPivot, &expected, &weaponRight, &weaponUp, &weaponForward))
+		return false;
+	if(angle != 0.0f){
+		expected = RotateAroundAxis(expected, axis, angle);
+		weaponRight = RotateAroundAxis(weaponRight, axis, angle);
+		weaponUp = RotateAroundAxis(weaponUp, axis, angle);
+		weaponForward = RotateAroundAxis(weaponForward, axis, angle);
+	}
+	const CVector lockedSocket = pivot+expected;
+	WeaponCalibration *calibration = GetCalibration(primary, weaponType);
+	if(calibration &&
+	   calibration->supportPoseVersion >= SUPPORT_GRIP_POSE_VERSION &&
+	   gWeaponContactSlot[primary] == primarySlot &&
+	   gWeaponContactType[primary] == weaponType &&
+	   gWeaponContactFrame[primary] == CTimer::GetFrameCounter()){
+		CVector barrel = gWeaponContactMatrix[primary].GetRight();
+		CVector top = gWeaponContactMatrix[primary].GetForward();
+		CVector lateral;
+		if(BuildCanonicalSupportFrame(barrel, top,
+		   &lateral, &top, &barrel)){
+			weaponRight = barrel;
+			weaponUp = lateral*-1.0f;
+			weaponForward = top*-1.0f;
+		}
+	}
+	if(!BuildCanonicalSupportFrame(weaponForward, weaponUp,
+	   &weaponRight, &weaponUp, &weaponForward))
+		return false;
+	const int gripType = calibration ? calibration->supportGripType :
+		SUPPORT_GRIP_MAGAZINE;
+	const float palmSign = support == 0 ? -1.0f : 1.0f;
+	CVector encodedPalmAxis = gripType == SUPPORT_GRIP_FROM_BELOW ?
+		weaponUp*(-palmSign) : weaponRight;
+	encodedPalmAxis.Normalise();
+	CVector handUp = encodedPalmAxis*palmSign;
+	CVector handForward = weaponForward;
+	handForward.Normalise();
+	CVector handRight = CrossProduct(handUp, handForward);
+	if(handRight.MagnitudeSqr() < 0.0001f)
+		return false;
+	handRight.Normalise();
+	const float rotationX = DEGTORAD((float)(calibration ?
+		calibration->supportRotationX : 0)/WEAPON_VALUE_SCALE);
+	const float rotationY = DEGTORAD((float)(calibration ?
+		calibration->supportRotationY : 0)/WEAPON_VALUE_SCALE);
+	const float rotationZ = DEGTORAD((float)(calibration ?
+		calibration->supportRotationZ : 0)/WEAPON_VALUE_SCALE);
+	if(rotationX != 0.0f){
+		handUp = RotateAroundAxis(handUp, handRight, rotationX);
+		handForward = RotateAroundAxis(handForward, handRight, rotationX);
+	}
+	if(rotationY != 0.0f){
+		handRight = RotateAroundAxis(handRight, handUp, rotationY);
+		handForward = RotateAroundAxis(handForward, handUp, rotationY);
+	}
+	if(rotationZ != 0.0f){
+		handRight = RotateAroundAxis(handRight, handForward, rotationZ);
+		handUp = RotateAroundAxis(handUp, handForward, rotationZ);
+	}
+	handForward.Normalise();
+	handUp -= handForward*DotProduct(handUp, handForward);
+	if(handUp.MagnitudeSqr() < 0.0001f)
+		return false;
+	handUp.Normalise();
+	handRight = CrossProduct(handUp, handForward);
+	handRight.Normalise();
+	// The UltimateXR LEFT mesh was canonicalised during conversion and needs
+	// this one visual roll; RIGHT is already in the authored support basis.
+	if(support == 0){
+		handUp *= -1.0f;
+		handRight *= -1.0f;
+	}
+	encodedPalmAxis = handUp*palmSign;
+	if(handMatrix){
+		handMatrix->GetRight() = encodedPalmAxis;
+		handMatrix->GetUp() = handForward;
+		handMatrix->GetForward() = handRight*(support == 0 ? -1.0f : 1.0f);
+		handMatrix->GetPosition() = lockedSocket;
+	}
+	if(aimOrigin)
+		*aimOrigin = lockedSocket;
+	if(aimDirection)
+		*aimDirection = handForward;
+	if(grip)
+		*grip = gripType == SUPPORT_GRIP_FROM_BELOW ? 0.55f : 1.0f;
+	if(trigger)
+		*trigger = gripType == SUPPORT_GRIP_FROM_BELOW ? 0.65f : 1.0f;
+	return true;
+}
+
 bool
 GetTrackedHandMatrix(int hand, CMatrix *matrix, float *grip, float *trigger)
 {
 	if(!matrix || hand < 0 || hand >= VR_HAND_COUNT || !gPoseValid[hand])
 		return false;
+	if(IsImmersiveCarDrivingActive() &&
+	   IsImmersiveSteeringHandleGrabbed(hand) &&
+	   GetImmersiveSteeringHandleMatrix(hand, matrix)){
+		// The interaction anchor remains exactly on the authoritative rim. Move
+		// only the rendered palm a little outward, then close every finger around
+		// the rim; the marker, radius and steering maths are deliberately unchanged.
+		const float side = hand == 0 ? -1.0f : 1.0f;
+		matrix->GetPosition() += matrix->GetRight()*(side*0.025f);
+		const float wheelGrip = Max(gGrip[hand], 0.90f);
+		if(grip) *grip = wheelGrip;
+		if(trigger) *trigger = Max(gTrigger[hand], wheelGrip);
+		return true;
+	}
 	if(IsImmersiveSteeringHandleGrabbed(hand) &&
 	   GetImmersiveSteeringHandleMatrix(hand, matrix)){
 		if(grip) *grip = gGrip[hand];
@@ -2427,6 +3214,44 @@ GetTrackedHandMatrix(int hand, CMatrix *matrix, float *grip, float *trigger)
 		return true;
 	}
 	return GetQuestRawTrackedHandMatrix(hand, matrix, grip, trigger);
+}
+
+static void
+ApplyBikeVisualGripAlignment(int hand, CMatrix *matrix)
+{
+	if(!matrix || hand < 0 || hand >= VR_HAND_COUNT)
+		return;
+	// The calibrated socket axis runs along the cylindrical handlebar grip, but
+	// the rendered fingers must wrap across it. Convert only the visual wrist;
+	// interaction sockets, steering and saved calibration remain authoritative.
+	const float angle = DEGTORAD(-90.0f);
+	matrix->GetForward() = RotateAroundAxis(matrix->GetForward(),
+		matrix->GetRight(), angle);
+	matrix->GetUp() = RotateAroundAxis(matrix->GetUp(),
+		matrix->GetRight(), angle);
+	matrix->GetForward().Normalise();
+	matrix->GetUp().Normalise();
+	// A round grip has no intrinsic forward hemisphere. Resolve that ambiguity
+	// deterministically against the bike so tiny pose noise cannot flip the hand
+	// by 180 degrees from one frame to the next.
+	CVehicle *vehicle = FindPlayerVehicle();
+	if(vehicle && vehicle->IsBike() &&
+	   DotProduct(matrix->GetForward(), vehicle->GetForward()) < 0.0f){
+		matrix->GetForward() *= -1.0f;
+		matrix->GetUp() *= -1.0f;
+	}
+}
+
+bool
+GetTrackedVisualHandMatrix(int hand, CMatrix *matrix, float *grip,
+	float *trigger)
+{
+	if(!GetTrackedHandMatrix(hand, matrix, grip, trigger))
+		return false;
+	if(IsImmersiveBikeHandleGrabbed(hand))
+		ApplyBikeVisualGripAlignment(hand, matrix);
+	ApplyTwoHandVisualHandLock(hand, matrix, nil, nil, grip, trigger);
+	return true;
 }
 
 bool
@@ -2446,6 +3271,27 @@ GetTrackedHandAimRay(int hand, CVector *origin, CVector *direction)
 	*origin = gAimMatrix[hand].GetPosition();
 	*direction = gAimMatrix[hand].GetForward();
 	direction->Normalise();
+	return true;
+}
+
+bool
+GetTrackedVisualHandAimRay(int hand, CVector *origin, CVector *direction)
+{
+	if(!origin || !direction)
+		return false;
+	if(IsImmersiveBikeHandleGrabbed(hand)){
+		CMatrix visualHandle;
+		if(GetImmersiveSteeringHandleMatrix(hand, &visualHandle)){
+			ApplyBikeVisualGripAlignment(hand, &visualHandle);
+			*origin = visualHandle.GetPosition();
+			*direction = visualHandle.GetForward();
+			direction->Normalise();
+			return true;
+		}
+	}
+	if(!GetTrackedHandAimRay(hand, origin, direction))
+		return false;
+	ApplyTwoHandVisualHandLock(hand, nil, origin, direction, nil, nil);
 	return true;
 }
 
@@ -2477,7 +3323,12 @@ ResolvePhysicalMeleeStrike(int hand, bool contact)
 {
 	if(!contact || hand < 0 || hand >= VR_HAND_COUNT)
 		return;
+	// A miss leaves the swing live so its continuation segments can still
+	// reach the target; a real contact latches until the hand slows down.
 	gMeleeMotion[hand].armed = false;
+	gMeleeMotion[hand].strikeInProgress = false;
+	gMeleeMotion[hand].strikePeakSpeed = 0.0f;
+	gMeleeMotion[hand].strikeContinueUntil = 0;
 	gMeleeMotion[hand].lastStrikeTime =
 		CTimer::GetTimeInMillisecondsNonClipped();
 	gMeleeMotion[hand].calmSince = 0;
@@ -2599,6 +3450,18 @@ QuestCalibrationValue(WeaponCalibration *calibration, int item,
 	case 14:
 		*minimum = -200; *maximum = 200;
 		return &calibration->supportZ;
+	case 15:
+		*minimum = -360; *maximum = 360;
+		return &calibration->supportRotationX;
+	case 16:
+		*minimum = -360; *maximum = 360;
+		return &calibration->supportRotationY;
+	case 17:
+		*minimum = -360; *maximum = 360;
+		return &calibration->supportRotationZ;
+	case 18:
+		*minimum = 0; *maximum = SUPPORT_GRIP_TYPE_COUNT-1;
+		return &calibration->supportGripType;
 	default: return nil;
 	}
 }
@@ -2618,7 +3481,9 @@ SaveQuestCalibration(int hand, int weaponType,
 	const WeaponCalibration &calibration)
 {
 	char section[96];
-	sprintf(section, "VRWeapon_%02d_%s", weaponType,
+	sprintf(section, ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_WEAPONS) == ModelSets::MODEL_SET_MODERN ?
+		"VRWeaponModern_%02d_%s" : "VRWeapon_%02d_%s", weaponType,
 		GetVrWeaponName(weaponType));
 	WriteCalibrationInt(section, hand, "Configured", 1);
 	WriteCalibrationInt(section, hand, "ValueScale", WEAPON_VALUE_SCALE);
@@ -2652,6 +3517,18 @@ SaveQuestCalibration(int hand, int weaponType,
 		calibration.supportY);
 	WriteCalibrationInt(section, hand, "SupportGripOffsetZ",
 		calibration.supportZ);
+	WriteCalibrationInt(section, hand, "SupportGripRotationX",
+		calibration.supportRotationX);
+	WriteCalibrationInt(section, hand, "SupportGripRotationY",
+		calibration.supportRotationY);
+	WriteCalibrationInt(section, hand, "SupportGripRotationZ",
+		calibration.supportRotationZ);
+	WriteCalibrationInt(section, hand, "SupportGripPoseVersion",
+		SUPPORT_GRIP_POSE_VERSION);
+	char style[16];
+	sprintf(style, "%d", calibration.supportGripType);
+	WritePrivateProfileStringA(section, "SupportGripStyle", style,
+		kSettingsPath);
 }
 
 int
@@ -2677,6 +3554,8 @@ AdjustQuestCalibrationValue(int hand, int weaponType, int item,
 		return;
 	*value = clamp(*value+(direction < 0 ? -1 : 1),
 		minimum, maximum);
+	if(item >= 12)
+		calibration->supportPoseVersion = SUPPORT_GRIP_POSE_VERSION;
 	SaveQuestCalibration(hand, weaponType, *calibration);
 }
 
@@ -2753,6 +3632,51 @@ CycleQuestHolsterPointSlot(int point, int direction)
 
 bool CanSkipDesktopGameplayRender() { return IsPhysicalWeaponInteractionActive(); }
 void ToggleCheatMenu() {}
+
+void
+PrepareForGameShutdown()
+{
+	for(int hand = 0; hand < VR_HAND_COUNT; hand++){
+		gPoseValid[hand] = false;
+		gGrip[hand] = 0.0f;
+		gTrigger[hand] = 0.0f;
+		gTriggerPressed[hand] = false;
+		gTriggerJustPressed[hand] = false;
+		gTriggerJustReleased[hand] = false;
+		gGripLatched[hand] = false;
+		gHeldSlot[hand] = -1;
+		gHolsterSelection[hand] = -1;
+		gSupportHand[hand] = -1;
+		gWeaponRenderSlot[hand] = -1;
+		gWeaponContactSlot[hand] = -1;
+		gWeaponContactType[hand] = -1;
+		gWeaponContactFrame[hand] = 0;
+		gDropped[hand] = DroppedWeapon();
+		ResetManualReloadState(gManualReloadState[hand]);
+		gManualReloadGripDown[hand] = false;
+		gMeleeMotion[hand] = MeleeMotion();
+		gMeleeStrike[hand] = MeleeStrike();
+		gThrowablePreview[hand] = false;
+		gTrackedDetonatorWasActive[hand] = false;
+		gTrackedDetonatorWaitForRelease[hand] = false;
+		gTrackedDetonatorJustPressed[hand] = false;
+	}
+	gWeaponHolsterMask = 0;
+	gAttachedMissionWeaponForced = false;
+	gAttachedMissionWeaponSlot = -1;
+	gTrackedDetonatorHand = -1;
+	gActiveFire = false;
+	gActiveFireHand = -1;
+	gActiveFireWeaponType = -1;
+	gActiveThrowable = false;
+	gScopeHand = -1;
+	gScopeWeaponType = -1;
+	gScopeCandidateHand = -1;
+	gScopeCandidateType = -1;
+	gBodyForward = CVector(0.0f, 1.0f, 0.0f);
+	gBodyForwardValid = false;
+	VRHandModel::Shutdown();
+}
 
 } // namespace OculusVR
 

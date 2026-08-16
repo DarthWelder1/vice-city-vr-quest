@@ -1,0 +1,652 @@
+diff --git a/src/animation/AnimManager.cpp b/src/animation/AnimManager.cpp
+index f6ac3eb..c4523c1 100644
+--- a/src/animation/AnimManager.cpp
++++ b/src/animation/AnimManager.cpp
+@@ -11,6 +11,7 @@
+ #include "AnimBlendAssocGroup.h"
+ #include "AnimManager.h"
+ #include "Streaming.h"
++#include "ModelSets.h"
+ 
+ CAnimBlock CAnimManager::ms_aAnimBlocks[NUMANIMBLOCKS];
+ CAnimBlendHierarchy CAnimManager::ms_aAnimations[NUMANIMATIONS];
+@@ -1269,8 +1270,15 @@ void
+ CAnimManager::LoadAnimFile(const char *filename)
+ {
+ 	RwStream *stream;
+-	stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++	char resolved[1024];
++	const char *modelSetFilename = ModelSets::ResolveAssetPath(filename,
++		resolved, sizeof(resolved));
++	stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, modelSetFilename);
++	if(!stream && modelSetFilename != filename)
++		stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
+ 	assert(stream);
++	if(!stream)
++		return;
+ 	LoadAnimFile(stream, true);
+ 	RwStreamClose(stream, nil);
+ }
+diff --git a/src/audio/AudioLogic.cpp b/src/audio/AudioLogic.cpp
+index 7469f57..2c355e4 100644
+--- a/src/audio/AudioLogic.cpp
++++ b/src/audio/AudioLogic.cpp
+@@ -42,6 +42,9 @@
+ #include "Fluff.h"
+ #include "Script.h"
+ #include "Wanted.h"
++#ifdef GTA_VR_WEAPONS
++#include "OculusVR.h"
++#endif
+ 
+ const int channels = ARRAY_SIZE(AudioManager.m_asActiveSamples);
+ const int policeChannel = channels + 1;
+@@ -1672,6 +1675,13 @@ cAudioManager::ProcessPlayersVehicleEngine(cVehicleParams& params, CVehicle* veh
+ 	} else {
+ 		accelerateState = Pads[0].GetAccelerate();
+ 		brakeState = Pads[0].GetBrake();
++#ifdef GTA_VR_WEAPONS
++		float immersiveThrottle;
++		if (params.m_VehicleType == VEHICLE_TYPE_BIKE &&
++		    OculusVR::GetImmersiveBikeThrottle(veh, &immersiveThrottle))
++			accelerateState = (int32)(255.0f *
++				clamp(immersiveThrottle, 0.0f, 1.0f));
++#endif
+ 	}
+ 	channelUsed = SampleManager.GetChannelUsedFlag(m_nActiveSamples);
+ 	if (isMoped) {
+diff --git a/src/core/CdStream.h b/src/core/CdStream.h
+index 516cef4..bee789e 100644
+--- a/src/core/CdStream.h
++++ b/src/core/CdStream.h
+@@ -39,6 +39,9 @@ void AddToQueue(Queue *queue, int32 item);
+ int32 GetFirstInQueue(Queue *queue);
+ void RemoveFirstInQueue(Queue *queue);
+ bool CdStreamAddImage(char const *path);
++// Registers the legal base GTA3 archive followed by the optional Modern
++// overlay archive.  Streaming chooses individual entries from the latter.
++bool CdStreamAddModelSetImages(char const *basePath);
+ char *CdStreamGetImageName(int32 cd);
+ void CdStreamRemoveImages(void);
+ int32 CdStreamGetNumImages(void);
+diff --git a/src/core/CdStreamPosix.cpp b/src/core/CdStreamPosix.cpp
+index 492e9c1..510f856 100644
+--- a/src/core/CdStreamPosix.cpp
++++ b/src/core/CdStreamPosix.cpp
+@@ -22,6 +22,7 @@
+ #include "CdStream.h"
+ #include "rwcore.h"
+ #include "MemoryMgr.h"
++#include "ModelSets.h"
+ 
+ #define CDDEBUG(f, ...)   debug ("%s: " f "\n", "cdvd_stream", ## __VA_ARGS__)
+ #define CDTRACE(f, ...)   printf("%s: " f "\n", "cdvd_stream", ## __VA_ARGS__)
+@@ -545,11 +546,16 @@ void *CdStreamThread(void *param)
+ 	pthread_exit(nil);
+ }
+ 
+-bool
+-CdStreamAddImage(char const *path)
++static bool
++CdStreamAddImagePath(char const *path, bool resolveModelSet)
+ {
+ 	ASSERT(path != nil);
+ 	ASSERT(gNumImages < MAX_CDIMAGES);
++	char modelSetPath[1024];
++	const char *originalPath = path;
++	if(resolveModelSet)
++		path = ModelSets::ResolveAssetPath(path, modelSetPath,
++			sizeof(modelSetPath));
+ 
+ 	gImgFiles[gNumImages] = open(path, _gdwCdStreamFlags);
+ 	const int directErrno = gImgFiles[gNumImages] == -1 ? errno : 0;
+@@ -570,6 +576,17 @@ CdStreamAddImage(char const *path)
+ 			free(real);
+ 		}
+ 	}
++	if(gImgFiles[gNumImages] == -1 && path != originalPath){
++		path = originalPath;
++		gImgFiles[gNumImages] = open(path, _gdwCdStreamFlags);
++		if(gImgFiles[gNumImages] == -1){
++			char *real = casepath(path, false);
++			if(real){
++				gImgFiles[gNumImages] = open(real, _gdwCdStreamFlags);
++				free(real);
++			}
++		}
++	}
+ 
+ 	if ( gImgFiles[gNumImages] == -1 ) {
+ 		// These paths are relative and spelled with backslashes, so a failure
+@@ -596,6 +613,26 @@ CdStreamAddImage(char const *path)
+ 	return true;
+ }
+ 
++bool
++CdStreamAddImage(char const *path)
++{
++	return CdStreamAddImagePath(path, true);
++}
++
++bool
++CdStreamAddModelSetImages(char const *basePath)
++{
++	if(!CdStreamAddImagePath(basePath, true))
++		return false;
++	if(!ModelSets::IsModernActive())
++		return true;
++	char modernPath[1024];
++	if(!ModelSets::GetModernAssetPath("models/gta3.img", modernPath,
++	   sizeof(modernPath)))
++		return true;
++	return CdStreamAddImagePath(modernPath, false);
++}
++
+ char *
+ CdStreamGetImageName(int32 cd)
+ {
+diff --git a/src/core/FileLoader.cpp b/src/core/FileLoader.cpp
+index bf01725..bfffccd 100644
+--- a/src/core/FileLoader.cpp
++++ b/src/core/FileLoader.cpp
+@@ -29,6 +29,19 @@
+ #include "Streaming.h"
+ #include "ColStore.h"
+ #include "Occlusion.h"
++#include "ModelSets.h"
++
++static RwStream *
++OpenModelSetRwStream(const char *filename)
++{
++	char resolved[1024];
++	const char *selected = ModelSets::ResolveAssetPath(filename, resolved,
++		sizeof(resolved));
++	RwStream *stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, selected);
++	if(!stream && selected != filename)
++		stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++	return stream;
++}
+ 
+ char CFileLoader::ms_line[256];
+ 
+@@ -156,7 +169,7 @@ CFileLoader::LoadTexDictionary(const char *filename)
+ 	RwStream *stream;
+ 
+ 	txd = nil;
+-	stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++	stream = OpenModelSetRwStream(filename);
+ 	debug("Loading texture dictionary file %s\n", filename);
+ 	if(stream){
+ 		if(RwStreamFindChunk(stream, rwID_TEXDICTIONARY, nil, nil))
+@@ -430,7 +443,9 @@ CFileLoader::LoadModelFile(const char *filename)
+ 	RpClump *clump;
+ 
+ 	debug("Loading model file %s\n", filename);
+-	stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++	stream = OpenModelSetRwStream(filename);
++	if(!stream)
++		return;
+ 	if(RwStreamFindChunk(stream, rwID_CLUMP, nil, nil)){
+ 		clump = RpClumpStreamRead(stream);
+ 		if(clump){
+@@ -452,7 +467,9 @@ CFileLoader::LoadClumpFile(const char *filename)
+ 	CClumpModelInfo *mi;
+ 
+ 	debug("Loading model file %s\n", filename);
+-	stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++	stream = OpenModelSetRwStream(filename);
++	if(!stream)
++		return;
+ 	while(RwStreamFindChunk(stream, rwID_CLUMP, nil, nil)){
+ 		clump = RpClumpStreamRead(stream);
+ 		if(clump){
+@@ -563,7 +580,9 @@ CFileLoader::LoadAtomicFile2Return(const char *filename)
+ 
+ 	clump = nil;
+ 	debug("Loading model file %s\n", filename);
+-	stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++	stream = OpenModelSetRwStream(filename);
++	if(!stream)
++		return nil;
+ 	if(RwStreamFindChunk(stream, rwID_CLUMP, nil, nil))
+ 		clump = RpClumpStreamRead(stream);
+ 	if(clump)
+diff --git a/src/core/FileMgr.cpp b/src/core/FileMgr.cpp
+index 32aa404..8d49f8e 100644
+--- a/src/core/FileMgr.cpp
++++ b/src/core/FileMgr.cpp
+@@ -7,6 +7,7 @@
+ #include "crossplatform.h"
+ 
+ #include "FileMgr.h"
++#include "ModelSets.h"
+ 
+ const char *_psGetUserFilesFolder();
+ 
+@@ -55,6 +56,15 @@ myfopen(const char *filename, const char *mode)
+ {
+ 	int fd;
+ 	char realmode[10], *p;
++	char modelSetPath[1024];
++	const char *originalFilename = filename;
++	// Overlay only read operations. Save files, generated TXD images, settings,
++	// and every other write must continue to target their original locations.
++	const bool readOnly = strchr(mode, 'r') != nil && strchr(mode, 'w') == nil &&
++		strchr(mode, 'a') == nil && strchr(mode, '+') == nil;
++	if(readOnly)
++		filename = ModelSets::ResolveAssetPath(filename, modelSetPath,
++			sizeof(modelSetPath));
+ 
+ 	for(fd = 1; fd < NUMFILES; fd++)
+ 		if(myfiles[fd].file == nil)
+@@ -72,6 +82,8 @@ found:
+ 	*p = '\0';
+ 	
+ 	myfiles[fd].file = fcaseopen(filename, realmode);
++	if(myfiles[fd].file == nil && filename != originalFilename)
++		myfiles[fd].file = fcaseopen(originalFilename, realmode);
+ 	if(myfiles[fd].file == nil)
+ 		return 0;
+ 	return fd;
+diff --git a/src/core/Frontend.cpp b/src/core/Frontend.cpp
+index 0a1eeef..a187b88 100644
+--- a/src/core/Frontend.cpp
++++ b/src/core/Frontend.cpp
+@@ -2459,8 +2459,8 @@ CMenuManager::DrawBackground(bool transitionCall)
+ 		// FONT_STANDARD uses the original game's fixed glyph atlas: its '#' slot
+ 		// is an icon rather than a number sign.  Keep public-build text to the
+ 		// atlas' reliable uppercase ASCII range so every language pack displays it.
+-		AsciiToUnicode("VICE CITY VR V0.4.0 ALPHA", releaseName);
+-		AsciiToUnicode("WORK IN PROGRESS", releaseStatus);
++		AsciiToUnicode("VICE CITY VR V0.5.0 ALPHA", releaseName);
++		AsciiToUnicode("NOT FOR SALE", releaseStatus);
+ 		AsciiToUnicode("", releaseCredit);
+ 
+ 		CFont::SetBackgroundOff();
+@@ -2477,8 +2477,16 @@ CMenuManager::DrawBackground(bool transitionCall)
+ 		CFont::SetDropColor(CRGBA(0, 0, 0, FadeIn(220)));
+ 		CFont::SetColor(CRGBA(255, 255, 255, FadeIn(235)));
+ 		const float releaseX = SCREEN_STRETCH_FROM_RIGHT(24.0f);
++		const float statusY = SCREEN_SCALE_FROM_BOTTOM(46.0f);
++		const float statusWidth = CFont::GetStringWidth(releaseStatus, true);
+ 		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(68.0f), releaseName);
+-		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(46.0f), releaseStatus);
++		CSprite2d::DrawRect(CRect(
++			releaseX-statusWidth-SCREEN_SCALE_X(8.0f),
++			statusY-SCREEN_SCALE_Y(2.0f),
++			releaseX+SCREEN_SCALE_X(4.0f),
++			statusY+SCREEN_SCALE_Y(15.0f)),
++			CRGBA(150, 35, 105, FadeIn(220)));
++		CFont::PrintString(releaseX, statusY, releaseStatus);
+ 		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(24.0f), releaseCredit);
+ 	}
+ 
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index 7ba25c5..1176f05 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -24,6 +24,7 @@
+ #include "EventList.h"
+ #include "FileLoader.h"
+ #include "FileMgr.h"
++#include "ModelSets.h"
+ #include "Fire.h"
+ #include "Fluff.h"
+ #include "Font.h"
+@@ -78,7 +79,7 @@
+ #include "WaterCannon.h"
+ #include "WaterLevel.h"
+ #include "Weapon.h"
+-#ifdef GTA_VR_OCULUS
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ #include "OculusVR.h"
+ #endif
+ #if defined(RW_VULKAN) && defined(__ANDROID__)
+@@ -168,6 +169,9 @@ bool
+ CGame::InitialiseOnceBeforeRW(void)
+ {
+ 	CFileMgr::Initialise();
++	// Select the base/optional overlay before RenderWare or streaming opens any
++	// asset. Category changes are next-launch requests by design.
++	ModelSets::InitializeStartup(CFileMgr::GetRootDirName());
+ 	CdStreamInit(MAX_CDCHANNELS);
+ 	debug("size of matrix %d\n", sizeof(CMatrix));
+ 	debug("size of placeable %d\n", sizeof(CPlaceable));
+@@ -447,7 +451,7 @@ bool CGame::Initialise(const char* datFile)
+ 	CPickups::Init();
+ 	CTheCarGenerators::Init();
+ 
+-	CdStreamAddImage("MODELS\\GTA3.IMG");
++	CdStreamAddModelSetImages("MODELS\\GTA3.IMG");
+ 
+ 	CFileLoader::LoadLevel("DATA\\DEFAULT.DAT");
+ 	CFileLoader::LoadLevel(datFile);
+@@ -584,6 +588,9 @@ bool CGame::Initialise(const char* datFile)
+ 
+ bool CGame::ShutDown(void)
+ {
++#ifdef GTA_VR_WEAPONS
++	OculusVR::PrepareForGameShutdown();
++#endif
+ #ifdef USE_TEXTURE_POOL
+ 	_TexturePoolsUnknown(false);
+ #endif
+@@ -732,6 +739,9 @@ void CGame::ReloadIPLs(void)
+ 
+ void CGame::ShutDownForRestart(void)
+ {
++#ifdef GTA_VR_WEAPONS
++	OculusVR::PrepareForGameShutdown();
++#endif
+ #ifdef USE_TEXTURE_POOL
+ 	_TexturePoolsUnknown(false);
+ #endif
+diff --git a/src/core/Streaming.cpp b/src/core/Streaming.cpp
+index a293e71..7d420c2 100644
+--- a/src/core/Streaming.cpp
++++ b/src/core/Streaming.cpp
+@@ -17,6 +17,7 @@
+ #include "Entity.h"
+ #include "FileMgr.h"
+ #include "FileLoader.h"
++#include "ModelSets.h"
+ #include "Zones.h"
+ #include "Radar.h"
+ #include "Camera.h"
+@@ -384,7 +385,7 @@ CStreaming::Update(void)
+ void
+ CStreaming::LoadCdDirectory(void)
+ {
+-	char dirname[132];
++	char dirname[1024];
+ 	int i;
+ 
+ #ifdef GTA_PC
+@@ -394,19 +395,87 @@ CStreaming::LoadCdDirectory(void)
+ 	ms_imageOffsets[3] = -1;
+ 	ms_imageOffsets[4] = -1;
+ 	ms_imageOffsets[5] = -1;
+-	ms_imageSize = GetGTA3ImgSize();
++	ms_imageSize = (int32)(GetGTA3ImgSize() / CDSTREAM_SECTOR_SIZE);
+ 	// PS2 uses CFileMgr::GetCdFile on all IMG files to fill the array
+ #endif
+ 
+ 	i = CdStreamGetNumImages();
+ 	while(i-- >= 1){
+-		strcpy(dirname, CdStreamGetImageName(i));
+-		strncpy(strrchr(dirname, '.') + 1, "DIR", 3);
++		strncpy(dirname, CdStreamGetImageName(i), sizeof(dirname)-1);
++		dirname[sizeof(dirname)-1] = '\0';
++		char *extension = strrchr(dirname, '.');
++		if(extension == nil)
++			continue;
++		strncpy(extension + 1, "DIR", 3);
+ 		LoadCdDirectory(dirname, i);
+ 	}
+ 
+ 	ms_lastImageRead = 0;
++	#ifndef GTA_PC
+ 	ms_imageSize /= CDSTREAM_SECTOR_SIZE;
++	#endif
++}
++
++static ModelSets::eModelCategory
++GetModelSetCategory(int modelId)
++{
++	CBaseModelInfo *model = modelId >= 0 && modelId < MODELINFOSIZE ?
++		CModelInfo::GetModelInfo(modelId) : nil;
++	if(!model)
++		return ModelSets::MODEL_CATEGORY_WORLD;
++	switch(model->GetModelType()){
++	case MITYPE_VEHICLE: return ModelSets::MODEL_CATEGORY_VEHICLES;
++	case MITYPE_PED: return ModelSets::MODEL_CATEGORY_PEDS;
++	case MITYPE_WEAPON: return ModelSets::MODEL_CATEGORY_WEAPONS;
++	default: break;
++	}
++	if(ModelSets::IsVegetationModel(model->GetModelName()))
++		return ModelSets::MODEL_CATEGORY_VEGETATION;
++	return ModelSets::MODEL_CATEGORY_WORLD;
++}
++
++static bool
++ShouldUseModernModel(int modelId)
++{
++	const ModelSets::eModelCategory category = GetModelSetCategory(modelId);
++	if(category != ModelSets::MODEL_CATEGORY_WORLD || ModelSets::HasVegetationManifest())
++		return ModelSets::IsCategoryModernActive(category);
++	CBaseModelInfo *model = modelId >= 0 && modelId < MODELINFOSIZE ?
++		CModelInfo::GetModelInfo(modelId) : nil;
++	if(model && (model->GetModelType() == MITYPE_SIMPLE ||
++	   model->GetModelType() == MITYPE_TIME ||
++	   model->GetModelType() == MITYPE_CLUMP))
++		return ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WORLD) &&
++			ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEGETATION);
++	return ModelSets::IsCategoryModernActive(category);
++}
++
++static bool
++ShouldUseModernTxd(int txdSlot)
++{
++	bool referenced = false;
++	for(int i = 0; i < MODELINFOSIZE; i++){
++		CBaseModelInfo *model = CModelInfo::GetModelInfo(i);
++		if(!model || model->GetTxdSlot() != txdSlot)
++			continue;
++		referenced = true;
++		if(ShouldUseModernModel(i))
++			return true;
++	}
++	return !referenced && ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WORLD);
++}
++
++static bool
++ShouldUseModernArchiveEntry(const char *extension, int modelId)
++{
++	if(strncasecmp(extension, "DFF", 3) == 0)
++		return ShouldUseModernModel(modelId);
++	if(strncasecmp(extension, "TXD", 3) == 0)
++		return ShouldUseModernTxd(modelId-STREAM_OFFSET_TXD);
++	if(strncasecmp(extension, "IFP", 3) == 0)
++		return ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_PEDS) ||
++			ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WEAPONS);
++	return ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WORLD);
+ }
+ 
+ void
+@@ -420,6 +489,7 @@ CStreaming::LoadCdDirectory(const char *dirname, int n)
+ 	lastID = -1;
+ 	fd = CFileMgr::OpenFile(dirname, "rb");
+ 	assert(fd > 0);
++	const bool modernArchive = ModelSets::IsModernAssetPath(dirname);
+ 
+ 	imgSelector = n<<24;
+ 	assert(sizeof(direntry) == 32);
+@@ -442,6 +512,13 @@ CStreaming::LoadCdDirectory(const char *dirname, int n)
+ 			if(CModelInfo::GetModelInfo(direntry.name, &modelId)){
+ 				bAddToStreaming = true;
+ 			}else{
++				if(modernArchive &&
++				   (!ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WORLD) ||
++				    (!ModelSets::HasVegetationManifest() &&
++				     !ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEGETATION)))){
++					lastID = -1;
++					continue;
++				}
+ #ifdef FIX_BUGS
+ 				// remember which cdimage this came from
+ 				ms_pExtraObjectsDir->AddItem(direntry, n);
+@@ -457,12 +534,23 @@ CStreaming::LoadCdDirectory(const char *dirname, int n)
+ 			modelId += STREAM_OFFSET_TXD;
+ 			bAddToStreaming = true;
+ 		}else if(strncasecmp(dot+1, "COL", 3) == 0){
++			if(modernArchive && !ModelSets::IsCategoryModernActive(
++			   ModelSets::MODEL_CATEGORY_WORLD)){
++				lastID = -1;
++				continue;
++			}
+ 			modelId = CColStore::FindColSlot(direntry.name);
+ 			if(modelId == -1)
+ 				modelId = CColStore::AddColSlot(direntry.name);
+ 			modelId += STREAM_OFFSET_COL;
+ 			bAddToStreaming = true;
+ 		}else if(strncasecmp(dot+1, "IFP", 3) == 0){
++			if(modernArchive &&
++			   !ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_PEDS) &&
++			   !ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WEAPONS)){
++				lastID = -1;
++				continue;
++			}
+ 			modelId = CAnimManager::RegisterAnimBlock(direntry.name);
+ 			modelId += STREAM_OFFSET_ANIM;
+ 			bAddToStreaming = true;
+@@ -472,7 +560,26 @@ CStreaming::LoadCdDirectory(const char *dirname, int n)
+ 		}
+ 
+ 		if(bAddToStreaming){
++			if(modernArchive && !ShouldUseModernArchiveEntry(dot+1, modelId)){
++				lastID = -1;
++				continue;
++			}
+ 			if(ms_aInfoForModel[modelId].GetCdSize()){
++				uint32 existingImage = ms_aInfoForModel[modelId].m_position >> 24;
++				const char *existingImageName =
++					existingImage < (uint32)CdStreamGetNumImages() ?
++					CdStreamGetImageName(existingImage) : nil;
++				const bool existingIsModern = ModelSets::IsModernAssetPath(existingImageName);
++				if(modernArchive){
++					direntry.offset |= imgSelector;
++					ms_aInfoForModel[modelId].SetCdPosnAndSize(direntry.offset, direntry.size);
++					lastID = -1;
++					continue;
++				}
++				if(existingIsModern){
++					lastID = -1;
++					continue;
++				}
+ 				debug("%s.%s appears more than once in %s\n", direntry.name, dot+1, dirname);
+ 				lastID = -1;
+ 			}else{
+diff --git a/src/extras/custompipes.cpp b/src/extras/custompipes.cpp
+index 47cecd0..c99d69c 100644
+--- a/src/extras/custompipes.cpp
++++ b/src/extras/custompipes.cpp
+@@ -132,6 +132,12 @@ EnvMapRender(void)
+ 	if(FindPlayerPed() == nil)
+ 		return;
+ 
++	// Refreshing the low-frequency vehicle reflection by rendering the complete
++	// world every frame is disproportionately expensive on the mobile tiler.
++	static uint32 envMapFrameCounter;
++	if(++envMapFrameCounter % 9 != 1)
++		return;
++
+ 	RwCameraEndUpdate(Scene.camera);
+ 
+ 	// Neo does this differently, but i'm not quite convinced it's much better
+diff --git a/src/peds/PedAI.cpp b/src/peds/PedAI.cpp
+index cd8b06f..2db4ed7 100644
+--- a/src/peds/PedAI.cpp
++++ b/src/peds/PedAI.cpp
+@@ -4642,6 +4642,30 @@ CPed::GetNearestDoor(CVehicle *veh, CVector &posToOpen)
+ 
+ 	CVector lfPos = GetPositionToOpenCarDoor(veh, CAR_DOOR_LF);
+ 	CVector rfPos = GetPositionToOpenCarDoor(veh, CAR_DOOR_RF);
++	if (veh->GetModelIndex() == MI_VCNMAV) {
++		// Some replacement helicopter COLs include wide skid spheres while
++		// retaining the stock seat and enter animation.  VCNMAV's resulting
++		// stock seek points, for example, sit inside those spheres and the ped
++		// can only push/circle the helicopter.  Move only the pre-animation seek
++		// targets to the lateral collision edge.  LineUpPedWithCar continues to
++		// use the authored door/seat positions once the enter animation starts.
++		CColModel *colModel = veh->GetColModel();
++		if (colModel) {
++			CVector localLf = GetLocalPositionToOpenCarDoor(veh, CAR_DOOR_LF, 1.0f);
++			CVector localRf = GetLocalPositionToOpenCarDoor(veh, CAR_DOOR_RF, 1.0f);
++			if (localLf.x > colModel->boundingBox.min.x) {
++				// Match PositionPedOutOfCollision's ped-radius clearance so
++				// the target itself is physically reachable, rather than merely
++				// relying on Seek's 0.5 m completion tolerance.
++				localLf.x = colModel->boundingBox.min.x - 0.355f;
++				lfPos = veh->GetPosition() + Multiply3x3(veh->GetMatrix(), localLf);
++			}
++			if (localRf.x < colModel->boundingBox.max.x) {
++				localRf.x = colModel->boundingBox.max.x + 0.355f;
++				rfPos = veh->GetPosition() + Multiply3x3(veh->GetMatrix(), localRf);
++			}
++		}
++	}
+ 
+ 	// Left front door is closer
+ 	if ((lfPos - GetPosition()).MagnitudeSqr2D() < (rfPos - GetPosition()).MagnitudeSqr2D()) {
+diff --git a/src/peds/PlayerPed.cpp b/src/peds/PlayerPed.cpp
+index 7815aab..2ae6876 100644
+--- a/src/peds/PlayerPed.cpp
++++ b/src/peds/PlayerPed.cpp
+@@ -2042,7 +2042,7 @@ CPlayerPed::ProcessPlayerWeapon(CPad *padUsed)
+ 			vrLastWeapon[hand] = vrWeaponType;
+ 			vrNextFireTime[hand] = 0;
+ 		}
+-		if(!OculusVR::IsTrackedWeaponTriggerPressed(hand)){
++		if(!OculusVR::IsTrackedWeaponFireTriggerPressed(hand, vrWeaponType)){
+ 			vrNextFireTime[hand] = 0;
+ 			vrWaitForTriggerRelease[hand] = false;
+ 			continue;
+@@ -2052,7 +2052,7 @@ CPlayerPed::ProcessPlayerWeapon(CPad *padUsed)
+ 		if(vrWaitForTriggerRelease[hand])
+ 			continue;
+ 		const bool fireThisFrame = vrAutomaticWeapon ||
+-			OculusVR::IsTrackedWeaponTriggerJustPressed(hand);
++			OculusVR::IsTrackedWeaponFireTriggerJustPressed(hand, vrWeaponType);
+ 		CVector vrFireSource, vrFireDirection;
+ 		const bool haveTrackedAim = OculusVR::GetTrackedWeaponAim(
+ 			hand, vrWeaponType, &vrFireSource, &vrFireDirection);
+diff --git a/src/rw/TxdStore.cpp b/src/rw/TxdStore.cpp
+index 43b1472..bdf15f2 100644
+--- a/src/rw/TxdStore.cpp
++++ b/src/rw/TxdStore.cpp
+@@ -3,6 +3,7 @@
+ #include "templates.h"
+ #include "General.h"
+ #include "Streaming.h"
++#include "ModelSets.h"
+ #include "RwHelper.h"
+ #include "TxdStore.h"
+ 
+@@ -143,6 +144,9 @@ CTxdStore::LoadTxd(int slot, const char *filename)
+ {
+ 	RwStream *stream;
+ 	bool ret;
++	char resolved[1024];
++	const char *modelSetFilename = ModelSets::ResolveAssetPath(filename,
++		resolved, sizeof(resolved));
+ 
+ 	ret = false;
+ 	_rwD3D8TexDictionaryEnableRasterFormatConversion(true);
+@@ -152,10 +156,13 @@ CTxdStore::LoadTxd(int slot, const char *filename)
+ 	// exactly how the splash screen presented on the headset. Bound it, and
+ 	// say which file failed.
+ 	for(int attempt = 0; attempt < 16; attempt++){
+-		stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
++		stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD,
++			modelSetFilename);
+ 		if(stream != nil)
+ 			break;
+ 	}
++	if(stream == nil && modelSetFilename != filename)
++		stream = RwStreamOpen(rwSTREAMFILENAME, rwSTREAMREAD, filename);
+ 	if(stream == nil){
+ 		printf("Failed to open TXD '%s' for slot %d\n", filename, slot);
+ 		return false;
+diff --git a/src/core/main.cpp b/src/core/main.cpp
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -2278,7 +2278,8 @@ static void
+ RenderVrCarSteeringWheel(void)
+ {
+-	if(!OculusVR::IsVrCarDrivingActive())
++	if(!OculusVR::IsVrCarDrivingActive() ||
++	   !OculusVR::ShouldRenderQuestImmersiveCarWheel())
+ 		return;
+ 	CMatrix leftHandle, rightHandle;
+ 	if(!OculusVR::GetImmersiveSteeringHandleMatrix(0, &leftHandle) ||
+ 	   !OculusVR::GetImmersiveSteeringHandleMatrix(1, &rightHandle))

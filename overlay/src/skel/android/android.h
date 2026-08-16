@@ -24,13 +24,21 @@ struct VulkanContext
 	unsigned int queueFamilyIndex;
 	unsigned int width;
 	unsigned int height;
+	float renderScaleEffectivePercent;
 	unsigned int viewCount;
 	VkFormat colourFormat;
 };
 
 // Runs rsINITIALIZE and rsRWINITIALIZE against the device the OpenXR session
 // already created.
-bool Initialise(const VulkanContext &context);
+bool Initialise(const VulkanContext &context,
+	bool *renderTargetStartupFailure = nullptr);
+
+// Completes the one-time game/frontend setup before OpenXR starts asking the
+// game for frames.  InitialiseOnceAfterRW can take hundreds of milliseconds;
+// doing it from Step would leave an already-begun XR frame open for that whole
+// time and make the compositor reproject a half-transitioned startup image.
+bool PrepareFrontendBeforeFrames(void);
 
 // Controller state pushed in from the OpenXR layer once per frame. CapturePad
 // turns it into the game's pad state, which is the same seam the desktop build
@@ -57,6 +65,10 @@ struct PadInput
 
 void SetPadInput(const PadInput &input);
 const PadInput &GetPadInput(void);
+// Weapon-fire vibration on one controller; forwarded to the OpenXR session.
+void TriggerWeaponHaptic(int hand, float strength);
+// Preferred display refresh rate in Hz; forwarded to the OpenXR session.
+void SetPreferredRefreshRate(int hz);
 
 // Renders the native Quest tracked hands after the world/effects pass. The
 // function is a no-op in cinema mode and until both OpenXR and the player
@@ -85,10 +97,12 @@ const unsigned char *VrDebugPixels(int *width, int *height);
 bool VrMenuConsumesInput(void);
 bool VrViceCityColorEnabled(void);
 bool VrFxaaEnabled(void);
+int VrSpatialAaMode(void);
 bool VrGameplayHudEnabled(void);
 void VrGetGameplayHudSettings(int *widthPercent, int *scalePercent,
                               int *offsetXCm, int *offsetYCm);
 bool VrUsesHeadRelativeMovement(void);
+bool VrHeadBobbingEnabled(void);
 bool VrUsesExperimentalHeadTurning(void);
 float VrHeadTurnScale(void);
 bool VrUsesSnapTurn(void);

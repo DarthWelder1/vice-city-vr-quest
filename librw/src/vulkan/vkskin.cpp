@@ -265,30 +265,6 @@ skinRenderCB(Atomic *atomic, InstanceDataHeader *header)
 	if(!uploadBoneMatrices(boneCount, &dynamicOffset))
 		return;
 
-	// Diagnostic for the reversed player model: the game data says the ped
-	// faces away from the camera while the rendered model faces it, so the
-	// 180 must be added somewhere between the hierarchy and the shader. If
-	// pose0 is near identity the frame carries it; if pose0 shows the flip,
-	// the bone chain does.
-	{
-		static int32 poseProbe = 0;
-		if((poseProbe++ % 600) == 0){
-			const Matrix *pose = (const Matrix*)gBoneMatrices;
-			const Matrix *ltm = atomic->getFrame()->getLTM();
-			HAnimHierarchy *hier = Skin::getHierarchy(atomic);
-			printf("[probe] pose0 r %.2f %.2f %.2f u %.2f %.2f %.2f "
-			       "at %.2f %.2f %.2f | ltm r %.2f %.2f at %.2f %.2f "
-			       "pos %.1f %.1f | hflags 0x%x\n",
-			       pose->right.x, pose->right.y, pose->right.z,
-			       pose->up.x, pose->up.y, pose->up.z,
-			       pose->at.x, pose->at.y, pose->at.z,
-			       ltm->right.x, ltm->right.y,
-			       ltm->at.x, ltm->at.y,
-			       ltm->pos.x, ltm->pos.y,
-			       hier != nil ? (uint32)hier->flags : 0xdead);
-		}
-	}
-
 	drawAtomicMeshes(atomic, header, SHADER_SKIN, &dynamicOffset);
 }
 

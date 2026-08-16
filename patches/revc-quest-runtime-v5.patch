@@ -1,0 +1,758 @@
+diff --git a/src/control/CarAI.cpp b/src/control/CarAI.cpp
+index 8e79fee..078a6ff 100644
+--- a/src/control/CarAI.cpp
++++ b/src/control/CarAI.cpp
+@@ -556,9 +556,16 @@ void CCarAI::AddPoliceCarOccupants(CVehicle* pVehicle)
+ 		return;
+ 	case MI_VICECHEE:
+ 	{
+-		pVehicle->SetUpDriver()->bMiamiViceCop = true;
+-		pVehicle->SetupPassenger(0)->bMiamiViceCop = true;
+-		CPopulation::NumMiamiViceCops += 2;
++		CPed *driver = pVehicle->SetUpDriver();
++		CPed *passenger = pVehicle->SetupPassenger(0);
++		if (driver) {
++			driver->bMiamiViceCop = true;
++			CPopulation::NumMiamiViceCops++;
++		}
++		if (passenger) {
++			passenger->bMiamiViceCop = true;
++			CPopulation::NumMiamiViceCops++;
++		}
+ 		CCarCtrl::MiamiViceCycle = (CCarCtrl::MiamiViceCycle + 1) % 4;
+ 		CCarCtrl::LastTimeMiamiViceGenerated = CTimer::GetTimeInMilliseconds();
+ 		return;
+diff --git a/src/control/PathFind.cpp b/src/control/PathFind.cpp
+index bf72199..3d1c417 100644
+--- a/src/control/PathFind.cpp
++++ b/src/control/PathFind.cpp
+@@ -524,9 +524,25 @@ CPathFind::PreparePathData(void)
+ 		delete[] TempExternalNodes;
+ 		TempExternalNodes = nil;
+ 	}
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Scripts have not run yet, so every disabled flag at this point came
++	// from the map data itself.
++	RememberMapDisabledNodes();
++#endif
+ 	printf("Done with PreparePathData\n");
+ }
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++void
++CPathFind::RememberMapDisabledNodes(void)
++{
++	memset(m_mapDisabledNodes, 0, sizeof(m_mapDisabledNodes));
++	for(int i = 0; i < m_numPathNodes; i++)
++		if(m_pathNodes[i].bDisabled)
++			m_mapDisabledNodes[i >> 5] |= 1u << (i & 31);
++}
++#endif
++
+ /* String together connected nodes in a list by a flood fill algorithm */
+ void
+ CPathFind::CountFloodFillGroups(uint8 type)
+diff --git a/src/control/PathFind.h b/src/control/PathFind.h
+index 9975959..2db35ce 100644
+--- a/src/control/PathFind.h
++++ b/src/control/PathFind.h
+@@ -268,6 +268,17 @@ public:
+ 	void Save(uint8 *buf, uint32 *size);
+ 	void Load(uint8 *buf, uint32 size);
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Which nodes the map itself ships switched off (beach lanes, decorative
++	// paths). The script's runtime closures (hurricane bridges) are the only
++	// ones the dev road unlock may reopen; map-off nodes must stay off or
++	// ambient traffic starts routing over beaches.
++	uint32 m_mapDisabledNodes[(NUM_PATHNODES + 31) / 32];
++	void RememberMapDisabledNodes(void);
++	bool WasDisabledByMap(int32 node) const
++		{ return !!(m_mapDisabledNodes[node >> 5] & (1u << (node & 31))); }
++#endif
++
+ 	static CVector TakeWidthIntoAccountForWandering(CPathNode*, uint16);
+ 	static void TakeWidthIntoAccountForCoors(CPathNode*, CPathNode*, uint16, float*, float*);
+ 
+diff --git a/src/control/Pickups.cpp b/src/control/Pickups.cpp
+index 7bc8832..91ca013 100644
+--- a/src/control/Pickups.cpp
++++ b/src/control/Pickups.cpp
+@@ -1671,4 +1671,4 @@ CPed::CreateDeadPedPickupCoors(float *x, float *y, float *z)
+ 	*y = GetPosition().y;
+ 	*z = GetPosition().z + 0.4f;
+ #undef NUMBER_OF_ATTEMPTS
+-}
+\ No newline at end of file
++}
+diff --git a/src/control/RoadBlocks.cpp b/src/control/RoadBlocks.cpp
+index 4f714e8..649dd56 100644
+--- a/src/control/RoadBlocks.cpp
++++ b/src/control/RoadBlocks.cpp
+@@ -15,6 +15,7 @@
+ #include "CarCtrl.h"
+ #include "General.h"
+ #include "Object.h"
++#include "Pools.h"
+ 
+ #define ROADBLOCKDIST (90.0f)
+ #define ROADBLOCK_OBJECT_WIDTH (4.0f)
+@@ -84,6 +85,12 @@ CRoadBlocks::GenerateRoadBlockCopsForCar(CVehicle* pVehicle, int32 roadBlockType
+ 		}
+ 		if (!CStreaming::HasModelLoaded(modelInfoId))
+ 			copType = COP_STREET;
++		// A roadblock can request two officers in the same frame.  The custom
++		// ped allocator returns null when the physical pool is full, but C++
++		// would still enter the constructor on that null address.  Keep this
++		// optional reinforcement from consuming the last mission-reserved slot.
++		if (CPools::GetPedPool()->GetNoOfFreeSpaces() <= 1)
++			break;
+ 		CCopPed* pCopPed = new CCopPed(copType);
+ 		if (copType == COP_STREET)
+ 			pCopPed->SetCurrentWeapon(WEAPONTYPE_COLT45);
+diff --git a/src/control/Script7.cpp b/src/control/Script7.cpp
+index 71099cc..6ba9021 100644
+--- a/src/control/Script7.cpp
++++ b/src/control/Script7.cpp
+@@ -1180,6 +1180,11 @@ int8 CRunningScript::ProcessCommands1300To1399(int32 command)
+ 		CollectParameters(&m_nIp, 1);
+ 		CVehicle* pVehicle = CPools::GetVehiclePool()->GetAt(ScriptParams[0]);
+ 		CPed* pPed = CPopulation::AddPedInCar(pVehicle, true);
++		if (pPed == nil) {
++			ScriptParams[0] = -1;
++			StoreParameters(&m_nIp, 1);
++			return 0;
++		}
+ 		pPed->CharCreatedBy = MISSION_CHAR;
+ 		pPed->bRespondsToThreats = false;
+ 		pPed->bAllowMedicsToReviveMe = false;
+@@ -1211,6 +1216,11 @@ int8 CRunningScript::ProcessCommands1300To1399(int32 command)
+ 		CollectParameters(&m_nIp, 2);
+ 		CVehicle* pVehicle = CPools::GetVehiclePool()->GetAt(ScriptParams[0]);
+ 		CPed* pPed = CPopulation::AddPedInCar(pVehicle, false);
++		if (pPed == nil) {
++			ScriptParams[0] = -1;
++			StoreParameters(&m_nIp, 1);
++			return 0;
++		}
+ 		pPed->CharCreatedBy = MISSION_CHAR;
+ 		pPed->bRespondsToThreats = false;
+ 		pPed->bAllowMedicsToReviveMe = false;
+diff --git a/src/control/SetPieces.cpp b/src/control/SetPieces.cpp
+index 0409a8b..8f5266b 100644
+--- a/src/control/SetPieces.cpp
++++ b/src/control/SetPieces.cpp
+@@ -11,6 +11,7 @@
+ #include "Wanted.h"
+ #include "World.h"
+ #include "VarConsole.h"
++#include "Pools.h"
+ 
+ #define TIME_BETWEEN_SETPIECE_SPAWNS 20000
+ 
+@@ -306,6 +307,10 @@ CVehicle* CSetPiece::TryToGenerateCopCar(CVector2D vSpawn, CVector2D vTarget)
+ 
+ CCopPed* CSetPiece::TryToGenerateCopPed(CVector2D vSpawn)
+ {
++	// Set-piece police is optional.  Never invoke the pool-backed constructor
++	// when no physical ped slot is available.
++	if (CPools::GetPedPool()->GetNoOfFreeSpaces() <= 1)
++		return nil;
+ 	CCopPed* pCop = new CCopPed(COP_STREET);
+ 	CVector pos(vSpawn.x, vSpawn.y, 1000.0f);
+ 	CColPoint point;
+@@ -321,4 +326,4 @@ CCopPed* CSetPiece::TryToGenerateCopPed(CVector2D vSpawn)
+ 	}
+ 	CWorld::Add(pCop);
+ 	return pCop;
+-}
+\ No newline at end of file
++}
+diff --git a/src/core/Frontend.cpp b/src/core/Frontend.cpp
+index bb27765..a187b88 100644
+--- a/src/core/Frontend.cpp
++++ b/src/core/Frontend.cpp
+@@ -541,6 +541,12 @@ CMenuManager::CMenuManager()
+ 
+ #ifdef NO_ISLAND_LOADING
+ 	m_PrefsIslandLoading = ISLAND_LOADING_LOW;
++#elif defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// The Quest streamer is handed 1.5GB — the whole map fits resident.
++	// Full residency removes the island-transition purge and its loading
++	// pause, keeping bridge traffic continuous. A saved user choice still
++	// overrides this default afterwards.
++	m_PrefsIslandLoading = ISLAND_LOADING_HIGH;
+ #endif
+ 
+ #ifdef GAMEPAD_MENU
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index e0ca169..1176f05 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -847,6 +847,10 @@ void CGame::InitialiseWhenRestarting(void)
+ 
+ void CGame::Process(void) 
+ {
++	#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerBeginPhase(
++		androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++	#endif
+ 	CPad::UpdatePads();
+ #ifdef USE_CUSTOM_ALLOCATOR
+ 	ProcessTidyUpMemory();
+@@ -873,6 +877,8 @@ void CGame::Process(void)
+ 	OculusVR::PerfBeginPhase(OculusVR::PERF_PHASE_STREAMING);
+ #endif
+ #if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerEndPhase(
++		androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
+ 	androidgame::QuestProfilerBeginPhase(
+ 		androidgame::QUEST_PROFILER_PHASE_STREAMING);
+ #endif
+@@ -880,6 +886,8 @@ void CGame::Process(void)
+ #if defined(RW_VULKAN) && defined(__ANDROID__)
+ 	androidgame::QuestProfilerEndPhase(
+ 		androidgame::QUEST_PROFILER_PHASE_STREAMING);
++	androidgame::QuestProfilerBeginPhase(
++		androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
+ #endif
+ #ifdef GTA_VR_OCULUS
+ 	OculusVR::PerfEndPhase(OculusVR::PERF_PHASE_STREAMING);
+@@ -904,9 +912,21 @@ void CGame::Process(void)
+ 		CClock::Update();
+ 		CWeather::Update();
+ 
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_SCRIPT);
++		#endif
+ 		PUSH_MEMID(MEMID_SCRIPT);
+ 		CTheScripts::Process();
+ 		POP_MEMID();
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_SCRIPT);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		#endif
+ 
+ 		CCollision::Update();
+ 		CScriptPaths::Update();
+@@ -922,8 +942,41 @@ void CGame::Process(void)
+ #endif
+ 		CSetPieces::Update();
+ 		CEventList::Update();
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_PARTICLE_UPDATE);
++		#endif
+ 		CParticle::Update();
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_PARTICLE_UPDATE);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		#endif
+ 		gFireManager.Update();
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_POPULATION);
++		#endif
++		#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++		// Streaming spikes used to disable both pedestrian and car generation
++		// indefinitely. Keep the normal 2 ms protection, but grant staggered
++		// rescue ticks so high-density settings always converge once there is
++		// room. Ped and car work deliberately run on different phases.
++		const bool allowPedGeneration = processTime < 2 ||
++			(CTimer::GetFrameCounter() & 3) == 0;
++		const uint32 populationStartTime =
++			CTimer::GetCurrentTimeInCycles() /
++			CTimer::GetCyclesPerMillisecond();
++		CPopulation::Update(allowPedGeneration);
++		const uint32 populationProcessTime =
++			CTimer::GetCurrentTimeInCycles() /
++			CTimer::GetCyclesPerMillisecond() - populationStartTime;
++		#else
+ 		if (processTime >= 2) {
+ 			CPopulation::Update(false);
+ 		} else {
+@@ -931,6 +984,13 @@ void CGame::Process(void)
+ 			CPopulation::Update(true);
+ 			processTime = CTimer::GetCurrentTimeInCycles() / CTimer::GetCyclesPerMillisecond() - startTime;
+ 		}
++		#endif
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_POPULATION);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		#endif
+ 		CWeapon::UpdateWeapons();
+ 		if (!CCutsceneMgr::IsRunning())
+ 			CTheCarGenerators::Process();
+@@ -942,9 +1002,21 @@ void CGame::Process(void)
+ 		CUserDisplay::Process();
+ 		CReplay::Update();
+ 
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_WORLD_PROCESS);
++		#endif
+ 		PUSH_MEMID(MEMID_WORLD);
+ 		CWorld::Process();
+ 		POP_MEMID();
++		#if defined(RW_VULKAN) && defined(__ANDROID__)
++		androidgame::QuestProfilerEndPhase(
++			androidgame::QUEST_PROFILER_PHASE_WORLD_PROCESS);
++		androidgame::QuestProfilerBeginPhase(
++			androidgame::QUEST_PROFILER_PHASE_POST_WORLD_CAMERA_FX);
++		#endif
+ 
+ 		gAccidentManager.Update();
+ 		CPacManPickups::Update();
+@@ -967,15 +1039,41 @@ void CGame::Process(void)
+ 		gPhoneInfo.Update();
+ 		if (!CReplay::IsPlayingBack())
+ 		{
++			#if defined(RW_VULKAN) && defined(__ANDROID__)
++			androidgame::QuestProfilerEndPhase(
++				androidgame::QUEST_PROFILER_PHASE_POST_WORLD_CAMERA_FX);
++			androidgame::QuestProfilerBeginPhase(
++				androidgame::QUEST_PROFILER_PHASE_CAR);
++			#endif
+ 			PUSH_MEMID(MEMID_CARS);
++			#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++			const bool allowCarGeneration =
++				(processTime < 2 && populationProcessTime < 2) ||
++				(CTimer::GetFrameCounter() & 3) == 2;
++			if (allowCarGeneration)
++				CCarCtrl::GenerateRandomCars();
++			#else
+ 			if (processTime < 2)
+ 				CCarCtrl::GenerateRandomCars();
++			#endif
+ 			CRoadBlocks::GenerateRoadBlocks();
+ 			CCarCtrl::RemoveDistantCars();
+ 			CCarCtrl::RemoveCarsIfThePoolGetsFull();
+ 			POP_MEMID();
++			#if defined(RW_VULKAN) && defined(__ANDROID__)
++			androidgame::QuestProfilerEndPhase(
++				androidgame::QUEST_PROFILER_PHASE_CAR);
++			androidgame::QuestProfilerBeginPhase(
++				androidgame::QUEST_PROFILER_PHASE_POST_WORLD_CAMERA_FX);
++			#endif
+ 		}
+ 	}
++	#if defined(RW_VULKAN) && defined(__ANDROID__)
++	androidgame::QuestProfilerEndPhase(
++		androidgame::QUEST_PROFILER_PHASE_PRE_WORLD_MISC);
++	androidgame::QuestProfilerEndPhase(
++		androidgame::QUEST_PROFILER_PHASE_POST_WORLD_CAMERA_FX);
++	#endif
+ #ifdef GTA_PS2
+ 	CMemCheck::DoTest();
+ #endif
+diff --git a/src/core/Ropes.cpp b/src/core/Ropes.cpp
+index 0b3215d..fa783de 100644
+--- a/src/core/Ropes.cpp
++++ b/src/core/Ropes.cpp
+@@ -169,6 +169,8 @@ CRopes::CreateRopeWithSwatComingDown(CVector pos)
+ 	if(!CStreaming::HasModelLoaded(MI_SWAT) || !RegisterRope(ropeId+100, pos, true))
+ 		return false;
+ 	CCopPed *swat = (CCopPed*)CPopulation::AddPed(PEDTYPE_COP, COP_HELI_SWAT, pos);
++	if (swat == nil)
++		return false;
+ 	swat->bUsesCollision = false;
+ 	swat->m_pRopeEntity = (CEntity*)1;
+ 	swat->m_nRopeID = 100 + ropeId;
+diff --git a/src/core/Streaming.cpp b/src/core/Streaming.cpp
+index 9d192dc..7d420c2 100644
+--- a/src/core/Streaming.cpp
++++ b/src/core/Streaming.cpp
+@@ -2032,6 +2032,20 @@ CStreaming::LoadBigBuildingsWhenNeeded(void)
+ 
+ 	CTimer::Suspend();
+ 	CGame::currLevel = CTheZones::m_CurrLevel;
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// With full island residency a crossing needs no loading at all — and
++	// the legacy blocking transition below (splash plus a synchronous
++	// LoadAllRequestedModels inside one frame) deadlocks the VR frame
++	// loop, whose batched GPU uploads only drain between frames. Note the
++	// new level and keep driving; nothing else is required when
++	// everything is resident.
++	if (FrontEndMenuManager.m_PrefsIslandLoading ==
++	    CMenuManager::ISLAND_LOADING_HIGH) {
++		CReplay::EmptyReplayBuffer();
++		CTimer::Resume();
++		return;
++	}
++#endif
+ 	ISLAND_LOADING_IS(LOW)
+ 	{
+ 		DMAudio.SetEffectsFadeVol(0);
+@@ -2854,6 +2868,18 @@ CStreaming::DeleteFarAwayRwObjects(const CVector &pos)
+ 	int r, i;
+ 	CSector *sect;
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// The "wake" wedge behind the player's movement starts a mere two
++	// sectors out and is fully visible in VR: the head turns freely, the
++	// car reverses and zigzags, and this legacy trim keeps deleting the
++	// visuals of props the player is actually looking at. They stay
++	// invisible (and, as dummies, intangible) until the lazy re-creation
++	// catches up — the vanishing-props bug. With the headset's streaming
++	// budget this memory trim buys nothing; genuine memory pressure is
++	// still handled by the ordinary eviction paths.
++	return;
++#endif
++
+ 	posx = CWorld::GetSectorIndexX(pos.x);
+ 	posy = CWorld::GetSectorIndexY(pos.y);
+ 
+diff --git a/src/core/config.h b/src/core/config.h
+index 284e2ee..a227f2d 100644
+--- a/src/core/config.h
++++ b/src/core/config.h
+@@ -11,7 +11,16 @@ enum Config {
+ 	MAX_CDCHANNELS = 5,
+ 
+ 	MODELINFOSIZE = 6500,	// 4900 on PS2
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Full-map residency keeps both islands' texture dictionaries loaded
++	// at once; the stock store overflows and every subsequent TXD load
++	// fails — models, peds and even the frontend render white. The same
++	// overflow was reported on PC after an island crossing with the
++	// no-island-loading option. NUMSTREAMINFO scales with this constant.
++	TXDSTORESIZE = 2200,
++#else
+ 	TXDSTORESIZE = 1385,
++#endif
+ 	COLSTORESIZE = 31,
+ 	EXTRADIRSIZE = 256,
+ 	CUTSCENEDIRSIZE = 512,
+@@ -30,13 +39,36 @@ enum Config {
+ 
+ 	// Pool sizes
+ 	NUMPTRNODES = 50000,
++	#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Every moving physical entity needs one entry-info node for every world
++	// sector its bounds overlap. The stock 3200-node pool is exhausted when
++	// high Quest traffic and combat debris coexist, making CPhysical::Add
++	// dereference a null allocation. This costs well under one megabyte and
++	// leaves ample headroom for the 300% traffic mode.
++	NUMENTRYINFOS = 12000,
++	#else
+ 	NUMENTRYINFOS = 3200,
++	#endif
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// High-density VR traffic keeps ambient walkers, vehicle occupants, cops
++	// and mission actors alive at the same time.  Keep this below 256 because
++	// replay/save code still stores ped pool indices in a uint8.
++	NUMPEDS = 220,
++#else
+ 	NUMPEDS = 140,
++#endif
+ 	NUMVEHICLES = 110,
+ 	NUMBUILDINGS = 7000,
+ 	NUMTREADABLES = 1,
+ 	NUMOBJECTS = 460,
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// Full-map residency (forced ISLAND_LOADING_HIGH) keeps the dynamic
++	// props of every island alive as dummies at once; the stock pool sits
++	// at ~19 free slots and any churn spike starts eating props.
++	NUMDUMMIES = 3400,
++#else
+ 	NUMDUMMIES = 2340,
++#endif
+ 	NUMAUDIOSCRIPTOBJECTS = 192,
+ 	NUMCOLMODELS = 4400,
+ 	NUMCUTSCENEOBJECTS = 50,	// not a pool in VC
+@@ -56,7 +88,12 @@ enum Config {
+ 	NUMALPHALIST = 20,
+ 	NUMBOATALPHALIST = 20,
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-	NUMALPHAENTITYLIST = 600,
++	// Every entity inside its fade band renders ONLY through this sorted
++	// list; a full list silently drops the entity for the frame. The
++	// director-density world saturates 600 routinely — short-draw props
++	// (bollards 40m, hydrants 40m, street lamps 55-62m, traffic lights
++	// 80m) then blink out deterministically at their band distances.
++	NUMALPHAENTITYLIST = 2048,
+ #else
+ 	NUMALPHAENTITYLIST = 200,
+ #endif
+@@ -128,7 +165,10 @@ enum Config {
+ 	NUM_SCRIPT_ROADBLOCKS = 16,
+ 
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-	NUMVISIBLEENTITIES = 6000,
++	// Full-map residency plus the 360° VR scan can exceed 6000 entities
++	// near the island boundary; overflow silently drops the last-scanned
++	// entities — street props visibly vanishing while they still exist.
++	NUMVISIBLEENTITIES = 9000,
+ #else
+ 	NUMVISIBLEENTITIES = 2000,
+ #endif
+diff --git a/src/core/re3.cpp b/src/core/re3.cpp
+index ec31638..678b7f9 100644
+--- a/src/core/re3.cpp
++++ b/src/core/re3.cpp
+@@ -568,6 +568,15 @@ bool LoadINISettings()
+ 	}
+ #endif
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// The Quest streamer is handed 1.5GB — the whole map stays resident.
++	// Force full island residency regardless of what an older ini stored:
++	// it removes the island-transition purge and its loading pause, and
++	// keeps bridge traffic continuous.
++	FrontEndMenuManager.m_PrefsIslandLoading =
++		CMenuManager::ISLAND_LOADING_HIGH;
++#endif
++
+ 	return true;
+ }
+ 
+diff --git a/src/entities/Physical.h b/src/entities/Physical.h
+index 926b976..969cb8d 100644
+--- a/src/entities/Physical.h
++++ b/src/entities/Physical.h
+@@ -174,4 +174,17 @@ public:
+ 	bool ProcessCollisionSectorList(CPtrList *lists);
+ 	bool CheckCollision(void);
+ 	bool CheckCollision_SimpleCar(void);
++
++	// Quest-only, main-thread cache for repeated collision sector-list walks.
++	// The methods are harmless no-ops on other builds.
++	bool BeginVrCollisionFlatCacheScope(void);
++	void EndVrCollisionFlatCacheScope(void);
++	static void ResetVrCollisionFlatCacheDiagnostics(void);
++	static int32 NumVrCollisionFlatScopes;
++	static int32 NumVrCollisionFlatBuilds;
++	static int32 NumVrCollisionFlatReuses;
++	static int32 NumVrCollisionFlatStale;
++	static int32 NumVrCollisionFlatOverflows;
++	static int32 NumVrCollisionFlatItems;
++	static int32 NumVrCollisionFlatSavedNodeVisits;
+ };
+diff --git a/src/peds/Population.h b/src/peds/Population.h
+index 8c58f1b..dd21cc2 100644
+--- a/src/peds/Population.h
++++ b/src/peds/Population.h
+@@ -20,6 +20,9 @@ public:
+ 	static bool ms_bGivePedsWeapons;
+ 	static int32 m_AllRandomPedsThisType;
+ 	static float PedDensityMultiplier;
++	// Live authored-zone target used by the Quest traffic menu/profiler. This
++	// is deliberately separate from the hard pool/cap value.
++	static float VrTargetAmbientPeds;
+ 	static uint32 ms_nTotalMissionPeds;
+ 	static int32 MaxNumberOfPedsInUse;
+ 	static int32 MaxNumberOfPedsInUseInterior;
+diff --git a/src/render/Particle.cpp b/src/render/Particle.cpp
+index 14b4824..88223af 100644
+--- a/src/render/Particle.cpp
++++ b/src/render/Particle.cpp
+@@ -1784,6 +1784,27 @@ void CParticle::Update()
+ 	}
+ }
+ 
++int32
++CParticle::GetActiveCount(tParticleType type)
++{
++	if(type < 0 || type >= MAX_PARTICLES)
++		return 0;
++	int32 count = 0;
++	for(CParticle *particle = mod_ParticleSystemManager.m_aParticles[type].m_pParticles;
++	    particle; particle = particle->m_pNext)
++		count++;
++	return count;
++}
++
++int32
++CParticle::GetTotalActiveCount(void)
++{
++	int32 count = 0;
++	for(int32 type = 0; type < MAX_PARTICLES; type++)
++		count += GetActiveCount((tParticleType)type);
++	return count;
++}
++
+ void CParticle::Render()
+ {
+ 	PUSH_RENDERGROUP("CParticle::Render");
+diff --git a/src/render/Particle.h b/src/render/Particle.h
+index 5542dc0..c627794 100644
+--- a/src/render/Particle.h
++++ b/src/render/Particle.h
+@@ -67,6 +67,8 @@ public:
+ 
+ 	static void Update();
+ 	static void Render();
++	static int32 GetActiveCount(tParticleType type);
++	static int32 GetTotalActiveCount(void);
+ 
+ 	static void RemovePSystem(tParticleType type);
+ 	static void RemoveParticle(CParticle *pParticle, CParticle *pPrevParticle, tParticleSystemData *pPSystemData);
+diff --git a/src/render/Weather.cpp b/src/render/Weather.cpp
+index 5d06280..aa7a978 100644
+--- a/src/render/Weather.cpp
++++ b/src/render/Weather.cpp
+@@ -427,6 +427,9 @@ void CWeather::AddStreamAfterRain()
+ 
+ void CWeather::AddRain()
+ {
++#ifdef __ANDROID__
++	static float rainDropCarry = 0.0f;
++#endif
+ 	if (CCullZones::CamNoRain() || CCullZones::PlayerNoRain())
+ 		return;
+ 	if (TheCamera.GetLookingLRBFirstPerson()) {
+@@ -454,10 +457,37 @@ void CWeather::AddRain()
+ 		AddSplashesDuringHurricane();
+ 
+ 	if (Rain <= 0.1f)
++	{
++#ifdef __ANDROID__
++		// Do not carry a fractional burst into the next storm.
++		rainDropCarry = 0.0f;
++#endif
+ 		return;
++	}
+ 	static RwRGBA colour;
+-	int numDrops = 5.0f * Rain;
++	int numDrops;
++#ifdef __ANDROID__
++	// The original emitted an authored number of drops every rendered frame at
++	// roughly 30 Hz. At 72 Hz this fills the 750-particle pool with about 2.4x
++	// as many translucent rain/splash sprites and becomes an alpha-overdraw
++	// bottleneck in both eyes. Preserve a stable real-time rate with fractional
++	// carry; retain most visible screen rain while reducing redundant splashes.
++	const float frameScale30Hz = Min(Max(
++		CTimer::GetTimeStepInSeconds()*30.0f, 0.0f), 1.0f);
++	const float vrRainDensity = 0.65f;
++	const float requestedDrops = 5.0f*Rain*frameScale30Hz*vrRainDensity +
++		rainDropCarry;
++	numDrops = (int)requestedDrops;
++	rainDropCarry = requestedDrops-numDrops;
++#else
++	numDrops = 5.0f * Rain;
++#endif
+ 	int numSplashes = 2.0f * Rain;
++#ifdef __ANDROID__
++	const int extraSplashes = 8;
++#else
++	const int extraSplashes = 15;
++#endif
+ 	CVector pos, dir;
+ 	for(int i = 0; i < numDrops; i++){
+ 		pos.x = CGeneral::GetRandomNumberInRange(0, (int)SCREEN_WIDTH);
+@@ -498,7 +528,7 @@ void CWeather::AddRain()
+ 		CEntity *ent;
+ 		if(CWorld::ProcessVerticalLine(pos+CVector(0.0f, 0.0f, 40.0f), -40.0f, point, ent, true, false, false, false, true, false, nil)){
+ 			pos.z = point.point.z;
+-			for(int j = 0; j < numSplashes+15; j++){
++			for(int j = 0; j < numSplashes+extraSplashes; j++){
+ 				CVector pos2 = pos;
+ 				pos2.x += CGeneral::GetRandomNumberInRange(-15.0f, 15.0f);
+ 				pos2.y += CGeneral::GetRandomNumberInRange(-15.0f, 15.0f);
+diff --git a/src/vehicles/Heli.cpp b/src/vehicles/Heli.cpp
+index bf14416..c04d73e 100644
+--- a/src/vehicles/Heli.cpp
++++ b/src/vehicles/Heli.cpp
+@@ -554,7 +554,9 @@ void
+ CHeli::PreRender(void)
+ {
+ 	float radius = (GetPosition().z - FindPlayerCoors().z - 10.0f - 1.0f) * 0.3f + 10.0f;
+-	HeliDustGenerate(this, radius, FindPlayerCoors().z, Max(16.0f - 4.0f*CTimer::GetTimeStep(), 2.0f));
++	const float authoredTimeStep = 50.0f/30.0f;
++	HeliDustGenerate(this, radius, FindPlayerCoors().z,
++		Max(16.0f-4.0f*authoredTimeStep, 2.0f));
+ 	CShadows::StoreShadowForVehicle(this, VEH_SHD_TYPE_HELI);
+ }
+ 
+@@ -731,6 +733,8 @@ CHeli::SendDownSwat(void)
+ 	float groundZ = CWorld::FindGroundZFor3DCoord(pos.x, pos.y, pos.z, nil);
+ 	if(Abs(FindPlayerCoors().z - groundZ) < 2.5f && CRopes::RegisterRope((uintptr)this + m_numSwat-1, pos, false)){
+ 		CCopPed *swat = (CCopPed*)CPopulation::AddPed(PEDTYPE_COP, COP_HELI_SWAT, pos);
++		if (swat == nil)
++			return false;
+ 		swat->bUsesCollision = false;
+ 		swat->m_pRopeEntity = this;
+ 		RegisterReference(&swat->m_pRopeEntity);
+diff --git a/src/vehicles/Vehicle.cpp b/src/vehicles/Vehicle.cpp
+index 4e6c24e..952f571 100644
+--- a/src/vehicles/Vehicle.cpp
++++ b/src/vehicles/Vehicle.cpp
+@@ -1791,6 +1791,8 @@ CVehicle::SetUpDriver(void)
+ 		return nil;
+ 
+ 	pDriver = CPopulation::AddPedInCar(this, true);
++	if (pDriver == nil)
++		return nil;
+ 	pDriver->m_pMyVehicle = this;
+ 	pDriver->m_pMyVehicle->RegisterReference((CEntity**)&pDriver->m_pMyVehicle);
+ 	pDriver->bInVehicle = true;
+@@ -1812,6 +1814,8 @@ CVehicle::SetupPassenger(int n)
+ 		pPassengers[0] = nil;
+ 	else{
+ 		CPed *passenger = CPopulation::AddPedInCar(this, false);
++		if (passenger == nil)
++			return nil;
+ 		pPassengers[n] = passenger;
+ 		passenger->m_pMyVehicle = this;
+ 		passenger->m_pMyVehicle->RegisterReference((CEntity**)&pPassengers[n]->m_pMyVehicle);
+@@ -2095,7 +2099,7 @@ CVehicle::UpdateClumpAlpha(void)
+ }
+ 
+ void
+-CVehicle::HeliDustGenerate(CEntity *heli, float radius, float ground, int rnd)
++CVehicle::HeliDustGenerate(CEntity *heli, float radius, float ground, float particlesAt30Hz)
+ {
+ 	int i;
+ 	float angle;
+@@ -2106,6 +2110,36 @@ CVehicle::HeliDustGenerate(CEntity *heli, float radius, float ground, int rnd)
+ 	if(heli == nil)
+ 		return;
+ 
++	int rnd;
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// The original effect authored a count per rendered frame at 30 Hz.  At
++	// 72/90 Hz the old code emitted 3-4 times as many one-second alpha sprites,
++	// filling the global 750-particle pool and causing severe stereo overdraw.
++	// Convert the authored count to particles per real second and retain a
++	// fractional carry so the cloud remains temporally smooth.
++	static float heliDustFractionalCarry = 0.0f;
++	const float vrDustQuality = 0.65f;
++	const float frameScale30Hz = Max(CTimer::GetTimeStepInSeconds()*30.0f, 0.0f);
++	float particlesThisFrame = Max(particlesAt30Hz, 0.0f)*frameScale30Hz*vrDustQuality +
++		heliDustFractionalCarry;
++	rnd = (int)particlesThisFrame;
++	heliDustFractionalCarry = particlesThisFrame-rnd;
++
++	// Keep one helicopter from monopolising every particle slot.  Quest uses a
++	// slightly tighter cap because the translucent cloud is drawn once per eye.
++#ifdef __ANDROID__
++	const int32 maxActiveHeliDust = 192;
++#else
++	const int32 maxActiveHeliDust = 320;
++#endif
++	const int32 activeHeliDust = CParticle::GetActiveCount(PARTICLE_HELI_DUST);
++	rnd = Min(rnd, Max(0, maxActiveHeliDust-activeHeliDust));
++#else
++	rnd = Max((int)particlesAt30Hz, 0);
++#endif
++	if(rnd <= 0)
++		return;
++
+ 	uint8 surface = SURFACE_TARMAC;
+ 	int frm = CTimer::GetFrameCounter() & 7;
+ 	float testLowZ = ground - 10.0f;

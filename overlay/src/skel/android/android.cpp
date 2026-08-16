@@ -13,6 +13,7 @@
 #include "platform.h"
 #include "skeleton.h"
 #include "android.h"
+#include "xr_vulkan_session.h"
 
 #include "main.h"
 #include "FileMgr.h"
@@ -31,6 +32,7 @@
 #include "Vehicle.h"
 #include "World.h"
 #include "Draw.h"
+#include "Renderer.h"
 #include "vulkan/rwvk.h"
 #ifdef GTA_VR_WEAPONS
 #include "OculusVR.h"
@@ -61,6 +63,94 @@ size_t _dwMemAvailPhys;
 
 static bool gRwInitialised = false;
 static bool gForegroundApp = true;
+static uint32 gQuestQuickStartSkipFrames;
+static uint32 gQuestQuickStartPlayableFrames;
+static bool gQuestQuickStartCutsceneSkipIssued;
+static bool gQuestQuickStartTimeScaleOwned;
+
+static bool
+QuestQuickTestStartEnabled(void)
+{
+	return GetPrivateProfileIntA("VR", "QuickTestStart", 0,
+	                             ".\\vr_settings.ini") != 0;
+}
+
+static void
+SkipQuestQuickStartCutsceneIfNeeded(void)
+{
+	if(gQuestQuickStartSkipFrames == 0)
+		return;
+
+	if(FindPlayerPed() != nil &&
+	   (CCutsceneMgr::IsRunning() || TheCamera.m_WideScreenOn)){
+		gQuestQuickStartPlayableFrames = 0;
+		if(!gQuestQuickStartCutsceneSkipIssued){
+			ALOG("quick test start: skipping startup cinema %s",
+			     CCutsceneMgr::IsRunning() ?
+			     CCutsceneMgr::GetCutsceneName() : "SCRIPTED WIDESCREEN");
+			if(CCutsceneMgr::IsRunning())
+				CCutsceneMgr::FinishCutscene();
+			else
+				TheCamera.FinishCutscene();
+			// FinishCutscene marks the cutscene as skipped, but the script may
+			// leave IsRunning true until its cleanup has completed. Do not
+			// repeatedly finish the same cutscene while that happens.
+			gQuestQuickStartCutsceneSkipIssued = true;
+		}
+		return;
+	}
+
+	// Re-arm for the next formal cutscene in the stock intro chain.
+	gQuestQuickStartCutsceneSkipIssued = false;
+}
+
+static void
+AdvanceQuestQuickStartIntroSkip(void)
+{
+	if(gQuestQuickStartSkipFrames == 0){
+		if(gQuestQuickStartTimeScaleOwned){
+			CTimer::SetTimeScale(1.0f);
+			gQuestQuickStartTimeScaleOwned = false;
+		}
+		return;
+	}
+
+	--gQuestQuickStartSkipFrames;
+	CPlayerPed *player = FindPlayerPed();
+	const bool genuinelyPlayable =
+		!CGame::playingIntro &&
+		!CCutsceneMgr::IsRunning() &&
+		!CCutsceneMgr::IsCutsceneProcessing() &&
+		player != nil &&
+		!CPad::GetPad(0)->ArePlayerControlsDisabled();
+
+	if(!genuinelyPlayable){
+		gQuestQuickStartPlayableFrames = 0;
+		// Some opening shots are main.scm-controlled cameras rather than formal
+		// CCutsceneMgr sequences. Speed only this armed startup interval so their
+		// script timers finish quickly even when no skippable spline exists.
+		if(CTimer::GetTimeScale() < 6.0f){
+			CTimer::SetTimeScale(6.0f);
+			gQuestQuickStartTimeScaleOwned = true;
+		}
+		return;
+	}
+	if(gQuestQuickStartTimeScaleOwned){
+		CTimer::SetTimeScale(1.0f);
+		gQuestQuickStartTimeScaleOwned = false;
+	}
+
+	// Require stable player control for a little over a second at 72 Hz.
+	// This keeps the skip armed across the gaps between the several formal
+	// startup cutscenes, but disarms it before later gameplay cutscenes.
+	if(++gQuestQuickStartPlayableFrames >= 90){
+		ALOG("quick test start: intro chain complete; cutscene skip disarmed");
+		gQuestQuickStartSkipFrames = 0;
+		gQuestQuickStartPlayableFrames = 0;
+		gQuestQuickStartCutsceneSkipIssued = false;
+		gQuestQuickStartTimeScaleOwned = false;
+	}
+}
 
 // ---------------------------------------------------------------------------
 // ps* interface
@@ -268,6 +358,19 @@ GetPadInput(void)
 }
 
 void
+TriggerWeaponHaptic(int hand, float strength)
+{
+	// 120Hz for a short, punchy report; strength maps to OpenXR amplitude.
+	xrvk::triggerHaptic(hand, strength, 120.0f, 60.0f);
+}
+
+void
+SetPreferredRefreshRate(int hz)
+{
+	xrvk::setPreferredDisplayRefreshRate((float)hz);
+}
+
+void
 SetFrameTimeNs(long long ns)
 {
 	gVrFrameTimeNs = ns;
@@ -430,7 +533,15 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		}
 
 		CVector head(0.0f, 0.0f, 0.0f);
-		player->m_pedIK.GetComponentPosition(head, PED_HEAD);
+		if(!gVrInVehicle && !androidgame::VrHeadBobbingEnabled() &&
+		   !player->bIsDucking){
+			// 0.4.1 PC parity: hold a stable eye height while walking. 0.59m
+			// matches reVC's established first-person no-bob anchor.
+			CVector up = player->GetUp();
+			up.Normalise();
+			head = player->GetPosition()+up*0.59f;
+		}else
+			player->m_pedIK.GetComponentPosition(head, PED_HEAD);
 		head += forward * 0.12f;
 #ifdef GTA_VR_WEAPONS
 		if(gVrInVehicle){
@@ -444,17 +555,6 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			head = vehicleView.GetPosition();
 		}
 #endif
-
-		// Diagnostic: where the anchor actually lands relative to the ped.
-		{
-			static int n;
-			if((n++ % 300) == 0){
-				const CVector p = player->GetPosition();
-				ALOG("[probe] fp anchor: head %.1f %.1f %.1f | ped %.1f %.1f "
-				     "%.1f | inVeh %d", head.x, head.y, head.z,
-				     p.x, p.y, p.z, gVrInVehicle);
-			}
-		}
 
 		bool fullVehicleBasis = false;
 #ifdef GTA_VR_WEAPONS
@@ -531,20 +631,16 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 				RwMatrixUpdate(m);
 				RwFrameUpdateObjects(RwCameraGetFrame(Scene.camera));
 				RwFrameOrthoNormalize(RwCameraGetFrame(Scene.camera));
+				const CVector viewPosition(vp[0], vp[1], vp[2]);
+				// The RenderWare view already uses the HMD frame above. Keep the
+				// game-side camera origins used by legacy occlusion in lockstep;
+				// otherwise close walls are tested from the old chase camera.
+				TheCamera.GetMatrix().GetPosition() = viewPosition;
+				CRenderer::SetVrViewCameraPosition(viewPosition);
 				TheCamera.m_viewMatrix.Update();
 			}
 		}
 	}else{
-		// Diagnostic: which gate dropped the view onto the chase camera.
-		{
-			static int n;
-			if((n++ % 300) == 0)
-				ALOG("[probe] fp OFF: want %d rw %p dying %d headframe %p",
-				     wantFirstPerson,
-				     player ? (void*)player->m_rwObject : nil,
-				     player ? (int)player->DyingOrDead() : -1,
-				     player ? (void*)player->m_pFrames[PED_HEAD] : nil);
-		}
 		rw::vulkan::setFirstPersonAnchor(nil, 0.0f, 0, 0);
 	}
 }
@@ -552,6 +648,28 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 // XINPUT is off on this platform, so CPad routes through CapturePad. This is
 // the same seam the desktop build uses to inject tracked-controller state.
 static bool gQuestSnapTurnStickLatched;
+static int gQuestFrontendVerticalDirection;
+static int gQuestFrontendHorizontalDirection;
+
+static int
+UpdateQuestFrontendAxisDirection(float axis, int &latchedDirection)
+{
+	const float engage = 0.68f;
+	const float release = 0.34f;
+	if(latchedDirection == 0){
+		if(axis >= engage)
+			latchedDirection = 1;
+		else if(axis <= -engage)
+			latchedDirection = -1;
+	}else if(Abs(axis) <= release){
+		latchedDirection = 0;
+	}else if(axis >= engage){
+		latchedDirection = 1;
+	}else if(axis <= -engage){
+		latchedDirection = -1;
+	}
+	return latchedDirection;
+}
 
 static void
 ApplyQuestSnapTurn(float stickX)
@@ -687,9 +805,15 @@ CapturePad(RwInt32 padID)
 		moveStickX = headX;
 		moveStickY = headY;
 	}
+	// The stock frontend listens to both analogue-stick edges and D-pad edges.
+	// Feeding the same Touch stick through both paths makes one slow deflection
+	// cross two thresholds on different frames and skip a menu row. While the
+	// frontend is open, give it only the debounced D-pad path below.
+	const bool frontendConsumesStick = FrontEndMenuManager.m_bMenuActive ||
+		FrontEndMenuManager.m_bGameNotLoaded;
 	const float sticks[4] = {
-		moveStickX,
-		-moveStickY,
+		frontendConsumesStick ? 0.0f : moveStickX,
+		frontendConsumesStick ? 0.0f : -moveStickY,
 		rightStickX,
 		clamp(-in.rightStickY, -1.0f, 1.0f)
 	};
@@ -737,13 +861,27 @@ CapturePad(RwInt32 padID)
 	state.LeftShock  = in.leftStickClick  ? 255 : 0;
 	state.RightShock = in.rightStickClick ? 255 : 0;
 
-	// The frontend walks its menus on the d-pad, so mirror the left stick onto
-	// it; without this the stick moves the player but cannot pick a menu item.
-	const float deadzone = 0.5f;
-	state.DPadLeft  = in.leftStickX < -deadzone ? 255 : 0;
-	state.DPadRight = in.leftStickX >  deadzone ? 255 : 0;
-	state.DPadUp    = in.leftStickY >  deadzone ? 255 : 0;
-	state.DPadDown  = in.leftStickY < -deadzone ? 255 : 0;
+	// The frontend walks its menus on the D-pad. Use hysteresis there so small
+	// controller noise cannot release and re-press the same direction. Gameplay
+	// keeps the historical direct mirror because scripts use D-pad edges too.
+	if(frontendConsumesStick){
+		const int horizontal = UpdateQuestFrontendAxisDirection(
+			in.leftStickX, gQuestFrontendHorizontalDirection);
+		const int vertical = UpdateQuestFrontendAxisDirection(
+			in.leftStickY, gQuestFrontendVerticalDirection);
+		state.DPadLeft  = horizontal < 0 ? 255 : 0;
+		state.DPadRight = horizontal > 0 ? 255 : 0;
+		state.DPadUp    = vertical > 0 ? 255 : 0;
+		state.DPadDown  = vertical < 0 ? 255 : 0;
+	}else{
+		gQuestFrontendHorizontalDirection = 0;
+		gQuestFrontendVerticalDirection = 0;
+		const float deadzone = 0.5f;
+		state.DPadLeft  = in.leftStickX < -deadzone ? 255 : 0;
+		state.DPadRight = in.leftStickX >  deadzone ? 255 : 0;
+		state.DPadUp    = in.leftStickY >  deadzone ? 255 : 0;
+		state.DPadDown  = in.leftStickY < -deadzone ? 255 : 0;
+	}
 }
 
 // GetLocalTime_CP comes from src/skel/crossplatform.cpp, which is already in
@@ -779,7 +917,10 @@ psInitialize(void)
 	const long pageSize = sysconf(_SC_PAGESIZE);
 	size_t physical = pages > 0 && pageSize > 0 ?
 		(size_t)pages * (size_t)pageSize : (size_t)2048 * 1024 * 1024;
-	const size_t cap = (size_t)1536 * 1024 * 1024;
+	// 2.5GB: full-map residency (ISLAND_LOADING_HIGH) needs the streaming
+	// budget headroom, or the streamer starts evicting models in plain
+	// sight — hydrants and poles blinking out right in front of the player.
+	const size_t cap = (size_t)2560 * 1024 * 1024;
 	_dwMemAvailPhys = physical < cap ? physical : cap;
 	ALOG("physical memory %zu MB, reporting %zu MB to the streamer",
 	     physical / (1024*1024), _dwMemAvailPhys / (1024*1024));
@@ -801,8 +942,10 @@ psTerminate(void)
 namespace androidgame {
 
 bool
-Initialise(const VulkanContext &context)
+Initialise(const VulkanContext &context, bool *renderTargetStartupFailure)
 {
+	if(renderTargetStartupFailure != nil)
+		*renderTargetStartupFailure = false;
 	RsGlobal.appName = "Vice City VR";
 	RsGlobal.maximumWidth = (RwInt32)context.width;
 	RsGlobal.maximumHeight = (RwInt32)context.height;
@@ -843,10 +986,43 @@ Initialise(const VulkanContext &context)
 	backendParams.queueFamilyIndex = context.queueFamilyIndex;
 	backendParams.width = context.width;
 	backendParams.height = context.height;
+	backendParams.renderScaleEffectivePercent =
+		context.renderScaleEffectivePercent;
+	const int requestedTemporalMode = GetPrivateProfileIntA("VR", "Sgsr2Mode",
+		(int)rw::vulkan::SGSR_OFF, ".\\vr_settings.ini");
+	// Temporal reconstruction is currently disabled on Quest: headset tests
+	// showed per-eye micro-motion even when the image was otherwise stationary.
+	// Keep the implementation for research, but never expose an unsafe startup
+	// mode. Headset validation also found no visible gain from 2x/4x MSAA, so
+	// the public path stays at the exact stable single-sample fallback.
+	const int requestedMsaa = GetPrivateProfileIntA("VR", "MsaaSamples", 1,
+	                                               ".\\vr_settings.ini");
+	if(requestedTemporalMode != rw::vulkan::SGSR_OFF){
+		WritePrivateProfileStringA("VR", "Sgsr2Mode", "0",
+		                           ".\\vr_settings.ini");
+		ALOG("disabled unstable temporal mode %d",
+		     requestedTemporalMode);
+	}
+	if(requestedMsaa != 1){
+		WritePrivateProfileStringA("VR", "MsaaSamples", "1",
+		                           ".\\vr_settings.ini");
+		ALOG("disabled ineffective MSAA request %d; using stable 1x",
+		     requestedMsaa);
+	}
+	backendParams.sgsrMode = rw::vulkan::SGSR_OFF;
+	backendParams.sceneSampleCount = 1;
+	backendParams.sceneWidth = context.width;
+	backendParams.sceneHeight = context.height;
 	backendParams.viewCount = context.viewCount;
 	backendParams.colourFormat = context.colourFormat;
+	ALOG("stable native scene=%ux%u output=%ux%u temporal=off msaa=1x",
+	     backendParams.sceneWidth, backendParams.sceneHeight,
+	     context.width, context.height);
 
 	if(RsEventHandler(rsRWINITIALIZE, &backendParams) == rsEVENTERROR){
+		if(renderTargetStartupFailure != nil)
+			*renderTargetStartupFailure =
+				rw::vulkan::didLastDeviceOpenFailForRenderTarget() != 0;
 		ALOGE("rsRWINITIALIZE failed");
 		RsEventHandler(rsTERMINATE, nil);
 		return false;
@@ -863,6 +1039,63 @@ Initialise(const VulkanContext &context)
 	ALOG("game initialised at %ux%u, %u view(s)",
 	     context.width, context.height, context.viewCount);
 	return true;
+}
+
+bool
+PrepareFrontendBeforeFrames(void)
+{
+	if(!gForegroundApp || !gRwInitialised)
+		return false;
+
+	// This is deliberately done before setFrameRenderer/renderFrame.  The
+	// original state machine performed InitialiseOnceAfterRW from Step, after
+	// xrBeginFrame and rw::vulkan::beginFrame.  On Quest that one call has been
+	// measured at 357 ms, during which the runtime can only keep reprojecting
+	// the previous startup image.  LoadingScreen remains useful for loading its
+	// splash texture; with no open librw frame all draw submissions fail open
+	// as no-ops, just like the existing non-rendering Step path below.
+	if(gGameState == GS_START_UP)
+		gGameState = GS_INIT_ONCE;
+
+	if(gGameState == GS_INIT_ONCE){
+		ALOG("pre-frame GS_INIT_ONCE: loading screen");
+		LoadingScreen(nil, nil, "loadsc0");
+		ALOG("pre-frame GS_INIT_ONCE: InitialiseOnceAfterRW");
+		if(!CGame::InitialiseOnceAfterRW()){
+			ALOGE("pre-frame InitialiseOnceAfterRW failed");
+			RsGlobal.quit = TRUE;
+			return false;
+		}
+		ALOG("pre-frame GS_INIT_ONCE: done");
+		gGameState = GS_INIT_FRONTEND;
+	}
+
+	if(gGameState == GS_INIT_FRONTEND){
+		if(QuestQuickTestStartEnabled()){
+			ALOG("quick test start: bypassing frontend and starting a new game");
+			LoadingScreen(nil, nil, "loadsc0");
+			InitialiseGame();
+			FrontEndMenuManager.m_bGameNotLoaded = false;
+			FrontEndMenuManager.m_bMenuActive = false;
+			FrontEndMenuManager.m_bStartUpFrontEndRequested = false;
+			FrontEndMenuManager.m_bWantToRestart = false;
+			FrontEndMenuManager.m_bWantToLoad = false;
+			gGameState = GS_PLAYING_GAME;
+			// Keep the one-shot skipper armed through the complete stock intro
+			// chain. It disarms only after genuine gameplay control is stable.
+			gQuestQuickStartSkipFrames = 3600;
+			gQuestQuickStartPlayableFrames = 0;
+			gQuestQuickStartCutsceneSkipIssued = false;
+			gQuestQuickStartTimeScaleOwned = false;
+			return true;
+		}
+		LoadingScreen(nil, nil, "loadsc0");
+		FrontEndMenuManager.m_bGameNotLoaded = true;
+		FrontEndMenuManager.m_bStartUpFrontEndRequested = true;
+		gGameState = GS_FRONTEND;
+	}
+
+	return gGameState == GS_FRONTEND;
 }
 
 void
@@ -935,28 +1168,6 @@ Step(void)
 	if(++steps - reportedSteps >= 200){
 		reportedSteps = steps;
 		ALOG("Step heartbeat: %u calls, gGameState=%u", steps, gGameState);
-
-		// Diagnostic for the reversed player model: if the ped's forward in
-		// game data points away from the camera while the rendered model faces
-		// it, the fault is in the renderer's bone path; if the data itself
-		// tracks the camera, it is game logic. GetForward is the frame's
-		// heading in world space, so this compares like with like.
-		CPlayerPed *player = FindPlayerPed();
-		if(player != nil && gGameState == GS_PLAYING_GAME){
-			const CVector pedFwd = player->GetForward();
-			const CVector pedPos = player->GetPosition();
-			const CVector camFwd = TheCamera.GetForward();
-			const CVector camPos = TheCamera.GetPosition();
-			// Which side of the player the camera sits on decides whether
-			// "camera forward equals ped forward" means back view or front
-			// view. dotSide > 0: camera is IN FRONT of the ped.
-			const CVector toCam = camPos - pedPos;
-			const float dotSide = toCam.x*pedFwd.x + toCam.y*pedFwd.y;
-			ALOG("[probe] ped fwd %.2f %.2f pos %.1f %.1f | cam fwd %.2f %.2f "
-			     "pos %.1f %.1f %.1f side %.1f",
-			     pedFwd.x, pedFwd.y, pedPos.x, pedPos.y,
-			     camFwd.x, camFwd.y, camPos.x, camPos.y, camPos.z, dotSide);
-		}
 	}
 
 	// Mirrors the desktop skeleton's gGameState machine, minus the startup
@@ -1001,10 +1212,15 @@ Step(void)
 		break;
 
 	case GS_PLAYING_GAME:
+		SkipQuestQuickStartCutsceneIfNeeded();
 		// No frame limiter: xrWaitFrame already paces the application to the
 		// headset's refresh rate, and a second limiter on top of it only adds
 		// judder.
 		RsEventHandler(rsIDLE, (void*)TRUE);
+		// The script may have created the cutscene inside this very idle step.
+		// Mark it skipped before the following submitted frame can present it.
+		SkipQuestQuickStartCutsceneIfNeeded();
+		AdvanceQuestQuickStartIntroSkip();
 		// Rendering ran on the eye fov; game logic keeps the original.
 		::VrRestoreFov();
 		break;

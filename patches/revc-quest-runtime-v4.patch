@@ -1,0 +1,232 @@
+warning: in the working copy of 'src/objects/ParticleObject.cpp', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/objects/ParticleObject.h', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/peds/PlayerPed.cpp', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/objects/ParticleObject.cpp b/src/objects/ParticleObject.cpp
+index 4d080d1..c221acd 100644
+--- a/src/objects/ParticleObject.cpp
++++ b/src/objects/ParticleObject.cpp
+@@ -19,6 +19,30 @@ CParticleObject *CParticleObject::pUnusedListHead;
+ 
+ CAudioHydrant List[MAX_AUDIOHYDRANTS];
+ 
++static int32 gVrFountainQuality = VR_FOUNTAIN_OPTIMIZED;
++
++void
++CParticleObject::SetVrFountainQuality(int32 quality)
++{
++	gVrFountainQuality = Min(Max(quality, (int32)VR_FOUNTAIN_OFF),
++		(int32)VR_FOUNTAIN_QUALITY_COUNT-1);
++}
++
++int32
++CParticleObject::GetVrFountainQuality(void)
++{
++	return gVrFountainQuality;
++}
++
++const char *
++CParticleObject::GetVrFountainQualityName(void)
++{
++	static const char *const names[VR_FOUNTAIN_QUALITY_COUNT] = {
++		"OFF", "LOW", "OPTIMIZED", "ORIGINAL"
++	};
++	return names[gVrFountainQuality];
++}
++
+ CAudioHydrant *CAudioHydrant::Get(int n) { return &List[n]; }
+ 
+ bool
+@@ -489,7 +513,14 @@ void CParticleObject::UpdateClose(void)
+ 		}
+ 	}
+ 	
+-	if ( ++this->m_nFrameCounter >= this->m_nSkipFrames )
++	uint16 effectiveSkipFrames = this->m_nSkipFrames;
++	if(this->m_Type == POBJECT_WATER_FOUNTAIN_VERT){
++		if(gVrFountainQuality == VR_FOUNTAIN_OPTIMIZED)
++			effectiveSkipFrames = Max((uint16)2, effectiveSkipFrames);
++		else if(gVrFountainQuality == VR_FOUNTAIN_LOW)
++			effectiveSkipFrames = Max((uint16)4, effectiveSkipFrames);
++	}
++	if ( ++this->m_nFrameCounter >= effectiveSkipFrames )
+     {
+ 		this->m_nFrameCounter = 0;
+ 		
+@@ -932,8 +963,29 @@ void CParticleObject::UpdateClose(void)
+ 				
+ 				case POBJECT_WATER_FOUNTAIN_VERT:
+ 				{
++					if(gVrFountainQuality == VR_FOUNTAIN_OFF)
++						break;
+ 					CVector pos = this->GetPosition();
+ 					CVector vel = this->m_vecTarget;
++					if(gVrFountainQuality != VR_FOUNTAIN_ORIGINAL){
++						const int32 splashCount =
++							gVrFountainQuality == VR_FOUNTAIN_LOW ? 2 : 4;
++						for(int32 i = 0; i < splashCount; i++){
++							const int32 angle = 360*i/splashCount;
++							const float fCos = CParticle::Cos(angle);
++							const float fSin = CParticle::Sin(angle);
++							const CVector splashpos = pos +
++								CVector(0.015f*fCos, 0.015f*fSin, 0.0f);
++							const CVector splashvel = vel +
++								CVector(0.015f*fCos, 0.015f*fSin,
++									CGeneral::GetRandomNumberInRange(0.004f, 0.008f));
++							CParticle::AddParticle(PARTICLE_SPLASH, splashpos,
++								splashvel, nil,
++								CGeneral::GetRandomNumberInRange(0.001f, 0.005f),
++								this->m_Color, 0, 0, 1, 750);
++						}
++						break;
++					}
+ 					
+ 					for ( int32 i = 0; i < 2; i++ )
+ 					{
+diff --git a/src/objects/ParticleObject.h b/src/objects/ParticleObject.h
+index f199e53..18b4795 100644
+--- a/src/objects/ParticleObject.h
++++ b/src/objects/ParticleObject.h
+@@ -41,6 +41,15 @@ enum eParticleObjectState
+ 	POBJECTSTATE_FREE,
+ };
+ 
++enum eVrFountainQuality
++{
++	VR_FOUNTAIN_OFF = 0,
++	VR_FOUNTAIN_LOW,
++	VR_FOUNTAIN_OPTIMIZED,
++	VR_FOUNTAIN_ORIGINAL,
++	VR_FOUNTAIN_QUALITY_COUNT
++};
++
+ class CParticle;
+ 
+ class CParticleObject : public CPlaceable
+@@ -71,6 +80,9 @@ public:
+ 	~CParticleObject();
+ 	
+ 	static void Initialise(void);
++	static void SetVrFountainQuality(int32 quality);
++	static int32 GetVrFountainQuality(void);
++	static const char *GetVrFountainQualityName(void);
+ 
+ 	static CParticleObject *AddObject(uint16        type, CVector const &pos,                                                                                                                     uint8 remove);
+ 	static CParticleObject *AddObject(uint16        type, CVector const &pos,                        float size,                                                                                  uint8 remove);
+@@ -109,4 +121,4 @@ public:
+ 	static void Remove(CParticleObject *particleobject);
+ 
+ 	static CAudioHydrant *Get(int n);	// for neo screen droplets
+-};
+\ No newline at end of file
++};
+diff --git a/src/peds/PlayerPed.cpp b/src/peds/PlayerPed.cpp
+index 0dd4b88..b879f22 100644
+--- a/src/peds/PlayerPed.cpp
++++ b/src/peds/PlayerPed.cpp
+@@ -1303,6 +1303,26 @@ void
+ CPlayerPed::ProcessAnimGroups(void)
+ {
+ 	AssocGroupId groupToSet;
++	CWeapon *locomotionWeapon = GetWeapon();
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// The selected inventory slot is not the weapon Tommy is physically holding
++	// in VR.  Rampages select their supplied heavy weapon immediately, so using
++	// the selected slot here leaves the player in the heavy/chainsaw locomotion
++	// group even while both hands are empty.  Drive the body animation from the
++	// actually held item and use the normal unarmed group when it is holstered.
++	if(OculusVR::IsPhysicalWeaponInteractionActive()){
++		locomotionWeapon = &GetWeapon(WEAPONSLOT_UNARMED);
++		for(int hand = 0; hand < 2; hand++){
++			const int heldSlot = OculusVR::GetHeldWeaponSlot(hand);
++			if(heldSlot >= WEAPONSLOT_UNARMED &&
++			   heldSlot < TOTAL_WEAPON_SLOTS && HasWeaponSlot(heldSlot)){
++				locomotionWeapon = &GetWeapon(heldSlot);
++				break;
++			}
++		}
++	}
++#endif
++	const eWeaponType locomotionWeaponType = locomotionWeapon->m_eWeaponType;
+ #ifdef PC_PLAYER_CONTROLS
+ 	if ((m_fWalkAngle <= -DEGTORAD(50.0f) || m_fWalkAngle >= DEGTORAD(50.0f))
+ 		&& TheCamera.Cams[TheCamera.ActiveCam].Using3rdPersonMouseCam()
+@@ -1310,30 +1330,30 @@ CPlayerPed::ProcessAnimGroups(void)
+ 
+ 		if (m_fWalkAngle >= -DEGTORAD(130.0f) && m_fWalkAngle <= DEGTORAD(130.0f)) {
+ 			if (m_fWalkAngle > 0.0f) {
+-				if (GetWeapon()->m_eWeaponType == WEAPONTYPE_ROCKETLAUNCHER)
++				if (locomotionWeaponType == WEAPONTYPE_ROCKETLAUNCHER)
+ 					groupToSet = ASSOCGRP_ROCKETLEFT;
+-				else if (GetWeapon()->m_eWeaponType == WEAPONTYPE_CHAINSAW ||
+-					GetWeapon()->m_eWeaponType == WEAPONTYPE_FLAMETHROWER ||
+-					GetWeapon()->m_eWeaponType == WEAPONTYPE_MINIGUN)
++				else if (locomotionWeaponType == WEAPONTYPE_CHAINSAW ||
++					locomotionWeaponType == WEAPONTYPE_FLAMETHROWER ||
++					locomotionWeaponType == WEAPONTYPE_MINIGUN)
+ 					groupToSet = ASSOCGRP_CHAINSAWLEFT;
+ 				else
+ 					groupToSet = ASSOCGRP_PLAYERLEFT;
+ 			} else {
+-				if (GetWeapon()->m_eWeaponType == WEAPONTYPE_ROCKETLAUNCHER)
++				if (locomotionWeaponType == WEAPONTYPE_ROCKETLAUNCHER)
+ 					groupToSet = ASSOCGRP_ROCKETRIGHT;
+-				else if (GetWeapon()->m_eWeaponType == WEAPONTYPE_CHAINSAW ||
+-					GetWeapon()->m_eWeaponType == WEAPONTYPE_FLAMETHROWER ||
+-					GetWeapon()->m_eWeaponType == WEAPONTYPE_MINIGUN)
++				else if (locomotionWeaponType == WEAPONTYPE_CHAINSAW ||
++					locomotionWeaponType == WEAPONTYPE_FLAMETHROWER ||
++					locomotionWeaponType == WEAPONTYPE_MINIGUN)
+ 					groupToSet = ASSOCGRP_CHAINSAWRIGHT;
+ 				else
+ 					groupToSet = ASSOCGRP_PLAYERRIGHT;
+ 			}
+ 		} else {
+-			if (GetWeapon()->m_eWeaponType == WEAPONTYPE_ROCKETLAUNCHER)
++			if (locomotionWeaponType == WEAPONTYPE_ROCKETLAUNCHER)
+ 				groupToSet = ASSOCGRP_ROCKETBACK;
+-			else if (GetWeapon()->m_eWeaponType == WEAPONTYPE_CHAINSAW ||
+-				GetWeapon()->m_eWeaponType == WEAPONTYPE_FLAMETHROWER ||
+-				GetWeapon()->m_eWeaponType == WEAPONTYPE_MINIGUN)
++			else if (locomotionWeaponType == WEAPONTYPE_CHAINSAW ||
++				locomotionWeaponType == WEAPONTYPE_FLAMETHROWER ||
++				locomotionWeaponType == WEAPONTYPE_MINIGUN)
+ 				groupToSet = ASSOCGRP_CHAINSAWBACK;
+ 			else
+ 				groupToSet = ASSOCGRP_PLAYERBACK;
+@@ -1341,23 +1361,23 @@ CPlayerPed::ProcessAnimGroups(void)
+ 	} else
+ #endif
+ 	{
+-		if (GetWeapon()->m_eWeaponType == WEAPONTYPE_ROCKETLAUNCHER) {
++		if (locomotionWeaponType == WEAPONTYPE_ROCKETLAUNCHER) {
+ 			groupToSet = ASSOCGRP_PLAYERROCKET;
+ 		} else {
+-			if (GetWeapon()->m_eWeaponType == WEAPONTYPE_BASEBALLBAT
+-				 || GetWeapon()->m_eWeaponType == WEAPONTYPE_MACHETE)
++			if (locomotionWeaponType == WEAPONTYPE_BASEBALLBAT
++				 || locomotionWeaponType == WEAPONTYPE_MACHETE)
+ 				groupToSet = ASSOCGRP_PLAYERBBBAT;
+-			else if (GetWeapon()->m_eWeaponType == WEAPONTYPE_CHAINSAW ||
+-				GetWeapon()->m_eWeaponType == WEAPONTYPE_FLAMETHROWER ||
+-				GetWeapon()->m_eWeaponType == WEAPONTYPE_MINIGUN)
++			else if (locomotionWeaponType == WEAPONTYPE_CHAINSAW ||
++				locomotionWeaponType == WEAPONTYPE_FLAMETHROWER ||
++				locomotionWeaponType == WEAPONTYPE_MINIGUN)
+ 				groupToSet = ASSOCGRP_PLAYERCHAINSAW;
+-			else if (GetWeapon()->m_eWeaponType != WEAPONTYPE_COLT45 && GetWeapon()->m_eWeaponType != WEAPONTYPE_UZI
++			else if (locomotionWeaponType != WEAPONTYPE_COLT45 && locomotionWeaponType != WEAPONTYPE_UZI
+ 				// I hope this is a inlined function...
+-				&& GetWeapon()->m_eWeaponType != WEAPONTYPE_PYTHON && GetWeapon()->m_eWeaponType != WEAPONTYPE_TEC9
+-				&& GetWeapon()->m_eWeaponType != WEAPONTYPE_SILENCED_INGRAM && GetWeapon()->m_eWeaponType != WEAPONTYPE_MP5
+-				&& GetWeapon()->m_eWeaponType != WEAPONTYPE_GOLFCLUB && GetWeapon()->m_eWeaponType != WEAPONTYPE_KATANA
+-				&& GetWeapon()->m_eWeaponType != WEAPONTYPE_CAMERA) {
+-				if (!GetWeapon()->IsType2Handed()) {
++				&& locomotionWeaponType != WEAPONTYPE_PYTHON && locomotionWeaponType != WEAPONTYPE_TEC9
++				&& locomotionWeaponType != WEAPONTYPE_SILENCED_INGRAM && locomotionWeaponType != WEAPONTYPE_MP5
++				&& locomotionWeaponType != WEAPONTYPE_GOLFCLUB && locomotionWeaponType != WEAPONTYPE_KATANA
++				&& locomotionWeaponType != WEAPONTYPE_CAMERA) {
++				if (!locomotionWeapon->IsType2Handed()) {
+ 					groupToSet = ASSOCGRP_PLAYER;
+ 				} else {
+ 					groupToSet = ASSOCGRP_PLAYER2ARMED;
+

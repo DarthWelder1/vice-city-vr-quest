@@ -4,8 +4,8 @@
 #   tools/assemble.sh <path to reVC source> <output dir>
 #
 # The reVC source tree is not part of this repository and is not distributed
-# with it. Obtain it separately; the patch targets the final (September 2021)
-# state of the reVC master branch.
+# with it. Obtain the miami branch separately; the tested patch base is commit
+# 06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87.
 set -e
 REVC="$1"
 OUT="$2"
@@ -24,7 +24,35 @@ echo "[2/4] Applying the port patch..."
 cd "$OUT"
 git init -q
 git apply --whitespace=nowarn "$REPO/patches/revc-quest.patch" || {
-    echo "Patch did not apply. Make sure the reVC tree is the final master state and unmodified."
+    echo "Patch did not apply. Use the clean tested miami commit 06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-v050.patch" || {
+    echo "The v0.5.0 parity patch did not apply after the base Quest patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-v050-integration.patch" || {
+    echo "The v0.5.0 integration patch did not apply after the parity patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v2.patch" || {
+    echo "The runtime v2 patch did not apply after the v0.5.0 integration patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v3.patch" || {
+    echo "The runtime v3 patch did not apply after the runtime v2 patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v4.patch" || {
+    echo "The runtime v4 patch did not apply after the runtime v3 patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v5.patch" || {
+    echo "The runtime v5 patch did not apply after the runtime v4 patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v6.patch" || {
+    echo "The runtime v6 patch did not apply after the runtime v5 patch."
     exit 1
 }
 rm -rf "$OUT/.git"
@@ -41,4 +69,4 @@ echo "Done. Next steps:"
 echo "  cd $OUT/android"
 echo "  gradle wrapper   (first time only, or open in Android Studio)"
 echo "  ./gradlew assembleDebug"
-echo "See BUILDING.md for prerequisites and installing to the headset."
+echo "See BUILDING.md for prerequisites, game data, VR hands and headset installation."

@@ -1,0 +1,58 @@
+diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
+--- a/src/peds/Ped.cpp
++++ b/src/peds/Ped.cpp
+@@ -1916,7 +1916,11 @@ CPed::ProcessControl(void)
+ 							TurnBody();
+ 						}
+ 					} else {
+-						if (m_nPedType != PEDTYPE_COP && neededTurn < DEGTORAD(15.0f) && m_nWaitState == WAITSTATE_FALSE) {
++						if (m_nPedType != PEDTYPE_COP && neededTurn < DEGTORAD(15.0f) && m_nWaitState == WAITSTATE_FALSE
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++							&& !(IsPlayer() && OculusVR::IsPhysicalWeaponInteractionActive())
++#endif
++							) {
+ 							if ((m_nStoredMoveState == PEDMOVE_RUN || m_nStoredMoveState == PEDMOVE_SPRINT) && m_vecDamageNormal.z < 0.3f) {
+ 								CAnimBlendAssociation *runAssoc = RpAnimBlendClumpGetAssociation(GetClump(), ANIM_STD_RUN);
+ 								if (!runAssoc)
+diff --git a/src/peds/PlayerPed.cpp b/src/peds/PlayerPed.cpp
+--- a/src/peds/PlayerPed.cpp
++++ b/src/peds/PlayerPed.cpp
+@@ -963,6 +963,38 @@ CPlayerPed::PlayerControlM16(CPad *padUsed)
+ void
+ CPlayerPed::PlayerControlFighter(CPad *padUsed)
+ {
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// A Rampage can force a fight/heavy inventory state even though neither
++	// tracked hand holds that weapon. Do not let the invisible inventory state
++	// trap VR locomotion in the short fighter shuffle. A real held weapon keeps
++	// the original fight controller unless RUN WITHOUT LIMITS explicitly asks
++	// for unrestricted movement.
++	bool useFreeVrLocomotion = IsRunWithoutLimitsCheatEnabled();
++	if(!useFreeVrLocomotion &&
++	   OculusVR::IsPhysicalWeaponInteractionActive()){
++		useFreeVrLocomotion = true;
++		for(int hand = 0; hand < 2; hand++)
++			if(OculusVR::GetHeldWeaponSlot(hand) >= 0){
++				useFreeVrLocomotion = false;
++				break;
++			}
++	}
++	const bool hitReaction = m_curFightMove >= FIGHTMOVE_HITFRONT &&
++		m_curFightMove <= FIGHTMOVE_HITBEHIND;
++	if(useFreeVrLocomotion && !hitReaction){
++		m_curFightMove = m_lastFightMove = FIGHTMOVE_NULL;
++		m_fightButtonPressure = 0;
++		m_fightState = FIGHTSTATE_NO_MOVE;
++		m_takeAStepAfterAttack = false;
++		m_nWaitTimer = 0;
++		RestoreHeadingRate();
++		RestorePreviousState();
++		if(m_nPedState == PED_FIGHT)
++			SetPedState(PED_IDLE);
++		PlayerControlZelda(padUsed);
++		return;
++	}
++#endif
+ 	float leftRight = padUsed->GetPedWalkLeftRight();
+ 	float upDown = padUsed->GetPedWalkUpDown();
+ 	float padMove = CVector2D(leftRight, upDown).Magnitude();

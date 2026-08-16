@@ -116,7 +116,9 @@ struct State
 State gs;
 
 const VkDeviceSize DYNAMIC_CAPACITY = 8 * 1024 * 1024;
-const uint32 MAX_TEXTURE_DESCRIPTORS = 4096;
+// Sized for full-map residency: both islands' texture dictionaries stay
+// loaded at once on the headset build.
+const uint32 MAX_TEXTURE_DESCRIPTORS = 8192;
 
 VkBlendFactor
 blendFactor(uint32 rwBlend)
@@ -463,6 +465,9 @@ stateInit(void)
 
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	// Destroyed rasters return their sets via vkFreeDescriptorSets, which
+	// requires this flag on the pool.
+	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 	poolInfo.maxSets =
 		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 16;
 	poolInfo.poolSizeCount = 3;
@@ -909,7 +914,7 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 
 	VkPipelineMultisampleStateCreateInfo multisample = {};
 	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisample.rasterizationSamples = gvk.sceneSamples;
 
 	VkPipelineDepthStencilStateCreateInfo depthStencil = {};
 	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -940,7 +945,8 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 		}
 	}
 
-	VkPipelineColorBlendAttachmentState blendAttachment = {};
+	VkPipelineColorBlendAttachmentState blendAttachments[2] = {};
+	VkPipelineColorBlendAttachmentState &blendAttachment = blendAttachments[0];
 	blendAttachment.blendEnable = gstate.vertexAlphaEnabled ? VK_TRUE : VK_FALSE;
 	blendAttachment.srcColorBlendFactor = blendFactor(gstate.srcBlend);
 	blendAttachment.dstColorBlendFactor = blendFactor(gstate.dstBlend);
@@ -955,11 +961,22 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 	                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+	// Dynamic vectors replace the pixel belonging to the nearest submitted
+	// surface; colour blending must never mix velocities from two objects.
+	blendAttachments[1].blendEnable = VK_FALSE;
+	// Screen-space sprites (HUD, coronas, headlights, traffic lights) must not
+	// touch the motion attachment at all. Their colour still composites into
+	// attachment 0, while the world/object vector already stored underneath
+	// survives unchanged. This avoids both rectangular masks and lost vehicle
+	// vectors without any sentinel pixels.
+	blendAttachments[1].colorWriteMask = shader == SHADER_IM2D ? 0 :
+		(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT);
 
 	VkPipelineColorBlendStateCreateInfo colourBlend = {};
 	colourBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-	colourBlend.attachmentCount = 1;
-	colourBlend.pAttachments = &blendAttachment;
+	colourBlend.attachmentCount =
+		gvk.sgsrMode != SGSR_OFF ? 2 : 1;
+	colourBlend.pAttachments = blendAttachments;
 
 	const VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT,
 	                                         VK_DYNAMIC_STATE_SCISSOR };
@@ -1015,6 +1032,27 @@ compilePendingPipelines(void)
 		getPipeline(work[i].shader, work[i].topology);
 	}
 	gstate = saved;
+}
+
+void
+freeTextureDescriptorSets(VkDescriptorSet *sets, uint32 count)
+{
+	if(gvk.device == VK_NULL_HANDLE || gs.descriptorPool == VK_NULL_HANDLE)
+		return;
+	VkDescriptorSet live[NUM_FRAME_CONTEXTS < 8 ? 8 : NUM_FRAME_CONTEXTS];
+	uint32 n = 0;
+	for(uint32 i = 0; i < count; i++){
+		if(sets[i] == VK_NULL_HANDLE)
+			continue;
+		live[n++] = sets[i];
+		sets[i] = VK_NULL_HANDLE;
+		if(n == nelem(live)){
+			vkFreeDescriptorSets(gvk.device, gs.descriptorPool, n, live);
+			n = 0;
+		}
+	}
+	if(n)
+		vkFreeDescriptorSets(gvk.device, gs.descriptorPool, n, live);
 }
 
 VkDescriptorSet

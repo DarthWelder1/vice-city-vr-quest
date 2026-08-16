@@ -12,8 +12,10 @@ layout(set = 1, binding = 0) uniform sampler2D diffuseTexture;
 layout(location = 0) in vec4 fragColour;
 layout(location = 1) in vec2 fragTexCoord;
 layout(location = 2) in float fragFog;
+layout(location = 3) flat in vec2 fragDynamicMotion;
 
 layout(location = 0) out vec4 outColour;
+layout(location = 1) out vec2 outDynamicMotion;
 
 void main()
 {
@@ -28,4 +30,6 @@ void main()
 
 	colour.rgb = mix(scene.fogColour.rgb, colour.rgb, fragFog);
 	outColour = colour;
+	// Compact dynamic-vector transport. The post pass divides by the same gain.
+	outDynamicMotion = clamp(fragDynamicMotion*8.0, vec2(-1.0), vec2(1.0));
 }

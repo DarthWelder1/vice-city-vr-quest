@@ -1,39 +1,73 @@
-# MiamiVR — Quest port (source only)
+# Vice City VR for Meta Quest — source build kit
 
-A native Meta Quest 3 VR port layer for the reVC engine: Vulkan renderer,
-OpenXR session with 6DOF head tracking, Android platform layer, first-person
-and vehicle play at 72 fps.
+This repository contains the original Quest/OpenXR port layer, Vulkan backend
+changes, build scripts and reVC patch files needed to build Vice City VR for a
+Meta Quest headset.
 
-**This repository distributes no game, no game assets and no binaries.**
-It contains only:
+It intentionally contains **no APK, complete reVC source tree, original game
+files, saves, logs or third-party Modern model packs**. Every user builds their
+own APK and supplies data from a legally owned PC copy of GTA Vice City.
 
-| Layer | What it is | License |
-|---|---|---|
-| `librw/` | librw fork with a Vulkan backend written for this port | MIT (librw by aap; backend additions same terms) |
-| `overlay/` | The port's own sources: Android app, OpenXR/Vulkan session, platform layer, VR gameplay layer | MIT |
-| `patches/` | A diff the build applies to a reVC source tree that **you provide** | — |
+## What is included
 
-To play you additionally need, and must obtain yourself:
+| Path | Contents |
+|---|---|
+| `overlay/` | New Android, OpenXR, Quest VR and tooling files |
+| `patches/` | Changes applied to a user-supplied reVC checkout |
+| `librw/` | MIT-licensed librw fork with the Quest Vulkan backend |
+| `tools/` | Windows and Unix source-assembly scripts |
 
-1. **The reVC source tree** (final master state, September 2021). It is not
-   included and will not be provided here.
-2. **Your own copy of the game's data files** from a legitimately purchased
-   copy of the original PC game. Nothing from the game ships in the APK; the
-   app reads everything from your files pushed to the headset.
+Modified upstream reVC files are distributed as patches, not as a second copy
+of the reVC repository. The only bundled art is the credited MIT-licensed VR
+hand asset under `overlay/gamefiles/models/vrhands/`.
 
-Build instructions: [BUILDING.md](BUILDING.md).
-Port internals and data setup: [overlay/docs/QUEST_PORT.md](overlay/docs/QUEST_PORT.md).
+## Required external source
 
-## Status
+Obtain the reVC `miami` branch yourself from:
 
-Playable: city, traffic, pedestrians, vehicles, first person on foot and in
-vehicles, theater mode for menus and cutscenes, in-headset debug overlay.
-Not done: audio (OpenAL backend pending), some cutscene presentation, minor
-effect artifacts.
+<https://github.com/mrxenginner/reVC>
+
+The tested base is commit
+`06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87`. The assembly scripts never modify
+that checkout: they copy it to a new directory, apply this project's patches,
+and add the Quest-only files.
+
+Complete prerequisites and copy-paste commands are in
+[BUILDING.md](BUILDING.md).
+
+The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
+
+## Current Quest build
+
+- Native arm64 Android application using OpenXR and Vulkan multiview.
+- Physical VR weapons, two-hand support, holsters and scoped aiming.
+- Physical steering for cars and motorcycles, including model steering wheels.
+- In-headset VR, calibration, cheats, traffic, graphics and model-set menus.
+- Stereo-safe building culling with an exact OFF fallback.
+- Optional Physics Director with ORIGINAL/OFF fallback and detailed profiler.
+- Classic/Modern asset categories; no external model pack is included.
+- Default quality profile: 125% render scale, sustained CPU/GPU hints,
+  Spatial AA, safe culling, Modern world textures/weapons and Classic vehicles,
+  pedestrians and vegetation when a user-built Modern overlay is available.
+- Normal frontend/save loading on first launch; the developer Quick Test Start
+  shortcut remains available but is off by default.
+
+Experimental temporal AA, SGSR, MSAA and runtime-only foveation are disabled:
+headset testing did not establish a safe visual or performance benefit.
+
+Runtime/data layout is documented in
+[overlay/docs/QUEST_PORT.md](overlay/docs/QUEST_PORT.md). Optional model mixing
+is documented in [overlay/docs/QUEST_MODELSETS.md](overlay/docs/QUEST_MODELSETS.md).
+
+## Distribution boundary
+
+Do not upload assembled source trees, APKs, original game files, saves, built
+Modern model overlays or signing keys to this repository. Publish only this
+build kit. Each player must obtain reVC and the original game separately and
+perform the documented build locally.
 
 ## No affiliation
 
-This is an unofficial fan project. It is not affiliated with, endorsed by, or
-connected to the publishers or developers of the original game. All
-trademarks belong to their owners. No original game code or content is
-distributed here. If you enjoy the game, buy it.
+This is an unofficial fan project. It is not affiliated with or endorsed by
+the publishers or developers of GTA Vice City, Meta, Khronos, Qualcomm or
+NVIDIA. All trademarks belong to their owners.

@@ -24,6 +24,16 @@ struct EngineOpenParams
 	// the multiview stereo path and 1 for any mono pass.
 	uint32 width;
 	uint32 height;
+	float32 renderScaleEffectivePercent;
+	// Optional private scene target. Phase-one temporal diagnostics keep it at
+	// native resolution; future SGSR2 modes may render it below the OpenXR
+	// output. Zero preserves the original native-resolution path.
+	uint32 sceneWidth;
+	uint32 sceneHeight;
+	uint32 sgsrMode;
+	// Requested scene raster sample count. The backend validates it against
+	// colour and depth limits and falls back to one sample if unsupported.
+	uint32 sceneSampleCount;
 	uint32 viewCount;
 	VkFormat colourFormat;
 };
@@ -46,6 +56,15 @@ bool32 rasterFromImage(Raster *raster, Image *image);
 Image *rasterToImage(Raster *raster);
 void setRasterHasAlpha(Raster *raster, bool32 hasAlpha);
 bool32 rasterHasAlpha(Raster *raster);
+
+// Vehicle alpha atomics can contain both opaque bodywork and transparent
+// side-window meshes.  The game scopes this flag to its vehicle alpha list so
+// the Vulkan object pipeline can keep depth writes for the body while leaving
+// the glass out of the depth buffer.
+void setVehicleAlphaPass(bool32 enabled);
+// Marks the synchronous entity/clump submission as a moving game object.
+// Used only by the optional temporal diagnostic path.
+void setDynamicObjectPass(bool32 enabled);
 
 // Compressed uploads. Adreno exposes ASTC and ETC2 natively but not BC/DXT,
 // which is what every Vice City TXD actually contains, so the DXT path has to
@@ -200,8 +219,18 @@ void endFrame(void);
 void setGpuFrameTimingEnabled(bool32 enabled);
 bool32 getGpuFrameTimeMs(float32 *milliseconds);
 
+// True only when the most recent DEVICEOPEN failed while creating one of the
+// full-resolution colour/depth targets or its framebuffer. This lets the
+// Android shell safely distinguish a render-scale recovery case from an
+// unrelated game-data or plugin initialisation failure.
+bool32 didLastDeviceOpenFailForRenderTarget(void);
+
 // Per-eye view-projection matrices for the multiview uniform block.
 void setStereoViewProjection(const float32 left[16], const float32 right[16]);
+// Horizontal OpenXR eye FOV used by SGSR2's depth-disocclusion tolerance.
+// Kept separate because setStereoViewProjection receives projection*view,
+// from which the projection scale cannot be recovered after head rotation.
+void setSgsrHorizontalFovDegrees(float32 degrees);
 
 // Places the Im2D screen plane in the world. Maps screen pixel coordinates to
 // a quad in front of the head, so both eyes project it and it converges.
@@ -239,6 +268,16 @@ void setHeadPose(const float32 position[3], float32 yaw,
 bool32 getFirstPersonViewFrame(float32 rwRight[3], float32 rwUp[3],
                                float32 rwAt[3], float32 position[3]);
 
+// Raw predicted OpenXR eye poses for the current immersive frame. They are
+// converted through the same first-person anchor as the centre HMD frame so
+// game-side systems can build independent left/right camera contexts.
+void setFirstPersonEyePoses(const float32 positions[2][3],
+                            const float32 orientations[2][4]);
+void clearFirstPersonEyePoses(void);
+bool32 getFirstPersonEyeViewFrame(uint32 eye, float32 rwRight[3],
+                                  float32 rwUp[3], float32 rwAt[3],
+                                  float32 position[3]);
+
 // Converts an OpenXR pose expressed in the current play space into Vice
 // City's world. Axes are the controller's local +X, +Y and forward -Z. This
 // uses the exact same first-person anchor as world rendering, keeping native
@@ -249,6 +288,26 @@ bool32 playPoseToFirstPersonWorld(const float32 playPosition[3],
                                   float32 worldUp[3],
                                   float32 worldForward[3],
                                   float32 worldPosition[3]);
+
+// Converts a direction from Vice City's world axes back into the current
+// OpenXR play-space axes. Translation is deliberately ignored. Physical
+// controls use this to freeze a reference frame that cannot be moved by the
+// animated vehicle or first-person anchor later in the grab.
+bool32 firstPersonWorldVectorToPlay(const float32 worldVector[3],
+                                    float32 playVector[3]);
+
+// Tests a game-world bounding sphere against the exact asymmetric OpenXR
+// projection of both eyes. Returns true when either eye can see any part of
+// the sphere, and fails open while first-person/stereo state is unavailable.
+// angularMarginTangent covers late head motion and imperfect legacy bounds
+// without reverting to the old very wide centre-eye cone.
+bool32 isFirstPersonWorldSphereVisibleInStereo(
+    const float32 worldCentre[3], float32 radius,
+    float32 angularMarginTangent);
+// Tighter building test than a bounding sphere. The eight points are an
+// oriented world-space box; visibility is the union of both physical eyes.
+bool32 isFirstPersonWorldBoxVisibleInStereo(
+    const float32 worldCorners[8][3], float32 angularMarginTangent);
 
 // First person: anchor the view on the player's head in the game world
 // instead of on the follow camera. headingYaw is the character's (or the
@@ -289,6 +348,38 @@ void setClearColour(uint8 red, uint8 green, uint8 blue);
 void setPostFx(uint32 mode, uint32 red, uint32 green, uint32 blue,
                float32 intensity);
 void setFxaaEnabled(bool32 enabled);
+void setSpatialAaMode(uint32 mode);
+
+enum SgsrMode {
+	SGSR_OFF = 0,
+	// Diagnostic foundation for SGSR2. Displays per-eye camera motion
+	// reconstructed from depth; it does not upscale or accumulate history.
+	SGSR2_MOTION_DEBUG,
+	// Native-resolution temporal stabilizer. Reprojects the preceding colour
+	// frame with the same per-eye camera/object vectors used by the diagnostic
+	// view. It is deliberately separate from resolution scaling and remains an
+	// opt-in experiment until headset ghosting/disocclusion tests pass.
+	SGSR2_TEMPORAL_STABILIZER,
+	// Two complementary sub-pixel projection samples resolved across adjacent
+	// raw frames. This remains isolated from the proven stabilizer and OFF.
+	SGSR2_JITTERED_TAA_2X,
+	// Stable resolved-history experiment. Unlike V2 it retains the temporally
+	// resolved output, but deliberately applies no camera-projection jitter:
+	// the four-phase version made the entire VR world visibly tremble.
+	SGSR2_RESOLVED_TEMPORAL_V3,
+	// Official Qualcomm SGSR2 two-fragment-pass temporal upscaler. The OpenXR
+	// output remains at the requested scale while the 3D scene is rendered at
+	// 80% linear resolution (125% output therefore costs roughly a 100% scene).
+	SGSR2_OFFICIAL_QUALITY,
+	SGSR_MODE_COUNT,
+};
+
+// Reports the active temporal startup configuration. Changing Sgsr2Mode in
+// the INI requires a restart because private targets are allocated during
+// DEVICEOPEN.
+bool32 getSgsrStatus(uint32 *mode, uint32 *sceneWidth, uint32 *sceneHeight,
+                     uint32 *outputWidth, uint32 *outputHeight);
+uint32 getSceneSampleCount(void);
 
 // Texture straight from DXT blocks (BC formats), no CPU decode. Returns nil
 // when the device lacks BC support or the type is not DXT1/3/5; the caller

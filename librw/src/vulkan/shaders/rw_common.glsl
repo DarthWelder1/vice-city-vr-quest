@@ -20,6 +20,7 @@ layout(set = 0, binding = 0) uniform SceneData {
 	// because the game runs more than one camera per frame and every draw in a
 	// frame reads this block at the value it holds when the frame is submitted.
 	mat4 viewProj[2];
+	mat4 previousViewProj[2];
 	vec4 fogColour;
 	// x = start, y = end, z = 1/(end-start), w = enabled
 	vec4 fogParams;
@@ -51,3 +52,23 @@ layout(push_constant) uniform PushConstants {
 	// xyz = directional light direction in play space, w = colour as RGBA8.
 	vec4 lightDirColour;
 } push;
+
+// In MOTION DEBUG the otherwise constant affine W row carries the previous
+// root-translation delta and a validity flag. Reconstruct the actual affine
+// matrix before transforming vertices. This keeps PushConstants at the
+// Vulkan-guaranteed 128 bytes instead of adding another per-draw buffer.
+mat4 RwModelMatrix()
+{
+	mat4 model = push.model;
+	model[0].w = 0.0;
+	model[1].w = 0.0;
+	model[2].w = 0.0;
+	model[3].w = 1.0;
+	return model;
+}
+
+vec4 RwRootScreenMotion()
+{
+	return vec4(push.model[0].w, push.model[1].w,
+	            push.model[2].w, push.model[3].w);
+}

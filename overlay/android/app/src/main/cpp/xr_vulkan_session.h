@@ -22,6 +22,41 @@ void destroy(void);
 // the runtime has asked the application to exit.
 bool pollEvents(void);
 
+// Fires a vibration burst on one controller (0 = left, 1 = right).
+// Amplitude 0..1, frequency in Hz, duration in milliseconds. Safe to call
+// any time; quietly does nothing before the session is focused.
+void triggerHaptic(int hand, float amplitude, float frequencyHz, float durationMs);
+
+// Sets the preferred display refresh rate (Hz). The session requests the
+// closest rate the runtime offers and keeps retrying until confirmed. Safe
+// to call any time.
+void setPreferredDisplayRefreshRate(float hz);
+
+// OpenXR performance hint for the standalone runtime. Auto leaves a fresh
+// session entirely under runtime control; the two explicit modes provide
+// performance-policy hints for profiling and demanding traffic scenes.
+enum PerformanceMode
+{
+	PERFORMANCE_MODE_AUTO = 0,
+	PERFORMANCE_MODE_SUSTAINED_HIGH = 1,
+	PERFORMANCE_MODE_BOOST = 2,
+};
+void setPerformanceMode(int mode);
+int getPerformanceMode(void);
+// Independent GPU clock-policy hint. BOOST is persistent for the session;
+// the Quest runtime remains free to thermally throttle it.
+void setGpuPerformanceMode(int mode);
+int getGpuPerformanceMode(void);
+int getActiveGpuPerformanceMode(void);
+bool isPerformanceModeSupported(void);
+
+bool isPerformanceBoostBlocked(void);
+// Effective hint in this session, or -1 when no complete hint was applied.
+// This can differ from getPerformanceMode(): OpenXR has no "clear hint" call,
+// so returning to Auto after an explicit mode needs a session restart to
+// restore the runtime's true default policy.
+int getActivePerformanceMode(void);
+
 // True once the session reached a state in which frames must be submitted.
 bool shouldRender(void);
 
@@ -38,12 +73,51 @@ struct GraphicsContext
 	unsigned int queueFamilyIndex;
 	unsigned int width;
 	unsigned int height;
+	float renderScaleEffectivePercent;
 	unsigned int viewCount;
 	VkFormat colourFormat;
 };
 
 // Valid only after create() succeeded.
 bool getContext(GraphicsContext *out);
+
+// The menu value is only a request. OpenXR may clamp it to the runtime's
+// maximum image extent or reject the large swapchain and make startup select
+// a lower preset. Keep all three values visible so UI and profiler output do
+// not claim 150% while the submitted image is actually smaller.
+enum RenderScaleFallbackReason
+{
+	RENDER_SCALE_FALLBACK_NONE = 0,
+	RENDER_SCALE_FALLBACK_RUNTIME_LIMIT = 1,
+	RENDER_SCALE_FALLBACK_SWAPCHAIN_ALLOCATION = 2,
+	RENDER_SCALE_FALLBACK_GAME_RENDERER_ALLOCATION = 3,
+};
+
+struct RenderScaleStatus
+{
+	int requestedPercent;
+	int selectedPresetPercent;
+	float effectivePercent;
+	unsigned int recommendedWidth;
+	unsigned int recommendedHeight;
+	unsigned int actualWidth;
+	unsigned int actualHeight;
+	unsigned int runtimeMaxWidth;
+	unsigned int runtimeMaxHeight;
+	int fallbackReason;
+	// Survives the recovery launch after a high-resolution game-renderer
+	// allocation failed and RenderScalePercent had to be reset to 100.
+	int previousFallbackRequestedPercent;
+	int previousFallbackPercent;
+	int previousFallbackReason;
+};
+
+bool getRenderScaleStatus(RenderScaleStatus *out);
+const char *getRenderScaleFallbackReasonName(int reason);
+// Called only after librw has successfully allocated its private scene/depth
+// targets. A high-resolution swapchain alone is not proof that the complete
+// render configuration started successfully.
+void confirmRenderScaleRendererReady(void);
 
 // Snapshot of the tracked controllers, refreshed once per frame while the
 // session holds focus. Axes are -1..1, triggers and grips 0..1.
@@ -93,7 +167,9 @@ typedef void (*FrameRenderer)(VkImage image, VkImageView view,
                               const float viewProj[2][16],
                               const float im2dWorld[16], float im2dDistance,
                               const float headPos[3], float headYaw,
-                              const float headQuat[4], float eyeFovDeg);
+                              const float headQuat[4], float eyeFovDeg,
+                              const float eyePos[2][3],
+                              const float eyeQuat[2][4]);
 void setFrameRenderer(FrameRenderer renderer);
 
 // Selects how the frame just rendered is submitted. Immersive gameplay uses

@@ -50,6 +50,7 @@ void StartEarly();
 bool SubmitStartupFrame(void *nativeWindow);
 void CancelStereoFrame(RwCamera *camera);
 void SetInactive();
+void PrepareForGameShutdown();
 int GetStereoScalePercent();
 bool IsStereoReversed();
 bool IsFirstPersonEnabled();
@@ -67,6 +68,8 @@ bool ShouldUseTrackedWeapon(int hand);
 bool IsTrackedWeaponTriggerPressed(int hand);
 bool IsTrackedWeaponTriggerJustPressed(int hand);
 bool IsTrackedWeaponTriggerJustReleased(int hand);
+bool IsTrackedWeaponFireTriggerPressed(int hand, int weaponType);
+bool IsTrackedWeaponFireTriggerJustPressed(int hand, int weaponType);
 bool IsTrackedDetonatorActive(int hand);
 bool IsTrackedDetonatorTriggerJustPressed(int hand);
 bool IsTrackedRemoteGrenadeFireActive();
@@ -89,6 +92,8 @@ bool IsPhysicalWeaponType(int weaponType);
 bool IsPhysicalWeaponInteractionActive();
 bool IsTrackedWeaponHeld(int hand);
 int GetHeldWeaponSlot(int hand);
+bool IsRunWithoutLimitsEnabled();
+void SetRunWithoutLimitsEnabled(bool enabled);
 void SetTrackedWeaponRenderMatrix(int hand, int slot, int weaponType,
 	const CMatrix *matrix,
 	const CMatrix *contactMatrix = nil);
@@ -115,6 +120,12 @@ bool GetActiveTrackedThrowableLaunch(CVector *source, CVector *velocity);
 void ReleaseTrackedWeaponAfterUse(int hand, int slot);
 bool GetTrackedHandMatrix(int hand, CMatrix *handMatrix, float *grip = nil, float *trigger = nil);
 bool GetTrackedHandAimRay(int hand, CVector *origin, CVector *direction);
+#ifdef GTA_VR_WEAPONS
+bool GetTrackedVisualHandMatrix(int hand, CMatrix *handMatrix,
+	float *grip = nil, float *trigger = nil);
+bool GetTrackedVisualHandAimRay(int hand, CVector *origin,
+	CVector *direction);
+#endif
 bool IsImmersiveDrivingActive();
 bool IsImmersiveCarDrivingActive();
 bool IsImmersiveBikeDrivingActive();
@@ -132,6 +143,9 @@ bool ShouldRenderImmersiveBikeHandleMarker(int hand);
 bool GetImmersiveSteeringHandleMatrix(int hand, CMatrix *matrix);
 bool IsImmersiveSteeringHandleGrabbed(int hand);
 bool ShouldRenderImmersiveSteeringHandleMarker(int hand);
+#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
+void UpdateImmersiveCarModelSteeringWheel(CVehicle *vehicle);
+#endif
 bool IsImmersiveBikeSidearm(int weaponType);
 bool IsImmersiveVehicleSidearm(int weaponType);
 bool ConsumePhysicalMeleeStrike(int hand, int *slot, int *weaponType,
@@ -151,6 +165,20 @@ enum eQuestVehicleCalibrationItem
 	QUEST_VEHICLE_CAL_ROT_X,
 	QUEST_VEHICLE_CAL_ROT_Y,
 	QUEST_VEHICLE_CAL_ROT_Z,
+	QUEST_VEHICLE_CAL_GLOBAL_CENTER_X,
+	QUEST_VEHICLE_CAL_GLOBAL_CENTER_Y,
+	QUEST_VEHICLE_CAL_GLOBAL_CENTER_Z,
+	QUEST_VEHICLE_CAL_GLOBAL_RADIUS,
+	QUEST_VEHICLE_CAL_MODEL_CENTER_X,
+	QUEST_VEHICLE_CAL_MODEL_CENTER_Y,
+	QUEST_VEHICLE_CAL_MODEL_CENTER_Z,
+	QUEST_VEHICLE_CAL_MODEL_RADIUS,
+	QUEST_VEHICLE_CAL_GLOBAL_PITCH,
+	QUEST_VEHICLE_CAL_GLOBAL_YAW,
+	QUEST_VEHICLE_CAL_GLOBAL_ROLL,
+	QUEST_VEHICLE_CAL_MODEL_PITCH,
+	QUEST_VEHICLE_CAL_MODEL_YAW,
+	QUEST_VEHICLE_CAL_MODEL_ROLL,
 	QUEST_VEHICLE_CAL_WHEELIE_HEIGHT,
 	QUEST_VEHICLE_CAL_STAND_HEIGHT,
 	QUEST_VEHICLE_CAL_ITEM_COUNT
@@ -170,16 +198,33 @@ bool GetQuestRawTrackedHandAimMatrix(int hand, CMatrix *matrix);
 bool IsQuestDrivingHandUnavailable(int hand);
 void RestrictQuestVehicleWeaponsToSidearms();
 
-int GetQuestDrivingType();
-const char *GetQuestDrivingTypeName();
-void CycleQuestDrivingType(int direction);
-int GetQuestDrivingYOffsetCm();
-void AdjustQuestDrivingYOffsetCm(int direction);
+const char *GetQuestCarDrivingTypeName();
+const char *GetQuestBikeDrivingTypeName();
+void CycleQuestCarDrivingType(int direction);
+void CycleQuestBikeDrivingType(int direction);
 bool HasQuestVehicleSeatCalibrationTarget();
-int GetQuestVehicleSeatDistanceCm();
-void AdjustQuestVehicleSeatDistanceCm(int direction);
+const char *GetQuestVehicleCategoryName();
+int GetQuestVehicleGlobalSeatHeightCm();
+int GetQuestVehicleGlobalSeatDistanceCm();
+int GetQuestVehicleModelSeatHeightCm();
+int GetQuestVehicleModelSeatDistanceCm();
+void AdjustQuestVehicleGlobalSeatHeightCm(int direction);
+void AdjustQuestVehicleGlobalSeatDistanceCm(int direction);
+void AdjustQuestVehicleModelSeatHeightCm(int direction);
+void AdjustQuestVehicleModelSeatDistanceCm(int direction);
+bool HasQuestDefaultVehicleViewOffsetTarget();
+const char *GetQuestDefaultVehicleViewOffsetName();
+int GetQuestDefaultVehicleSeatHeightCm();
+int GetQuestDefaultVehicleSeatDistanceCm();
+void AdjustQuestDefaultVehicleSeatHeightCm(int direction);
+void AdjustQuestDefaultVehicleSeatDistanceCm(int direction);
 int GetQuestMotionSteeringHand();
 void ToggleQuestMotionSteeringHand();
+bool IsQuestImmersiveCarWheelVisible();
+bool ShouldRenderQuestImmersiveCarWheel();
+void ToggleQuestImmersiveCarWheelVisible();
+const char *GetQuestVehicleModelWheelVisibilityName();
+void ToggleQuestVehicleModelWheelVisibility();
 bool AreQuestVehicleHandleHighlightsEnabled();
 void ToggleQuestVehicleHandleHighlights();
 bool IsQuestBikeHorizonLocked();
@@ -188,6 +233,10 @@ const char *GetQuestActiveVehicleName();
 bool IsQuestVehicleCalibrationAvailable();
 bool IsQuestVehicleCalibrationBike();
 int GetQuestVehicleCalibrationItemCount();
+int GetQuestVehicleCalibrationItemForRow(int row);
+const char *GetQuestVehicleCalibrationItemName(int item);
+bool IsQuestVehicleCalibrationRotation(int item);
+bool IsQuestVehicleCalibrationWholeCentimeters(int item);
 int GetQuestVehicleCalibrationValue(int hand, int item);
 void AdjustQuestVehicleCalibrationValue(int hand, int item, int direction);
 void SetQuestVehicleCalibrationPreview(bool visible);

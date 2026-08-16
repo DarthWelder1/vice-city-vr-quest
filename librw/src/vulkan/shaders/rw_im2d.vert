@@ -25,6 +25,7 @@ layout(location = 2) in vec2 inTexCoord;
 
 layout(location = 0) out vec4 fragColour;
 layout(location = 1) out vec2 fragTexCoord;
+layout(location = 2) flat out float fragWorldSprite;
 
 void main()
 {
@@ -52,4 +53,7 @@ void main()
 		gl_Position.z = max(inPosition.z, 0.00001) * gl_Position.w;
 	fragColour = inColour * push.materialColour;
 	fragTexCoord = inTexCoord;
+	// HUD/fonts arrive at the near plane and are clamped to the head-locked
+	// panel. Coronas, headlights and particles retain their real camera depth.
+	fragWorldSprite = inPosition.w > panel+0.01 ? 1.0 : 0.0;
 }

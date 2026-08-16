@@ -11,6 +11,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <vector>
 
@@ -269,6 +272,17 @@ struct State
 	int64_t swapchainFormat = 0;
 	uint32_t renderWidth = 0;
 	uint32_t renderHeight = 0;
+	int renderScaleRequestedPercent = 100;
+	int renderScaleSelectedPresetPercent = 100;
+	float renderScaleEffectivePercent = 100.0f;
+	uint32_t renderScaleRecommendedWidth = 0;
+	uint32_t renderScaleRecommendedHeight = 0;
+	uint32_t renderScaleRuntimeMaxWidth = 0;
+	uint32_t renderScaleRuntimeMaxHeight = 0;
+	int renderScaleFallbackReason = RENDER_SCALE_FALLBACK_NONE;
+	int previousRenderScaleFallbackRequestedPercent = 0;
+	int previousRenderScaleFallbackPercent = 0;
+	int previousRenderScaleFallbackReason = RENDER_SCALE_FALLBACK_NONE;
 
 	VkInstance vkInstance = VK_NULL_HANDLE;
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -302,10 +316,45 @@ struct State
 	PFN_xrGetDisplayRefreshRateFB getRefreshRate = nullptr;
 	PFN_xrRequestDisplayRefreshRateFB requestRefreshRate = nullptr;
 	bool refreshRateRequestAttempted = false;
+	// Keep application layers hidden while the headset panel changes refresh
+	// rate. Quest otherwise presents several menu frames at the old frequency.
+	bool refreshRateReadyForFrames = false;
 	int refreshRateRetryCount = 0;
 	XrTime nextRefreshRateRetryTime = 0;
 	float currentRefreshRateHz = kTargetDisplayRefreshRateHz;
+	// Runtime-configurable target (vr_settings "RefreshRate"); the constant
+	// above remains the safe default.
+	float targetRefreshRateHz = kTargetDisplayRefreshRateHz;
 	float elapsed = 0.0f;
+
+	// XR_EXT_performance_settings supplies hints rather than hard clock locks.
+	// Keep the requested menu value separate from the effective hint because
+	// the extension deliberately has no API for clearing a hint in-place.
+	bool hasPerformanceSettingsExt = false;
+	PFN_xrPerfSettingsSetPerformanceLevelEXT setPerformanceLevel = nullptr;
+	int requestedPerformanceMode = PERFORMANCE_MODE_SUSTAINED_HIGH;
+	int activePerformanceMode = -1;
+	// The headset-validated 125% profile holds 72 Hz with sustained CPU/GPU
+	// hints. Keep both domains on the thermally sustainable public OpenXR level;
+	// Boost remains an explicit short test rather than a shipping default.
+	int requestedGpuPerformanceMode = PERFORMANCE_MODE_SUSTAINED_HIGH;
+	int activeGpuPerformanceMode = -1;
+	bool gpuPerformanceHintSucceededThisSession = false;
+	bool cpuPerformanceHintSucceededThisSession = false;
+	bool cpuBoostActive = false;
+	bool boostThermallyBlocked = false;
+	int boostReturnMode = PERFORMANCE_MODE_AUTO;
+	XrTime boostExpiryDisplayTime = 0;
+	long long boostExpiryMonotonicNs = 0;
+	bool performanceAutoLogged = false;
+
+	// This port runs game logic and rendering on the same dedicated thread.
+	// XR_KHR_android_thread_settings lets the runtime identify that time-critical
+	// CPU thread without the application forcing a Linux scheduling policy.
+	bool hasAndroidThreadSettingsExt = false;
+	PFN_xrSetAndroidApplicationThreadKHR setAndroidApplicationThread = nullptr;
+	uint32_t applicationMainThreadId = 0;
+	bool applicationMainThreadRegistered = false;
 
 	FrameRenderer frameRenderer = nullptr;
 	bool theaterMode = true;
@@ -339,6 +388,7 @@ struct State
 	XrSpace gripSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 	XrSpace aimSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 	XrAction thumbstickAction = XR_NULL_HANDLE;
+	XrAction hapticAction = XR_NULL_HANDLE;
 	XrAction triggerAction = XR_NULL_HANDLE;
 	XrAction squeezeAction = XR_NULL_HANDLE;
 	XrAction thumbClickAction = XR_NULL_HANDLE;
@@ -457,6 +507,27 @@ initialiseLoader(android_app *app)
 }
 
 bool
+applyAndroidThreadSettings(const char *reason)
+{
+	if(!g.hasAndroidThreadSettingsExt ||
+	   g.setAndroidApplicationThread == nullptr ||
+	   g.session == XR_NULL_HANDLE || g.applicationMainThreadId == 0)
+		return false;
+
+	const XrResult result = g.setAndroidApplicationThread(
+		g.session, XR_ANDROID_THREAD_TYPE_APPLICATION_MAIN_KHR,
+		g.applicationMainThreadId);
+	g.applicationMainThreadRegistered = XR_SUCCEEDED(result);
+	if(g.applicationMainThreadRegistered)
+		LOGI("XR_KHR_android_thread_settings application-main tid=%u (%s): result=%d",
+		     g.applicationMainThreadId, reason, (int)result);
+	else
+		LOGW("xrSetAndroidApplicationThreadKHR application-main tid=%u (%s) failed: %d",
+		     g.applicationMainThreadId, reason, (int)result);
+	return g.applicationMainThreadRegistered;
+}
+
+bool
 createInstance(android_app *app)
 {
 	uint32_t extensionCount = 0;
@@ -490,7 +561,14 @@ createInstance(android_app *app)
 		has(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
 	if(g.hasPerformanceMetricsExt)
 		enabled.push_back(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
-
+	g.hasPerformanceSettingsExt =
+		has(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+	if(g.hasPerformanceSettingsExt)
+		enabled.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+	g.hasAndroidThreadSettingsExt =
+		has(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
+	if(g.hasAndroidThreadSettingsExt)
+		enabled.push_back(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
 	XrInstanceCreateInfoAndroidKHR androidInfo = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 	androidInfo.applicationVM = app->activity->vm;
 	androidInfo.applicationActivity = app->activity->clazz;
@@ -506,7 +584,6 @@ createInstance(android_app *app)
 	info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
 
 	XR_CHECK(xrCreateInstance(&info, &g.instance), "xrCreateInstance");
-
 	if(g.hasRefreshRateExt){
 		const XrResult enumerateResult = xrGetInstanceProcAddr(
 			g.instance, "xrEnumerateDisplayRefreshRatesFB",
@@ -525,6 +602,33 @@ createInstance(android_app *app)
 			g.hasRefreshRateExt = false;
 		}
 	}
+	g.refreshRateReadyForFrames = !g.hasRefreshRateExt;
+	if(g.hasPerformanceSettingsExt){
+		const XrResult result = xrGetInstanceProcAddr(
+			g.instance, "xrPerfSettingsSetPerformanceLevelEXT",
+			(PFN_xrVoidFunction *)&g.setPerformanceLevel);
+		if(XR_FAILED(result) || g.setPerformanceLevel == nullptr){
+			LOGE("XR_EXT_performance_settings entry point unavailable: %d",
+			     (int)result);
+			g.hasPerformanceSettingsExt = false;
+			g.setPerformanceLevel = nullptr;
+		}else
+			LOGI("XR_EXT_performance_settings supported");
+	}else
+		LOGI("XR_EXT_performance_settings not supported; runtime controls clocks");
+	if(g.hasAndroidThreadSettingsExt){
+		const XrResult result = xrGetInstanceProcAddr(
+			g.instance, "xrSetAndroidApplicationThreadKHR",
+			(PFN_xrVoidFunction *)&g.setAndroidApplicationThread);
+		if(XR_FAILED(result) || g.setAndroidApplicationThread == nullptr){
+			LOGW("XR_KHR_android_thread_settings entry point unavailable: %d",
+			     (int)result);
+			g.hasAndroidThreadSettingsExt = false;
+			g.setAndroidApplicationThread = nullptr;
+		}else
+			LOGI("XR_KHR_android_thread_settings supported");
+	}else
+		LOGI("XR_KHR_android_thread_settings not supported");
 	if(g.hasPerformanceMetricsExt){
 		const XrResult enumerateResult = xrGetInstanceProcAddr(
 			g.instance,
@@ -715,6 +819,23 @@ createSession(void)
 	info.next = &binding;
 	info.systemId = g.systemId;
 	XR_CHECK(xrCreateSession(g.instance, &info, &g.session), "xrCreateSession");
+	// The specification only requires a valid session. Register immediately so
+	// the runtime knows which CPU thread is critical while game resources are
+	// initialised, then reassert at READY/FOCUSED for runtimes which reset
+	// scheduling attributes across lifecycle transitions.
+	applyAndroidThreadSettings("session created");
+	// Thermal blocks and effective hints belong to one OpenXR session. A new
+	// session starts from runtime policy again while retaining the requested
+	// menu mode so READY can apply it.
+	g.activePerformanceMode = -1;
+	g.activeGpuPerformanceMode = -1;
+	g.cpuPerformanceHintSucceededThisSession = false;
+	g.gpuPerformanceHintSucceededThisSession = false;
+	g.cpuBoostActive = false;
+	g.boostThermallyBlocked = false;
+	g.boostExpiryDisplayTime = 0;
+	g.boostExpiryMonotonicNs = 0;
+	g.performanceAutoLogged = false;
 
 	// STAGE gives a floor-relative origin, which is what a standing game wants.
 	// Not every runtime configuration offers it, so LOCAL remains the fallback.
@@ -809,6 +930,8 @@ createActions(void)
 	g.xAction = makeAction("xbutton", "X", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
 	g.yAction = makeAction("ybutton", "Y", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
 	g.menuAction = makeAction("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, false);
+	g.hapticAction = makeAction("haptic", "Haptic",
+	                            XR_ACTION_TYPE_VIBRATION_OUTPUT, true);
 
 	struct Binding { XrAction action; const char *path; };
 	const Binding bindings[] = {
@@ -816,6 +939,8 @@ createActions(void)
 		{ g.gripPoseAction,   "/user/hand/right/input/grip/pose" },
 		{ g.aimPoseAction,    "/user/hand/left/input/aim/pose" },
 		{ g.aimPoseAction,    "/user/hand/right/input/aim/pose" },
+		{ g.hapticAction,     "/user/hand/left/output/haptic" },
+		{ g.hapticAction,     "/user/hand/right/output/haptic" },
 		{ g.thumbstickAction, "/user/hand/left/input/thumbstick" },
 		{ g.thumbstickAction, "/user/hand/right/input/thumbstick" },
 		{ g.triggerAction,    "/user/hand/left/input/trigger/value" },
@@ -1024,9 +1149,81 @@ createSwapchain(void)
 	             XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &viewCount, g.viewConfigs),
 	         "xrEnumerateViewConfigurationViews");
 
-	g.renderWidth = g.viewConfigs[0].recommendedImageRectWidth;
-	g.renderHeight = g.viewConfigs[0].recommendedImageRectHeight;
-	LOGI("per-eye render target: %ux%u", g.renderWidth, g.renderHeight);
+	char settingsPath[512];
+	snprintf(settingsPath, sizeof(settingsPath), "%s/vr_settings.ini",
+		platform::gameDataRoot());
+	// Apply the tested Quest baseline once when upgrading an older settings
+	// file. The version marker is written last, so a partial write retries on
+	// the next launch. After migration every menu option remains user-editable.
+	const int baselineVersion = (int)GetPrivateProfileIntA(
+		"VR", "QuestBaselineProfileVersion", 0, settingsPath);
+	if(baselineVersion < 1){
+		struct BaselineSetting { const char *key; const char *value; };
+		static const BaselineSetting settings[] = {
+			{ "RenderScalePercent", "125" },
+			{ "Sgsr2Mode", "0" },
+			{ "CpuPerformanceMode", "1" },
+			{ "GpuPerformanceMode", "1" },
+			{ "OcclusionCulling", "1" },
+			{ "OcclusionCullingModeV2", "1" },
+			{ "PhysicsDirectorMode", "3" },
+			{ "PhysicsDirectorPreset", "0" },
+			{ "VehicleVisualBudgetMode", "0" },
+			{ "ModelSet", "1" },
+			{ "ModelSetWorld", "1" },
+			{ "ModelSetVegetation", "0" },
+			{ "ModelSetVehicles", "0" },
+			{ "ModelSetPeds", "0" },
+			{ "ModelSetWeapons", "1" }
+		};
+		bool migrated = true;
+		for(size_t i = 0; i < sizeof(settings)/sizeof(settings[0]); i++)
+			migrated = WritePrivateProfileStringA("VR", settings[i].key,
+				settings[i].value, settingsPath) && migrated;
+		if(migrated)
+			migrated = WritePrivateProfileStringA("VR",
+				"QuestBaselineProfileVersion", "1", settingsPath);
+		LOGI("Quest baseline profile migration: version=%d result=%s path=%s",
+		     baselineVersion, migrated ? "applied" : "FAILED", settingsPath);
+	}
+	int renderScalePercent = (int)GetPrivateProfileIntA(
+		"VR", "RenderScalePercent", 125, settingsPath);
+	if(renderScalePercent < 100)
+		renderScalePercent = 100;
+	else if(renderScalePercent > 175)
+		renderScalePercent = 175;
+	const uint32_t recommendedWidth =
+		g.viewConfigs[0].recommendedImageRectWidth;
+	const uint32_t recommendedHeight =
+		g.viewConfigs[0].recommendedImageRectHeight;
+	const uint32_t maxWidth = g.viewConfigs[0].maxImageRectWidth;
+	const uint32_t maxHeight = g.viewConfigs[0].maxImageRectHeight;
+	g.renderScaleRequestedPercent = renderScalePercent;
+	g.renderScaleRecommendedWidth = recommendedWidth;
+	g.renderScaleRecommendedHeight = recommendedHeight;
+	g.renderScaleRuntimeMaxWidth = maxWidth;
+	g.renderScaleRuntimeMaxHeight = maxHeight;
+	g.renderScaleSelectedPresetPercent = 0;
+	g.renderScaleEffectivePercent = 0.0f;
+	g.renderScaleFallbackReason = RENDER_SCALE_FALLBACK_NONE;
+	g.previousRenderScaleFallbackRequestedPercent =
+		(int)GetPrivateProfileIntA("VR", "RenderScaleLastFallbackRequest",
+			0, settingsPath);
+	g.previousRenderScaleFallbackPercent =
+		(int)GetPrivateProfileIntA("VR", "RenderScaleLastFallbackPercent",
+			0, settingsPath);
+	g.previousRenderScaleFallbackReason =
+		(int)GetPrivateProfileIntA("VR", "RenderScaleLastFallbackReason",
+			RENDER_SCALE_FALLBACK_NONE, settingsPath);
+	if(recommendedWidth == 0 || recommendedHeight == 0 ||
+	   maxWidth < recommendedWidth || maxHeight < recommendedHeight){
+		LOGE("invalid OpenXR render extents: recommended %ux%u, max %ux%u",
+		     recommendedWidth, recommendedHeight, maxWidth, maxHeight);
+		return false;
+	}
+	LOGI("render scale requested: %d%% (recommended %ux%u, runtime max %ux%u)",
+		renderScalePercent, recommendedWidth, recommendedHeight,
+		maxWidth, maxHeight);
 
 	uint32_t formatCount = 0;
 	xrEnumerateSwapchainFormats(g.session, 0, &formatCount, nullptr);
@@ -1065,12 +1262,136 @@ createSwapchain(void)
 	                  XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
 	info.format = g.swapchainFormat;
 	info.sampleCount = 1;
-	info.width = g.renderWidth;
-	info.height = g.renderHeight;
 	info.faceCount = 1;
 	info.arraySize = 2;
 	info.mipCount = 1;
-	XR_CHECK(xrCreateSwapchain(g.session, &info, &g.swapchain), "xrCreateSwapchain");
+
+	// Keep the two axes on one common scale. Independently clamping width and
+	// height can distort the projection whenever only one runtime maximum is
+	// reached. If the runtime cannot allocate the requested swapchain, retain
+	// the persisted request and retry the nearest lower menu presets for this
+	// launch only.
+	int scaleCandidates[4];
+	int scaleCandidateCount = 0;
+	scaleCandidates[scaleCandidateCount++] = renderScalePercent;
+	static const int lowerScalePresets[] = { 150, 125, 100 };
+	for(int preset : lowerScalePresets)
+		if(preset < renderScalePercent)
+			scaleCandidates[scaleCandidateCount++] = preset;
+
+	uint32_t previousWidth = 0;
+	uint32_t previousHeight = 0;
+	int selectedScalePercent = 0;
+	double selectedEffectiveScalePercent = 0.0;
+	for(int candidateIndex = 0;
+	    candidateIndex < scaleCandidateCount;
+	    candidateIndex++){
+		const int candidateScalePercent = scaleCandidates[candidateIndex];
+		double uniformScale = (double)candidateScalePercent/100.0;
+		const double maxWidthScale = (double)maxWidth/recommendedWidth;
+		const double maxHeightScale = (double)maxHeight/recommendedHeight;
+		if(uniformScale > maxWidthScale)
+			uniformScale = maxWidthScale;
+		if(uniformScale > maxHeightScale)
+			uniformScale = maxHeightScale;
+
+		uint32_t candidateWidth =
+			(uint32_t)(recommendedWidth*uniformScale+0.5);
+		uint32_t candidateHeight =
+			(uint32_t)(recommendedHeight*uniformScale+0.5);
+		// Rounding should already respect the common maximum scale. Keep the
+		// final values defensive without deriving a second per-axis scale.
+		if(candidateWidth > maxWidth)
+			candidateWidth = maxWidth;
+		if(candidateHeight > maxHeight)
+			candidateHeight = maxHeight;
+		const double widthScale =
+			(double)candidateWidth/recommendedWidth;
+		const double heightScale =
+			(double)candidateHeight/recommendedHeight;
+		const double candidateEffectiveScalePercent =
+			(widthScale < heightScale ? widthScale : heightScale)*100.0;
+
+		if(candidateWidth == previousWidth &&
+		   candidateHeight == previousHeight)
+			continue;
+		previousWidth = candidateWidth;
+		previousHeight = candidateHeight;
+
+		info.width = candidateWidth;
+		info.height = candidateHeight;
+		XrSwapchain candidateSwapchain = XR_NULL_HANDLE;
+		const XrResult createResult =
+			xrCreateSwapchain(g.session, &info, &candidateSwapchain);
+		if(XR_SUCCEEDED(createResult)){
+			g.swapchain = candidateSwapchain;
+			g.renderWidth = candidateWidth;
+			g.renderHeight = candidateHeight;
+			selectedScalePercent = candidateScalePercent;
+			selectedEffectiveScalePercent =
+				candidateEffectiveScalePercent;
+			break;
+		}
+		LOGW("xrCreateSwapchain %ux%u (request %d%%, candidate %d%%, "
+		     "effective %.2f%%) failed: %d; trying a lower preset",
+			candidateWidth, candidateHeight, renderScalePercent,
+			candidateScalePercent, candidateEffectiveScalePercent,
+			(int)createResult);
+	}
+	if(g.swapchain == XR_NULL_HANDLE){
+		LOGE("xrCreateSwapchain failed for requested %d%% and all lower presets",
+		     renderScalePercent);
+		return false;
+	}
+	g.renderScaleSelectedPresetPercent = selectedScalePercent;
+	g.renderScaleEffectivePercent = (float)selectedEffectiveScalePercent;
+	if(selectedScalePercent < renderScalePercent)
+		g.renderScaleFallbackReason =
+			RENDER_SCALE_FALLBACK_SWAPCHAIN_ALLOCATION;
+	else if(selectedEffectiveScalePercent+0.5 <
+	        (double)renderScalePercent)
+		g.renderScaleFallbackReason =
+			RENDER_SCALE_FALLBACK_RUNTIME_LIMIT;
+	const bool renderScaleFallback =
+		g.renderScaleFallbackReason != RENDER_SCALE_FALLBACK_NONE;
+	// Keep the user's request intact. The menu exposes REQUEST and ACTIVE
+	// separately and highlights this fallback in red. Retrying this OpenXR
+	// allocation next launch is safe because it already recovered in-process.
+	// Only a later librw allocation failure writes emergency 100% for recovery.
+	if(g.renderScaleFallbackReason ==
+	   RENDER_SCALE_FALLBACK_SWAPCHAIN_ALLOCATION){
+		char requestText[16], actualText[16], reasonText[16];
+		snprintf(requestText, sizeof(requestText), "%d", renderScalePercent);
+		snprintf(actualText, sizeof(actualText), "%d", selectedScalePercent);
+		snprintf(reasonText, sizeof(reasonText), "%d",
+			g.renderScaleFallbackReason);
+		const bool saved =
+			WritePrivateProfileStringA("VR", "RenderScaleLastFallbackRequest",
+				requestText, settingsPath) &&
+			WritePrivateProfileStringA("VR", "RenderScaleLastFallbackPercent",
+				actualText, settingsPath) &&
+			WritePrivateProfileStringA("VR", "RenderScaleLastFallbackReason",
+				reasonText, settingsPath);
+		g.previousRenderScaleFallbackRequestedPercent = renderScalePercent;
+		g.previousRenderScaleFallbackPercent = selectedScalePercent;
+		g.previousRenderScaleFallbackReason = g.renderScaleFallbackReason;
+		if(!saved)
+			LOGE("could not persist render-scale fallback status %d%% -> %d%%",
+			     renderScalePercent, selectedScalePercent);
+		else
+			LOGW("render-scale fallback recorded without changing request: %d%% -> %d%%",
+			     renderScalePercent, selectedScalePercent);
+	}
+	LOGI("per-eye render target: %ux%u (requested %d%%, selected %d%%, "
+	     "effective %.2f%%, fallback %s)",
+		g.renderWidth, g.renderHeight, renderScalePercent,
+		selectedScalePercent, selectedEffectiveScalePercent,
+		getRenderScaleFallbackReasonName(g.renderScaleFallbackReason));
+	if(renderScaleFallback)
+		LOGW("render scale fallback active: request=%d%% actual=%.2f%% "
+		     "reason=%s",
+			renderScalePercent, selectedEffectiveScalePercent,
+			getRenderScaleFallbackReasonName(g.renderScaleFallbackReason));
 
 	uint32_t imageCount = 0;
 	xrEnumerateSwapchainImages(g.swapchain, 0, &imageCount, nullptr);
@@ -1383,15 +1704,32 @@ createPipeline(void)
 }
 
 bool
-createPerImageResources(void)
+createSwapchainImageViews(void)
 {
-	const uint32_t imageCount = (uint32_t)g.images.size();
-
 	VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 	poolInfo.queueFamilyIndex = g.queueFamily;
 	VK_CHECK(vkCreateCommandPool(g.device, &poolInfo, nullptr, &g.commandPool),
 	         "vkCreateCommandPool");
+
+	for(SwapchainImage &image : g.images){
+		VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+		viewInfo.image = image.image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+		viewInfo.format = (VkFormat)g.swapchainFormat;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 2;
+		VK_CHECK(vkCreateImageView(g.device, &viewInfo, nullptr, &image.view),
+		         "vkCreateImageView(colour)");
+	}
+	return true;
+}
+
+bool
+createPerImageBringupResources(void)
+{
+	const uint32_t imageCount = (uint32_t)g.images.size();
 
 	VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, imageCount };
 	VkDescriptorPoolCreateInfo descriptorPoolInfo = {
@@ -1405,16 +1743,6 @@ createPerImageResources(void)
 
 	for(uint32_t i = 0; i < imageCount; i++){
 		SwapchainImage &image = g.images[i];
-
-		VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-		viewInfo.image = image.image;
-		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-		viewInfo.format = (VkFormat)g.swapchainFormat;
-		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		viewInfo.subresourceRange.levelCount = 1;
-		viewInfo.subresourceRange.layerCount = 2;
-		VK_CHECK(vkCreateImageView(g.device, &viewInfo, nullptr, &image.view),
-		         "vkCreateImageView(colour)");
 
 		const VkImageView attachments[2] = { image.view, g.depthView };
 		VkFramebufferCreateInfo framebufferInfo = {
@@ -1601,14 +1929,37 @@ renderLayer(const XrView views[2])
 		// screen-space effects size themselves from it.
 		const float eyeFovDeg =
 			(renderFov[0].angleRight-renderFov[0].angleLeft)*57.29578f;
+		float eyePos[2][3];
+		float eyeQuat[2][4];
+		for(int eye = 0; eye < 2; eye++){
+			eyePos[eye][0] = views[eye].pose.position.x;
+			eyePos[eye][1] = views[eye].pose.position.y;
+			eyePos[eye][2] = views[eye].pose.position.z;
+			eyeQuat[eye][0] = views[eye].pose.orientation.x;
+			eyeQuat[eye][1] = views[eye].pose.orientation.y;
+			eyeQuat[eye][2] = views[eye].pose.orientation.z;
+			eyeQuat[eye][3] = views[eye].pose.orientation.w;
+		}
 		g.frameRenderer(image.image, image.view, matrices, im2dWorld.m,
-		                im2dDistance, headPos, headYaw, headQuat, eyeFovDeg);
+		                im2dDistance, headPos, headYaw, headQuat, eyeFovDeg,
+		                eyePos, eyeQuat);
 
 		XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 		xrReleaseSwapchainImage(g.swapchain, &releaseInfo);
 		return true;
 	}
 
+#ifndef MIAMIVR_BRINGUP
+	// Release builds deliberately do not allocate the standalone bring-up
+	// depth/pipeline resources. android_main installs the librw callback before
+	// the first frame; fail closed if that contract is ever broken instead of
+	// dereferencing null Vulkan handles.
+	XrSwapchainImageReleaseInfo releaseInfo = {
+		XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	xrReleaseSwapchainImage(g.swapchain, &releaseInfo);
+	LOGE("release frame reached without an installed game renderer");
+	return false;
+#else
 	vkWaitForFences(g.device, 1, &image.fence, VK_TRUE, UINT64_MAX);
 	vkResetFences(g.device, 1, &image.fence);
 	memcpy(image.uniformMapped, viewProj, sizeof(viewProj));
@@ -1656,6 +2007,7 @@ renderLayer(const XrView views[2])
 	XrSwapchainImageReleaseInfo releaseInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 	xrReleaseSwapchainImage(g.swapchain, &releaseInfo);
 	return true;
+#endif
 }
 
 bool
@@ -1669,9 +2021,18 @@ requestPreferredDisplayRefreshRate(void)
 	XrResult result =
 		g.enumerateRefreshRates(g.session, 0, &count, nullptr);
 	if(XR_FAILED(result) || count == 0){
-		LOGE("display refresh enumeration failed: %d, count %u",
-		     (int)result, count);
-		return false;
+		// Some Horizon OS builds return an empty rate list. Request the
+		// target directly and let the runtime validate it; unsupported
+		// values fail cleanly with DISPLAY_REFRESH_RATE_UNSUPPORTED.
+		result = g.requestRefreshRate(g.session, g.targetRefreshRateHz);
+		float actual = 0.0f;
+		if(XR_SUCCEEDED(g.getRefreshRate(g.session, &actual)) &&
+		   actual > 0.0f)
+			g.currentRefreshRateHz = actual;
+		LOGI("display refresh direct request %.1f Hz: result %d, "
+		     "now %.1f Hz", g.targetRefreshRateHz, (int)result,
+		     g.currentRefreshRateHz);
+		return XR_SUCCEEDED(result);
 	}
 
 	std::vector<float> rates(count);
@@ -1682,11 +2043,11 @@ requestPreferredDisplayRefreshRate(void)
 	}
 
 	float target = rates[0];
-	float targetDistance = fabsf(target - kTargetDisplayRefreshRateHz);
+	float targetDistance = fabsf(target - g.targetRefreshRateHz);
 	for(uint32_t i = 0; i < count; i++){
 		LOGI("display refresh offered[%u] = %.1f Hz", i, rates[i]);
 		const float distance =
-			fabsf(rates[i] - kTargetDisplayRefreshRateHz);
+			fabsf(rates[i] - g.targetRefreshRateHz);
 		if(distance < targetDistance){
 			target = rates[i];
 			targetDistance = distance;
@@ -1709,6 +2070,239 @@ requestPreferredDisplayRefreshRate(void)
 	return XR_SUCCEEDED(result);
 }
 
+const char *
+performanceModeName(int mode)
+{
+	switch(mode){
+	case PERFORMANCE_MODE_AUTO: return "Auto";
+	case PERFORMANCE_MODE_SUSTAINED_HIGH: return "SustainedHigh";
+	case PERFORMANCE_MODE_BOOST: return "Boost";
+	default: return "Unknown";
+	}
+}
+
+const char *
+performanceDomainName(XrPerfSettingsDomainEXT domain)
+{
+	switch(domain){
+	case XR_PERF_SETTINGS_DOMAIN_CPU_EXT: return "CPU";
+	case XR_PERF_SETTINGS_DOMAIN_GPU_EXT: return "GPU";
+	default: return "unknown";
+	}
+}
+
+const char *
+performanceSubDomainName(XrPerfSettingsSubDomainEXT subDomain)
+{
+	switch(subDomain){
+	case XR_PERF_SETTINGS_SUB_DOMAIN_COMPOSITING_EXT: return "compositing";
+	case XR_PERF_SETTINGS_SUB_DOMAIN_RENDERING_EXT: return "rendering";
+	case XR_PERF_SETTINGS_SUB_DOMAIN_THERMAL_EXT: return "thermal";
+	default: return "unknown";
+	}
+}
+
+static constexpr long long kPerformanceBoostDurationNs = 25LL * 1000000000LL;
+static constexpr long long kPerformanceStepDownRetryNs = 1LL * 1000000000LL;
+
+long long
+monotonicTimeNs(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+bool
+setCpuPerformanceLevel(XrPerfSettingsLevelEXT level, const char *reason)
+{
+	if(!g.hasPerformanceSettingsExt || g.setPerformanceLevel == nullptr ||
+	   g.session == XR_NULL_HANDLE || !g.running)
+		return false;
+	const XrResult result = g.setPerformanceLevel(
+		g.session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, level);
+	LOGI("OpenXR CPU performance %s: level=%d result=%d",
+	     reason, (int)level, (int)result);
+	if(XR_SUCCEEDED(result))
+		g.cpuPerformanceHintSucceededThisSession = true;
+	return XR_SUCCEEDED(result);
+}
+
+bool
+setGpuPerformanceLevel(XrPerfSettingsLevelEXT level, const char *reason)
+{
+	if(!g.hasPerformanceSettingsExt || g.setPerformanceLevel == nullptr ||
+	   g.session == XR_NULL_HANDLE || !g.running)
+		return false;
+	const XrResult result = g.setPerformanceLevel(
+		g.session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, level);
+	LOGI("OpenXR GPU performance %s: level=%d result=%d",
+	     reason, (int)level, (int)result);
+	if(XR_SUCCEEDED(result))
+		g.gpuPerformanceHintSucceededThisSession = true;
+	return XR_SUCCEEDED(result);
+}
+
+bool
+applyGpuPerformanceMode(bool force)
+{
+	if(!g.hasPerformanceSettingsExt || g.setPerformanceLevel == nullptr ||
+	   g.session == XR_NULL_HANDLE || !g.running)
+		return false;
+	const int requested = g.requestedGpuPerformanceMode;
+	if(!force && g.activeGpuPerformanceMode == requested)
+		return true;
+	if(requested == PERFORMANCE_MODE_AUTO &&
+	   !g.gpuPerformanceHintSucceededThisSession){
+		g.activeGpuPerformanceMode = PERFORMANCE_MODE_AUTO;
+		LOGI("OpenXR GPU performance Auto: no GPU hint issued");
+		return true;
+	}
+	// OpenXR has no clear-hint operation. Returning to Auto after an explicit
+	// request uses Sustained High until the next process/session restart.
+	const XrPerfSettingsLevelEXT level =
+		requested == PERFORMANCE_MODE_BOOST ?
+			XR_PERF_SETTINGS_LEVEL_BOOST_EXT :
+			XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT;
+	const bool ok = setGpuPerformanceLevel(level,
+		performanceModeName(requested));
+	g.activeGpuPerformanceMode = ok ?
+		(requested == PERFORMANCE_MODE_AUTO ?
+		 PERFORMANCE_MODE_SUSTAINED_HIGH : requested) : -1;
+	return ok;
+}
+
+void
+finishPerformanceBoost(const char *reason, bool thermal)
+{
+	const bool wasBoostActive = g.cpuBoostActive;
+	const int returnMode =
+		g.boostReturnMode == PERFORMANCE_MODE_SUSTAINED_HIGH ?
+			PERFORMANCE_MODE_SUSTAINED_HIGH : PERFORMANCE_MODE_AUTO;
+	const bool steppedDown = setCpuPerformanceLevel(
+		XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT, reason);
+	g.requestedPerformanceMode = returnMode;
+	if(thermal)
+		g.boostThermallyBlocked = true;
+	if(steppedDown){
+		g.activePerformanceMode = PERFORMANCE_MODE_SUSTAINED_HIGH;
+		g.cpuBoostActive = false;
+		g.boostExpiryDisplayTime = 0;
+		g.boostExpiryMonotonicNs = 0;
+		LOGW("OpenXR CPU Boost ended (%s); requested mode restored to %s%s",
+		     reason, performanceModeName(returnMode),
+		     thermal ? "; Boost blocked until a new session" : "");
+	}else if(wasBoostActive){
+		// A transient runtime failure must not leave the last accepted Boost
+		// hint active indefinitely. Keep the expiry pump armed and retry the
+		// safe level at a low rate instead of spamming the OpenXR call.
+		g.activePerformanceMode = PERFORMANCE_MODE_BOOST;
+		g.cpuBoostActive = true;
+		g.boostExpiryDisplayTime = g.predictedDisplayTime > 0 ?
+			g.predictedDisplayTime + kPerformanceStepDownRetryNs : 0;
+		g.boostExpiryMonotonicNs =
+			monotonicTimeNs() + kPerformanceStepDownRetryNs;
+		LOGW("OpenXR CPU Boost step-down failed (%s); retrying in one second",
+		     reason);
+	}else{
+		g.activePerformanceMode = -1;
+		g.cpuBoostActive = false;
+		g.boostExpiryDisplayTime = 0;
+		g.boostExpiryMonotonicNs = 0;
+	}
+}
+
+// CPU-only on purpose. Traffic/render submission is CPU-bound; touching the
+// GPU policy would add heat without addressing the measured bottleneck.
+bool
+applyPerformanceMode(bool force)
+{
+	if(!g.hasPerformanceSettingsExt || g.setPerformanceLevel == nullptr ||
+	   g.session == XR_NULL_HANDLE || !g.running)
+		return false;
+
+	const int requested = g.requestedPerformanceMode;
+	if(requested == PERFORMANCE_MODE_AUTO){
+		if(!g.cpuPerformanceHintSucceededThisSession){
+			g.activePerformanceMode = PERFORMANCE_MODE_AUTO;
+			if(!g.performanceAutoLogged){
+				LOGI("OpenXR performance mode Auto: no CPU hint issued");
+				g.performanceAutoLogged = true;
+			}
+			return true;
+		}
+
+		// XR_EXT_performance_settings has no clear/default call. After any
+		// successful CPU hint, Auto therefore means the safe sustained level
+		// until the next session restores the runtime's untouched policy.
+		const bool ok = setCpuPerformanceLevel(
+			XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT,
+			"Auto safe fallback");
+		if(ok){
+			g.activePerformanceMode = PERFORMANCE_MODE_SUSTAINED_HIGH;
+			g.cpuBoostActive = false;
+			g.boostExpiryDisplayTime = 0;
+			g.boostExpiryMonotonicNs = 0;
+		}else if(g.cpuBoostActive){
+			// Preserve the retry pump if this Auto request is the return path
+			// from a Boost whose first safe-level request was rejected.
+			g.activePerformanceMode = PERFORMANCE_MODE_BOOST;
+			g.boostExpiryDisplayTime = g.predictedDisplayTime > 0 ?
+				g.predictedDisplayTime + kPerformanceStepDownRetryNs : 0;
+			g.boostExpiryMonotonicNs =
+				monotonicTimeNs() + kPerformanceStepDownRetryNs;
+		}else
+			g.activePerformanceMode = -1;
+		if(!force)
+			LOGW("OpenXR performance Auto requested after a CPU hint; "
+			     "full runtime default returns after application restart");
+		return ok;
+	}
+
+	if(requested == PERFORMANCE_MODE_BOOST && g.boostThermallyBlocked){
+		LOGW("OpenXR CPU Boost rejected: thermally blocked until a new session");
+		g.requestedPerformanceMode = g.boostReturnMode;
+		return false;
+	}
+	if(requested == PERFORMANCE_MODE_BOOST && g.cpuBoostActive &&
+	   g.boostExpiryMonotonicNs > 0 &&
+	   monotonicTimeNs() >= g.boostExpiryMonotonicNs){
+		finishPerformanceBoost("25 second timeout", false);
+		return true;
+	}
+	if(!force && g.activePerformanceMode == requested)
+		return true;
+
+	const XrPerfSettingsLevelEXT cpuLevel =
+		requested == PERFORMANCE_MODE_BOOST ?
+			XR_PERF_SETTINGS_LEVEL_BOOST_EXT :
+			XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT;
+	const bool ok = setCpuPerformanceLevel(
+		cpuLevel, performanceModeName(requested));
+	if(!ok){
+		g.activePerformanceMode = -1;
+		return false;
+	}
+	g.activePerformanceMode = requested;
+	if(requested == PERFORMANCE_MODE_BOOST){
+		// Reasserting the hint after READY/FOCUSED must never extend the 25 s
+		// diagnostic window.
+		if(!g.cpuBoostActive){
+			g.cpuBoostActive = true;
+			g.boostExpiryMonotonicNs =
+				monotonicTimeNs() + kPerformanceBoostDurationNs;
+			g.boostExpiryDisplayTime = g.predictedDisplayTime > 0 ?
+				g.predictedDisplayTime + kPerformanceBoostDurationNs : 0;
+			LOGI("OpenXR CPU Boost armed for at most 25 seconds");
+		}
+	}else{
+		g.cpuBoostActive = false;
+		g.boostExpiryDisplayTime = 0;
+		g.boostExpiryMonotonicNs = 0;
+	}
+	return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1718,6 +2312,12 @@ requestPreferredDisplayRefreshRate(void)
 bool
 create(android_app *app)
 {
+	// create() is called by gameThreadMain, the single thread which performs
+	// both CGame::Step and render submission. gettid supplies the kernel TID
+	// required by XR_KHR_android_thread_settings (not pthread_t).
+	g.applicationMainThreadId = (uint32_t)syscall(SYS_gettid);
+	LOGI("OpenXR application-main candidate tid=%u (game/render thread)",
+	     g.applicationMainThreadId);
 	if(!initialiseLoader(app)) return false;
 	if(!createInstance(app)) return false;
 	if(!createVulkan()) return false;
@@ -1727,10 +2327,17 @@ create(android_app *app)
 	// loop.
 	if(!createActions()) return false;
 	if(!createSwapchain()) return false;
+	// The full game renderer only needs the OpenXR colour views and this
+	// command pool (the latter also uploads the debug/menu quad). Keep the
+	// large two-eye depth image and the rest of the standalone bring-up
+	// renderer out of release builds so they do not compete with librw's own
+	// full-resolution scene/depth allocations during startup.
+	if(!createSwapchainImageViews()) return false;
+#ifdef MIAMIVR_BRINGUP
 	if(!createDepthBuffer()) return false;
 	if(!createRenderPass()) return false;
 	if(!createPipeline()) return false;
-	if(!createPerImageResources()) return false;
+	if(!createPerImageBringupResources()) return false;
 
 	if(!uploadThroughHostBuffer(kCubeVertices, sizeof(kCubeVertices),
 	                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -1740,6 +2347,9 @@ create(android_app *app)
 	                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
 	                            &g.indexBuffer, &g.indexMemory))
 		return false;
+#else
+	LOGI("release renderer bootstrap: standalone full-resolution depth/pipeline skipped");
+#endif
 
 	LOGI("OpenXR/Vulkan session ready");
 	return true;
@@ -1757,9 +2367,79 @@ getContext(GraphicsContext *out)
 	out->queueFamilyIndex = g.queueFamily;
 	out->width = g.renderWidth;
 	out->height = g.renderHeight;
+	out->renderScaleEffectivePercent = g.renderScaleEffectivePercent;
 	out->viewCount = 2;
 	out->colourFormat = (VkFormat)g.swapchainFormat;
 	return true;
+}
+
+bool
+getRenderScaleStatus(RenderScaleStatus *out)
+{
+	if(out == nullptr || g.renderWidth == 0 || g.renderHeight == 0)
+		return false;
+	out->requestedPercent = g.renderScaleRequestedPercent;
+	out->selectedPresetPercent = g.renderScaleSelectedPresetPercent;
+	out->effectivePercent = g.renderScaleEffectivePercent;
+	out->recommendedWidth = g.renderScaleRecommendedWidth;
+	out->recommendedHeight = g.renderScaleRecommendedHeight;
+	out->actualWidth = g.renderWidth;
+	out->actualHeight = g.renderHeight;
+	out->runtimeMaxWidth = g.renderScaleRuntimeMaxWidth;
+	out->runtimeMaxHeight = g.renderScaleRuntimeMaxHeight;
+	out->fallbackReason = g.renderScaleFallbackReason;
+	out->previousFallbackRequestedPercent =
+		g.previousRenderScaleFallbackRequestedPercent;
+	out->previousFallbackPercent = g.previousRenderScaleFallbackPercent;
+	out->previousFallbackReason = g.previousRenderScaleFallbackReason;
+	return true;
+}
+
+const char *
+getRenderScaleFallbackReasonName(int reason)
+{
+	switch(reason){
+	case RENDER_SCALE_FALLBACK_NONE:
+		return "NONE";
+	case RENDER_SCALE_FALLBACK_RUNTIME_LIMIT:
+		return "RUNTIME LIMIT";
+	case RENDER_SCALE_FALLBACK_SWAPCHAIN_ALLOCATION:
+		return "SWAPCHAIN ALLOCATION";
+	case RENDER_SCALE_FALLBACK_GAME_RENDERER_ALLOCATION:
+		return "GAME RENDERER ALLOCATION";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+void
+confirmRenderScaleRendererReady(void)
+{
+	// Do not clear a current fallback, and keep the most recent recovery note
+	// visible while running at the conservative 100% value chosen for it.
+	if(g.renderScaleFallbackReason != RENDER_SCALE_FALLBACK_NONE ||
+	   g.renderScaleRequestedPercent <= 100 ||
+	   g.previousRenderScaleFallbackReason == RENDER_SCALE_FALLBACK_NONE)
+		return;
+
+	char settingsPath[512];
+	snprintf(settingsPath, sizeof(settingsPath), "%s/vr_settings.ini",
+		platform::gameDataRoot());
+	const bool cleared =
+		WritePrivateProfileStringA("VR", "RenderScaleLastFallbackRequest",
+			"0", settingsPath) &&
+		WritePrivateProfileStringA("VR", "RenderScaleLastFallbackPercent",
+			"0", settingsPath) &&
+		WritePrivateProfileStringA("VR", "RenderScaleLastFallbackReason",
+			"0", settingsPath);
+	if(cleared){
+		LOGI("complete renderer confirmed at %.2f%%; cleared old fallback history",
+		     g.renderScaleEffectivePercent);
+		g.previousRenderScaleFallbackRequestedPercent = 0;
+		g.previousRenderScaleFallbackPercent = 0;
+		g.previousRenderScaleFallbackReason = RENDER_SCALE_FALLBACK_NONE;
+	}else
+		LOGW("complete renderer succeeded but fallback history could not be cleared");
 }
 
 void
@@ -1828,7 +2508,7 @@ setDebugOverlay(const unsigned char *rgba, int width, int height)
 	// 2 Hz. Visibility and size transitions always upload immediately. The
 	// Uploads are submitted asynchronously below. A slower refresh still keeps
 	// the diagnostic probe out of nearly every timing window.
-	const bool compact = width <= 512 && height <= 128;
+	const bool compact = width <= 512;
 	const XrTime now = g.predictedDisplayTime;
 	const XrTime compactInterval = (XrTime)500000000;
 	if(compact && wasVisible && sameContentSize &&
@@ -1972,6 +2652,117 @@ getInput(ControllerInput *out)
 		*out = g.input;
 }
 
+void
+setPreferredDisplayRefreshRate(float hz)
+{
+	if(hz < 60.0f || hz > 144.0f ||
+	   fabsf(hz - g.targetRefreshRateHz) < 0.5f)
+		return;
+	g.targetRefreshRateHz = hz;
+	// Re-arm the retry pump in renderFrame; it re-requests on the next
+	// focused frame and keeps retrying until the display confirms.
+	g.refreshRateRetryCount = 0;
+	g.nextRefreshRateRetryTime = 0;
+	LOGI("display refresh target set to %.1f Hz", hz);
+}
+
+void
+setPerformanceMode(int mode)
+{
+	if(mode < PERFORMANCE_MODE_AUTO || mode > PERFORMANCE_MODE_BOOST){
+		LOGW("invalid OpenXR performance mode %d; using Auto", mode);
+		mode = PERFORMANCE_MODE_AUTO;
+	}
+	if(mode == PERFORMANCE_MODE_BOOST && g.boostThermallyBlocked){
+		LOGW("OpenXR CPU Boost request rejected: thermally blocked until restart");
+		return;
+	}
+	if(mode == PERFORMANCE_MODE_BOOST &&
+	   g.requestedPerformanceMode != PERFORMANCE_MODE_BOOST)
+		g.boostReturnMode =
+			g.requestedPerformanceMode == PERFORMANCE_MODE_SUSTAINED_HIGH ?
+				PERFORMANCE_MODE_SUSTAINED_HIGH : PERFORMANCE_MODE_AUTO;
+	const bool changed = g.requestedPerformanceMode != mode;
+	g.requestedPerformanceMode = mode;
+	if(changed)
+		LOGI("OpenXR performance mode requested: %s",
+		     performanceModeName(mode));
+	// Safe before create/session startup: the value remains pending and the
+	// READY/FOCUSED event paths apply it once the session is usable.
+	if(g.session != XR_NULL_HANDLE && g.running)
+		applyPerformanceMode(false);
+}
+
+int
+getPerformanceMode(void)
+{
+	return g.requestedPerformanceMode;
+}
+
+void
+setGpuPerformanceMode(int mode)
+{
+	if(mode < PERFORMANCE_MODE_AUTO || mode > PERFORMANCE_MODE_BOOST){
+		LOGW("invalid OpenXR GPU performance mode %d; using Sustained High", mode);
+		mode = PERFORMANCE_MODE_SUSTAINED_HIGH;
+	}
+	const bool changed = g.requestedGpuPerformanceMode != mode;
+	g.requestedGpuPerformanceMode = mode;
+	if(changed)
+		LOGI("OpenXR GPU performance mode requested: %s",
+		     performanceModeName(mode));
+	if(g.session != XR_NULL_HANDLE && g.running)
+		applyGpuPerformanceMode(false);
+}
+
+int
+getGpuPerformanceMode(void)
+{
+	return g.requestedGpuPerformanceMode;
+}
+
+int
+getActiveGpuPerformanceMode(void)
+{
+	return g.activeGpuPerformanceMode;
+}
+
+bool
+isPerformanceModeSupported(void)
+{
+	return g.hasPerformanceSettingsExt && g.setPerformanceLevel != nullptr;
+}
+
+bool
+isPerformanceBoostBlocked(void)
+{
+	return g.boostThermallyBlocked;
+}
+
+int
+getActivePerformanceMode(void)
+{
+	return g.activePerformanceMode;
+}
+
+void
+triggerHaptic(int hand, float amplitude, float frequencyHz, float durationMs)
+{
+	if(hand < 0 || hand > 1 || g.session == XR_NULL_HANDLE ||
+	   g.hapticAction == XR_NULL_HANDLE ||
+	   g.sessionState != XR_SESSION_STATE_FOCUSED)
+		return;
+	XrHapticVibration vibration = { XR_TYPE_HAPTIC_VIBRATION };
+	vibration.amplitude = amplitude < 0.f ? 0.f : amplitude > 1.f ? 1.f : amplitude;
+	vibration.frequency = frequencyHz;
+	vibration.duration = (XrDuration)(durationMs * 1000000.0f);
+	XrHapticActionInfo info = { XR_TYPE_HAPTIC_ACTION_INFO };
+	info.action = g.hapticAction;
+	info.subactionPath = g.handPath[hand];
+	xrApplyHapticFeedback(g.session, &info,
+	                      (const XrHapticBaseHeader *)&vibration);
+}
+
 bool
 pollEvents(void)
 {
@@ -1994,16 +2785,34 @@ pollEvents(void)
 					XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 				if(XR_SUCCEEDED(xrBeginSession(g.session, &beginInfo))){
 					g.running = true;
+					g.refreshRateReadyForFrames = !g.hasRefreshRateExt;
+					applyAndroidThreadSettings("session READY");
 					g.refreshRateRequestAttempted = false;
 					g.refreshRateRetryCount = 0;
 					g.nextRefreshRateRetryTime = 0;
+					applyPerformanceMode(true);
+					applyGpuPerformanceMode(true);
 				}
 			}else if(g.sessionState == XR_SESSION_STATE_FOCUSED){
+				applyAndroidThreadSettings("session FOCUSED");
+				// Some runtimes re-evaluate clock policy as focus changes, so
+				// reassert explicit hints after the session gains focus.
+				applyPerformanceMode(true);
+				applyGpuPerformanceMode(true);
 				// Apply the stable 72 Hz target after the session owns focus.
 				// This avoids frame-rate changes while the game is running.
 				if(!g.refreshRateRequestAttempted){
 					g.refreshRateRequestAttempted = true;
-					requestPreferredDisplayRefreshRate();
+					const bool requested =
+						requestPreferredDisplayRefreshRate();
+					g.refreshRateReadyForFrames =
+						!requested ||
+						fabsf(g.currentRefreshRateHz -
+						      g.targetRefreshRateHz) < 0.5f;
+					if(!g.refreshRateReadyForFrames)
+						LOGI("holding application layers until display "
+						     "refresh settles at %.1f Hz",
+						     g.targetRefreshRateHz);
 					g.refreshRateRetryCount = 1;
 				}
 			}else if(g.sessionState == XR_SESSION_STATE_STOPPING){
@@ -2016,6 +2825,30 @@ pollEvents(void)
 			}
 			break;
 		}
+		case XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT: {
+			const XrEventDataPerfSettingsEXT &changed =
+				*(const XrEventDataPerfSettingsEXT *)&event;
+			if(changed.toLevel == XR_PERF_SETTINGS_NOTIF_LEVEL_NORMAL_EXT)
+				LOGI("OpenXR performance notification: %s/%s %d -> %d",
+				     performanceDomainName(changed.domain),
+				     performanceSubDomainName(changed.subDomain),
+				     (int)changed.fromLevel, (int)changed.toLevel);
+			else
+				LOGW("OpenXR performance warning: %s/%s %d -> %d",
+				     performanceDomainName(changed.domain),
+				     performanceSubDomainName(changed.subDomain),
+				     (int)changed.fromLevel, (int)changed.toLevel);
+			if(changed.subDomain == XR_PERF_SETTINGS_SUB_DOMAIN_THERMAL_EXT &&
+			   changed.toLevel != XR_PERF_SETTINGS_NOTIF_LEVEL_NORMAL_EXT){
+				g.boostThermallyBlocked = true;
+				if(g.cpuBoostActive ||
+				   g.requestedPerformanceMode == PERFORMANCE_MODE_BOOST)
+					finishPerformanceBoost("thermal warning", true);
+				else
+					LOGW("OpenXR CPU Boost blocked until a new session due to thermal warning");
+			}
+			break;
+		}
 		case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
 			g.exitRequested = true;
 			break;
@@ -2023,11 +2856,14 @@ pollEvents(void)
 			const XrEventDataDisplayRefreshRateChangedFB &changed =
 				*(const XrEventDataDisplayRefreshRateChangedFB *)&event;
 			g.currentRefreshRateHz = changed.toDisplayRefreshRate;
+			g.refreshRateReadyForFrames =
+				fabsf(changed.toDisplayRefreshRate -
+				      g.targetRefreshRateHz) < 0.5f;
 			LOGI("display refresh changed: %.1f -> %.1f Hz",
 			     changed.fromDisplayRefreshRate,
 			     changed.toDisplayRefreshRate);
 			if(fabsf(changed.toDisplayRefreshRate -
-			         kTargetDisplayRefreshRateHz) >= 0.5f){
+			         g.targetRefreshRateHz) >= 0.5f){
 				g.refreshRateRetryCount = 0;
 				g.nextRefreshRateRetryTime = 0;
 			}
@@ -2043,6 +2879,9 @@ pollEvents(void)
 bool
 shouldRender(void)
 {
+	// Keep pumping xrWaitFrame/xrBeginFrame/xrEndFrame while a requested panel
+	// refresh change is pending.  Quest does not advance the session to
+	// FOCUSED or deliver the changed event until frames are pumped.
 	return g.running;
 }
 
@@ -2058,6 +2897,17 @@ renderFrame(void)
 		return;
 	g.predictedDisplayTime = frameState.predictedDisplayTime;
 	g.lastPredictedDisplayTimeNs = (long long)frameState.predictedDisplayTime;
+	if(g.cpuBoostActive){
+		if(g.boostExpiryDisplayTime == 0)
+			g.boostExpiryDisplayTime = frameState.predictedDisplayTime +
+				kPerformanceBoostDurationNs;
+		const bool displayExpired =
+			frameState.predictedDisplayTime >= g.boostExpiryDisplayTime;
+		const bool monotonicExpired = g.boostExpiryMonotonicNs > 0 &&
+			monotonicTimeNs() >= g.boostExpiryMonotonicNs;
+		if(displayExpired || monotonicExpired)
+			finishPerformanceBoost("25 second timeout", false);
+	}
 
 	// A focused Quest session can acknowledge a rate request before the display
 	// has actually switched. Retry at a low rate for a bounded period, stopping
@@ -2070,8 +2920,9 @@ renderFrame(void)
 		const XrResult currentResult =
 			g.getRefreshRate(g.session, &current);
 		if(XR_SUCCEEDED(currentResult) &&
-		   fabsf(current - kTargetDisplayRefreshRateHz) < 0.5f){
+		   fabsf(current - g.targetRefreshRateHz) < 0.5f){
 			g.currentRefreshRateHz = current;
+			g.refreshRateReadyForFrames = true;
 			LOGI("display refresh confirmed at %.1f Hz", current);
 			g.refreshRateRetryCount = 8;
 		}else{
@@ -2097,7 +2948,7 @@ renderFrame(void)
 	const XrCompositionLayerBaseHeader *layers[2] = { nullptr, nullptr };
 	uint32_t layerCount = 0;
 
-	if(frameState.shouldRender){
+	if(frameState.shouldRender && g.refreshRateReadyForFrames){
 		XrViewState viewState = { XR_TYPE_VIEW_STATE };
 		XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 		locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -2214,8 +3065,7 @@ renderFrame(void)
 			// Head-locked debug overlay: pose and size are the desktop's.
 			if(g.debugVisible && g.debugSwapchain != XR_NULL_HANDLE &&
 			   g.viewSpace != XR_NULL_HANDLE){
-				const bool fullMenu =
-					g.debugContentWidth > 512 || g.debugContentHeight > 128;
+				const bool fullMenu = g.debugContentWidth > 512;
 				debugLayer.layerFlags =
 					XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 				debugLayer.space = g.viewSpace;
@@ -2241,7 +3091,7 @@ renderFrame(void)
 	// An empty frame is what makes Horizon OS drop the app back to its "still
 	// running" panel, so say the first few times it happens and why, instead of
 	// letting it pass silently.
-	if(layerCount == 0){
+	if(layerCount == 0 && g.refreshRateReadyForFrames){
 		static int reportedEmpty = 0;
 		if(reportedEmpty < 5){
 			reportedEmpty++;

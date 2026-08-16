@@ -83,7 +83,8 @@ set(LIBRW_SPIRV_HEADERS "")
 foreach(SHADER rw_world:vert:vertex rw_world:frag:fragment
                rw_im2d:vert:vertex  rw_im2d:frag:fragment
                rw_im3d:vert:vertex  rw_skin:vert:vertex
-               rw_postfx:vert:vertex rw_postfx:frag:fragment)
+               rw_postfx:vert:vertex rw_postfx:frag:fragment
+               rw_motion:frag:fragment rw_sgsr2_convert:frag:fragment)
 	string(REPLACE ":" ";" PARTS "${SHADER}")
 	list(GET PARTS 0 SHADER_NAME)
 	list(GET PARTS 1 SHADER_EXT)
@@ -167,6 +168,16 @@ if(NOT MIAMIVR_BRINGUP)
 		"${REVC_ROOT}/src/skel/android/QuestProfiler.cpp")
 	list(REMOVE_ITEM GAME_SOURCES "${QUEST_PROFILER_SOURCE}")
 	list(APPEND GAME_SOURCES "${QUEST_PROFILER_SOURCE}")
+	# Like QuestProfiler, keep the newly introduced source explicit so an
+	# already-configured Ninja graph notices it immediately.
+	set(PHYSICS_DIRECTOR_SOURCE
+		"${REVC_ROOT}/src/vehicles/PhysicsDirector.cpp")
+	list(REMOVE_ITEM GAME_SOURCES "${PHYSICS_DIRECTOR_SOURCE}")
+	list(APPEND GAME_SOURCES "${PHYSICS_DIRECTOR_SOURCE}")
+	set(VEHICLE_VISUAL_DIRECTOR_SOURCE
+		"${REVC_ROOT}/src/vehicles/VehicleVisualDirector.cpp")
+	list(REMOVE_ITEM GAME_SOURCES "${VEHICLE_VISUAL_DIRECTOR_SOURCE}")
+	list(APPEND GAME_SOURCES "${VEHICLE_VISUAL_DIRECTOR_SOURCE}")
 
 	# Quest audio uses a native AAudio SFX mixer and the Android platform
 	# decoder for long radio/cutscene streams.  The desktop OpenAL/Miles

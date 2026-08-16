@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 #include <vector>
 
 #include "../rwbase.h"
@@ -26,10 +27,18 @@ static const uint32_t kPostFxVertSpv[] =
 static const uint32_t kPostFxFragSpv[] =
 #include "rw_postfx_frag.h"
 ;
+static const uint32_t kMotionFragSpv[] =
+#include "rw_motion_frag.h"
+;
+static const uint32_t kSgsr2ConvertFragSpv[] =
+#include "rw_sgsr2_convert_frag.h"
+;
 #endif
 
 namespace rw {
 namespace vulkan {
+
+static bool32 gLastDeviceOpenRenderTargetFailure;
 
 #ifdef RW_VULKAN
 
@@ -98,6 +107,31 @@ retireImage(VkImageView view, VkImage image, VkDeviceMemory memory)
 	retiredImages[retirementFrame()].push_back(retired);
 }
 
+static std::vector<VkDescriptorSet> retiredDescriptorSets[NUM_FRAME_CONTEXTS];
+
+void
+retireTextureDescriptorSets(VkDescriptorSet *sets, uint32 count)
+{
+	uint32 live = 0;
+	for(uint32 i = 0; i < count; i++)
+		if(sets[i] != VK_NULL_HANDLE)
+			live++;
+	if(live == 0)
+		return;
+	if(!gvk.initialised || (!gvk.inFrame && !gvk.hasSubmittedFrame)){
+		freeTextureDescriptorSets(sets, count);
+		return;
+	}
+	std::vector<VkDescriptorSet> &queue =
+		retiredDescriptorSets[retirementFrame()];
+	for(uint32 i = 0; i < count; i++){
+		if(sets[i] == VK_NULL_HANDLE)
+			continue;
+		queue.push_back(sets[i]);
+		sets[i] = VK_NULL_HANDLE;
+	}
+}
+
 static void
 flushRetired(uint32 frameIndex)
 {
@@ -122,6 +156,12 @@ flushRetired(uint32 frameIndex)
 		if(retired.memory) vkFreeMemory(gvk.device, retired.memory, nil);
 	}
 	retiredImages[frameIndex].clear();
+
+	if(!retiredDescriptorSets[frameIndex].empty()){
+		freeTextureDescriptorSets(retiredDescriptorSets[frameIndex].data(),
+			(uint32)retiredDescriptorSets[frameIndex].size());
+		retiredDescriptorSets[frameIndex].clear();
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -298,8 +338,11 @@ createDepthBuffer(FrameContext &frame)
 			VkFormatProperties properties;
 			vkGetPhysicalDeviceFormatProperties(
 				gvk.physicalDevice, candidates[i], &properties);
-			if(properties.optimalTilingFeatures &
-			   VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT){
+			VkFormatFeatureFlags required =
+				VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+			if(gvk.sgsrMode != SGSR_OFF)
+				required |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+			if((properties.optimalTilingFeatures & required) == required){
 				gvk.depthFormat = candidates[i];
 				break;
 			}
@@ -314,14 +357,16 @@ createDepthBuffer(FrameContext &frame)
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imageInfo.imageType = VK_IMAGE_TYPE_2D;
 	imageInfo.format = gvk.depthFormat;
-	imageInfo.extent.width = gvk.width;
-	imageInfo.extent.height = gvk.height;
+	imageInfo.extent.width = gvk.sceneWidth;
+	imageInfo.extent.height = gvk.sceneHeight;
 	imageInfo.extent.depth = 1;
 	imageInfo.mipLevels = 1;
 	imageInfo.arrayLayers = gvk.viewCount;
-	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.samples = gvk.sceneSamples;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 	imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	if(gvk.sgsrMode != SGSR_OFF)
+		imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
 	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	if(vkCreateImage(gvk.device, &imageInfo, nil, &frame.depthImage) != VK_SUCCESS)
 		return 0;
@@ -361,8 +406,8 @@ createSceneColour(FrameContext &frame)
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imageInfo.imageType = VK_IMAGE_TYPE_2D;
 	imageInfo.format = gvk.colourFormat;
-	imageInfo.extent.width = gvk.width;
-	imageInfo.extent.height = gvk.height;
+	imageInfo.extent.width = gvk.sceneWidth;
+	imageInfo.extent.height = gvk.sceneHeight;
 	imageInfo.extent.depth = 1;
 	imageInfo.mipLevels = 1;
 	imageInfo.arrayLayers = gvk.viewCount;
@@ -425,44 +470,279 @@ createSceneColour(FrameContext &frame)
 }
 
 static bool32
+createSceneMsaaColour(FrameContext &frame)
+{
+	if(gvk.sceneSamples == VK_SAMPLE_COUNT_1_BIT)
+		return 1;
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = gvk.colourFormat;
+	imageInfo.extent = { gvk.sceneWidth, gvk.sceneHeight, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = gvk.viewCount;
+	imageInfo.samples = gvk.sceneSamples;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	                  VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil,
+	                 &frame.sceneMsaaImage) != VK_SUCCESS)
+		return 0;
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, frame.sceneMsaaImage,
+	                             &requirements);
+	uint32 typeIndex = UINT32_MAX;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+		return 0;
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+	                    &frame.sceneMsaaMemory) != VK_SUCCESS ||
+	   vkBindImageMemory(gvk.device, frame.sceneMsaaImage,
+	                     frame.sceneMsaaMemory, 0) != VK_SUCCESS)
+		return 0;
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = frame.sceneMsaaImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	viewInfo.format = gvk.colourFormat;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = gvk.viewCount;
+	return vkCreateImageView(gvk.device, &viewInfo, nil,
+	                         &frame.sceneMsaaView) == VK_SUCCESS;
+}
+
+static bool32
+createResolvedHistory(FrameContext &frame)
+{
+	if(gvk.sgsrMode != SGSR2_RESOLVED_TEMPORAL_V3 &&
+	   gvk.sgsrMode != SGSR2_OFFICIAL_QUALITY)
+		return 1;
+
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = gvk.colourFormat;
+	imageInfo.extent = { gvk.width, gvk.height, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = gvk.viewCount;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	                  VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil,
+	                 &frame.resolvedHistoryImage) != VK_SUCCESS){
+		VKERR("failed to create resolved temporal history image");
+		return 0;
+	}
+
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, frame.resolvedHistoryImage,
+	                             &requirements);
+	uint32 typeIndex = UINT32_MAX;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+		return 0;
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+	                    &frame.resolvedHistoryMemory) != VK_SUCCESS ||
+	   vkBindImageMemory(gvk.device, frame.resolvedHistoryImage,
+	                     frame.resolvedHistoryMemory, 0) != VK_SUCCESS)
+		return 0;
+
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = frame.resolvedHistoryImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	viewInfo.format = gvk.colourFormat;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = gvk.viewCount;
+	return vkCreateImageView(gvk.device, &viewInfo, nil,
+	                         &frame.resolvedHistoryView) == VK_SUCCESS;
+}
+
+static bool32
+createSgsr2ConvertImage(FrameContext &frame)
+{
+	if(gvk.sgsrMode != SGSR2_OFFICIAL_QUALITY)
+		return 1;
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+	imageInfo.extent = { gvk.sceneWidth, gvk.sceneHeight, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = gvk.viewCount;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	                  VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil,
+	                 &frame.sgsrConvertImage) != VK_SUCCESS)
+		return 0;
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, frame.sgsrConvertImage,
+	                             &requirements);
+	uint32 typeIndex = 0;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+		return 0;
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+	                    &frame.sgsrConvertMemory) != VK_SUCCESS ||
+	   vkBindImageMemory(gvk.device, frame.sgsrConvertImage,
+	                     frame.sgsrConvertMemory, 0) != VK_SUCCESS)
+		return 0;
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = frame.sgsrConvertImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = gvk.viewCount;
+	return vkCreateImageView(gvk.device, &viewInfo, nil,
+	                         &frame.sgsrConvertView) == VK_SUCCESS;
+}
+
+static bool32
+createMotionImage(FrameContext &frame)
+{
+	if(gvk.sgsrMode == SGSR_OFF)
+		return 1;
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = gvk.motionFormat;
+	imageInfo.extent = { gvk.sceneWidth, gvk.sceneHeight, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = gvk.viewCount;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	                  VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil, &frame.motionImage) != VK_SUCCESS)
+		return 0;
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, frame.motionImage, &requirements);
+	uint32 typeIndex = 0;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+		return 0;
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+	                    &frame.motionMemory) != VK_SUCCESS)
+		return 0;
+	if(vkBindImageMemory(gvk.device, frame.motionImage,
+	                     frame.motionMemory, 0) != VK_SUCCESS)
+		return 0;
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = frame.motionImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	viewInfo.format = gvk.motionFormat;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = gvk.viewCount;
+	return vkCreateImageView(gvk.device, &viewInfo, nil,
+	                         &frame.motionView) == VK_SUCCESS;
+}
+
+static bool32
 createRenderPass(void)
 {
-	VkAttachmentDescription attachments[2] = {};
+	VkAttachmentDescription attachments[3] = {};
+	const bool32 multisampled = gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT;
 	// World/HUD target. It is stored because the following post pass samples
 	// neighbouring texels for FXAA.
 	attachments[0].format = gvk.colourFormat;
-	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[0].samples = gvk.sceneSamples;
 	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[0].storeOp = multisampled ? VK_ATTACHMENT_STORE_OP_DONT_CARE :
+	                                      VK_ATTACHMENT_STORE_OP_STORE;
 	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	// beginFrame performs an explicit read->write transition. This is required
+	// once the alternating frame slot also serves as temporal history for the
+	// following submission; UNDEFINED here would discard it without ordering
+	// the preceding fragment read.
+	attachments[0].initialLayout = multisampled ? VK_IMAGE_LAYOUT_UNDEFINED :
+	                                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 	attachments[1].format = gvk.depthFormat;
-	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[1].samples = gvk.sceneSamples;
 	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	// Nothing reads depth after the pass. Discarding it spares the tiler a
 	// writeback of a full two-layer depth surface every single frame, which is
 	// one of the larger easy wins on a mobile GPU.
-	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].storeOp = gvk.sgsrMode != SGSR_OFF ?
+		VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	attachments[1].finalLayout = gvk.sgsrMode != SGSR_OFF ?
+		VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL :
+		VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	if(multisampled){
+		attachments[2].format = gvk.colourFormat;
+		attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
+		attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachments[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachments[2].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		attachments[2].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	}else if(gvk.sgsrMode != SGSR_OFF){
+		attachments[2].format = gvk.motionFormat;
+		attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
+		attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachments[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachments[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		attachments[2].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	}
 
-	VkAttachmentReference sceneRef = {};
-	sceneRef.attachment = 0;
-	sceneRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	VkAttachmentReference colourRefs[2] = {};
+	colourRefs[0].attachment = 0;
+	colourRefs[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colourRefs[1].attachment = 2;
+	colourRefs[1].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	VkAttachmentReference depthRef = {};
 	depthRef.attachment = 1;
 	depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
 	VkSubpassDescription subpass = {};
 	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.colorAttachmentCount = 1;
-	subpass.pColorAttachments = &sceneRef;
+	subpass.colorAttachmentCount =
+		gvk.sgsrMode != SGSR_OFF ? 2 : 1;
+	subpass.pColorAttachments = colourRefs;
 	subpass.pDepthStencilAttachment = &depthRef;
+	VkAttachmentReference resolveRef = {};
+	if(multisampled){
+		resolveRef.attachment = 2;
+		resolveRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		subpass.pResolveAttachments = &resolveRef;
+	}
 
 	const uint32 viewMask = gvk.viewCount > 1 ? 0x3u : 0x1u;
 	const uint32 correlationMask = viewMask;
@@ -477,37 +757,51 @@ createRenderPass(void)
 	VkRenderPassCreateInfo info = {};
 	info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 	info.pNext = gvk.viewCount > 1 ? &multiview : nil;
-	info.attachmentCount = 2;
+	info.attachmentCount =
+		(multisampled || gvk.sgsrMode != SGSR_OFF) ? 3 : 2;
 	info.pAttachments = attachments;
 	info.subpassCount = 1;
 	info.pSubpasses = &subpass;
 	if(vkCreateRenderPass(gvk.device, &info, nil, &gvk.renderPass) != VK_SUCCESS)
 		return 0;
 
-	// The resolve pass owns only the acquired OpenXR colour view. The private
-	// scene image is sampled through a descriptor after an explicit barrier.
-	VkAttachmentDescription destination = {};
-	destination.format = gvk.colourFormat;
-	destination.samples = VK_SAMPLE_COUNT_1_BIT;
-	destination.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	destination.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-	destination.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	destination.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	destination.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	destination.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	VkAttachmentReference destinationRef = {};
-	destinationRef.attachment = 0;
-	destinationRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	// V3 writes the same resolve pass to the OpenXR target and to a private
+	// unfiltered temporal-history attachment. Older modes keep the exact
+	// single-target render pass they used before.
+	const bool32 resolvedHistory =
+		gvk.sgsrMode == SGSR2_RESOLVED_TEMPORAL_V3 ||
+		gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY;
+	VkAttachmentDescription destinations[2] = {};
+	destinations[0].format = gvk.colourFormat;
+	destinations[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	destinations[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	destinations[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	destinations[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	destinations[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	destinations[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	destinations[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	if(resolvedHistory){
+		destinations[1] = destinations[0];
+		destinations[1].initialLayout =
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		destinations[1].finalLayout =
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	}
+	VkAttachmentReference destinationRefs[2] = {};
+	destinationRefs[0].attachment = 0;
+	destinationRefs[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	destinationRefs[1].attachment = 1;
+	destinationRefs[1].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	VkSubpassDescription postSubpass = {};
 	postSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	postSubpass.colorAttachmentCount = 1;
-	postSubpass.pColorAttachments = &destinationRef;
+	postSubpass.colorAttachmentCount = resolvedHistory ? 2 : 1;
+	postSubpass.pColorAttachments = destinationRefs;
 	VkRenderPassMultiviewCreateInfo postMultiview = multiview;
 	VkRenderPassCreateInfo postInfo = {};
 	postInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 	postInfo.pNext = gvk.viewCount > 1 ? &postMultiview : nil;
-	postInfo.attachmentCount = 1;
-	postInfo.pAttachments = &destination;
+	postInfo.attachmentCount = resolvedHistory ? 2 : 1;
+	postInfo.pAttachments = destinations;
 	postInfo.subpassCount = 1;
 	postInfo.pSubpasses = &postSubpass;
 	if(vkCreateRenderPass(gvk.device, &postInfo, nil,
@@ -515,6 +809,65 @@ createRenderPass(void)
 		vkDestroyRenderPass(gvk.device, gvk.renderPass, nil);
 		gvk.renderPass = VK_NULL_HANDLE;
 		return 0;
+	}
+
+	if(gvk.sgsrMode != SGSR_OFF){
+		VkAttachmentDescription motion = {};
+		motion.format = gvk.motionFormat;
+		motion.samples = VK_SAMPLE_COUNT_1_BIT;
+		motion.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		motion.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		motion.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		motion.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		motion.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		motion.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		VkAttachmentReference motionRef = {};
+		motionRef.attachment = 0;
+		motionRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkSubpassDescription motionSubpass = {};
+		motionSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		motionSubpass.colorAttachmentCount = 1;
+		motionSubpass.pColorAttachments = &motionRef;
+		VkRenderPassMultiviewCreateInfo motionMultiview = multiview;
+		VkRenderPassCreateInfo motionInfo = {};
+		motionInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		motionInfo.pNext = gvk.viewCount > 1 ? &motionMultiview : nil;
+		motionInfo.attachmentCount = 1;
+		motionInfo.pAttachments = &motion;
+		motionInfo.subpassCount = 1;
+		motionInfo.pSubpasses = &motionSubpass;
+		if(vkCreateRenderPass(gvk.device, &motionInfo, nil,
+		                      &gvk.motionRenderPass) != VK_SUCCESS)
+			return 0;
+	}
+	if(gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY){
+		VkAttachmentDescription convert = {};
+		convert.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		convert.samples = VK_SAMPLE_COUNT_1_BIT;
+		convert.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		convert.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		convert.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		convert.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		convert.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		convert.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		VkAttachmentReference convertRef = {};
+		convertRef.attachment = 0;
+		convertRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		VkSubpassDescription convertSubpass = {};
+		convertSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		convertSubpass.colorAttachmentCount = 1;
+		convertSubpass.pColorAttachments = &convertRef;
+		VkRenderPassMultiviewCreateInfo convertMultiview = multiview;
+		VkRenderPassCreateInfo convertInfo = {};
+		convertInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		convertInfo.pNext = gvk.viewCount > 1 ? &convertMultiview : nil;
+		convertInfo.attachmentCount = 1;
+		convertInfo.pAttachments = &convert;
+		convertInfo.subpassCount = 1;
+		convertInfo.pSubpasses = &convertSubpass;
+		if(vkCreateRenderPass(gvk.device, &convertInfo, nil,
+		                      &gvk.sgsrConvertRenderPass) != VK_SUCCESS)
+			return 0;
 	}
 	return 1;
 }
@@ -536,20 +889,60 @@ createPostFxModule(const uint32_t *code, size_t byteSize)
 static bool32
 createSceneFramebuffer(FrameContext &frame)
 {
-	const VkImageView attachments[2] = {
-		frame.sceneColourView, frame.depthView
+	const VkImageView attachments[3] = {
+		gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT ? frame.sceneMsaaView :
+			frame.sceneColourView,
+		frame.depthView,
+		gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT ? frame.sceneColourView :
+			frame.motionView
 	};
 	VkFramebufferCreateInfo info = {};
 	info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 	info.renderPass = gvk.renderPass;
-	info.attachmentCount = 2;
+	info.attachmentCount =
+		(gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT ||
+		 gvk.sgsrMode != SGSR_OFF) ? 3 : 2;
 	info.pAttachments = attachments;
-	info.width = gvk.width;
-	info.height = gvk.height;
+	info.width = gvk.sceneWidth;
+	info.height = gvk.sceneHeight;
 	// Multiview derives the layers from the render-pass view mask.
 	info.layers = 1;
 	return vkCreateFramebuffer(gvk.device, &info, nil,
 	                           &frame.sceneFramebuffer) == VK_SUCCESS;
+}
+
+static bool32
+createMotionFramebuffer(FrameContext &frame)
+{
+	if(gvk.sgsrMode == SGSR_OFF)
+		return 1;
+	VkFramebufferCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	info.renderPass = gvk.motionRenderPass;
+	info.attachmentCount = 1;
+	info.pAttachments = &frame.motionView;
+	info.width = gvk.sceneWidth;
+	info.height = gvk.sceneHeight;
+	info.layers = 1;
+	return vkCreateFramebuffer(gvk.device, &info, nil,
+	                           &frame.motionFramebuffer) == VK_SUCCESS;
+}
+
+static bool32
+createSgsr2ConvertFramebuffer(FrameContext &frame)
+{
+	if(gvk.sgsrMode != SGSR2_OFFICIAL_QUALITY)
+		return 1;
+	VkFramebufferCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	info.renderPass = gvk.sgsrConvertRenderPass;
+	info.attachmentCount = 1;
+	info.pAttachments = &frame.sgsrConvertView;
+	info.width = gvk.sceneWidth;
+	info.height = gvk.sceneHeight;
+	info.layers = 1;
+	return vkCreateFramebuffer(gvk.device, &info, nil,
+	                           &frame.sgsrConvertFramebuffer) == VK_SUCCESS;
 }
 
 static bool32
@@ -571,31 +964,45 @@ createPostFxResources(void)
 		return 0;
 	}
 
-	VkDescriptorSetLayoutBinding inputBinding = {};
-	inputBinding.binding = 0;
-	inputBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	inputBinding.descriptorCount = 1;
-	inputBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	VkDescriptorSetLayoutBinding inputBindings[5] = {};
+	for(uint32 binding = 0; binding < 3; binding++){
+		inputBindings[binding].binding = binding;
+		inputBindings[binding].descriptorType =
+			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		inputBindings[binding].descriptorCount = 1;
+		inputBindings[binding].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	}
+	inputBindings[3].binding = 3;
+	inputBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	inputBindings[3].descriptorCount = 1;
+	inputBindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	inputBindings[4].binding = 4;
+	inputBindings[4].descriptorType =
+		VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	inputBindings[4].descriptorCount = 1;
+	inputBindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
 	VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo = {};
 	descriptorLayoutInfo.sType =
 		VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	descriptorLayoutInfo.bindingCount = 1;
-	descriptorLayoutInfo.pBindings = &inputBinding;
+	descriptorLayoutInfo.bindingCount = 5;
+	descriptorLayoutInfo.pBindings = inputBindings;
 	if(vkCreateDescriptorSetLayout(gvk.device, &descriptorLayoutInfo, nil,
 	                               &gvk.postFxDescriptorLayout) != VK_SUCCESS){
 		VKERR("failed to create post-FX descriptor layout");
 		return 0;
 	}
 
-	VkDescriptorPoolSize poolSize = {};
-	poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSize.descriptorCount = NUM_FRAME_CONTEXTS;
+	VkDescriptorPoolSize poolSizes[2] = {};
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSizes[0].descriptorCount = NUM_FRAME_CONTEXTS*4;
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	poolSizes[1].descriptorCount = NUM_FRAME_CONTEXTS;
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = NUM_FRAME_CONTEXTS;
-	poolInfo.poolSizeCount = 1;
-	poolInfo.pPoolSizes = &poolSize;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = poolSizes;
 	if(vkCreateDescriptorPool(gvk.device, &poolInfo, nil,
 	                          &gvk.postFxDescriptorPool) != VK_SUCCESS){
 		VKERR("failed to create post-FX descriptor pool");
@@ -617,23 +1024,70 @@ createPostFxResources(void)
 		return 0;
 	}
 
-	VkDescriptorImageInfo imageDescriptors[NUM_FRAME_CONTEXTS] = {};
-	VkWriteDescriptorSet writes[NUM_FRAME_CONTEXTS] = {};
+	VkDescriptorImageInfo imageDescriptors[NUM_FRAME_CONTEXTS][4] = {};
+	VkDescriptorBufferInfo bufferDescriptors[NUM_FRAME_CONTEXTS] = {};
+	VkWriteDescriptorSet writes[NUM_FRAME_CONTEXTS][5] = {};
 	for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
 		gvk.frames[i].postFxDescriptor = descriptorSets[i];
-		imageDescriptors[i].sampler = gvk.postFxSampler;
-		imageDescriptors[i].imageView = gvk.frames[i].sceneColourView;
-		imageDescriptors[i].imageLayout =
+		imageDescriptors[i][0].sampler = gvk.postFxSampler;
+		imageDescriptors[i][0].imageView = gvk.frames[i].sceneColourView;
+		imageDescriptors[i][0].imageLayout =
 			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		writes[i].dstSet = descriptorSets[i];
-		writes[i].dstBinding = 0;
-		writes[i].descriptorCount = 1;
-		writes[i].descriptorType =
+		// Binding 1 is always valid. OFF points it at the ordinary scene image;
+		// MOTION DEBUG points at the private RG16F vector image.
+		imageDescriptors[i][1].sampler = gvk.postFxSampler;
+		imageDescriptors[i][1].imageView =
+			gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY ?
+			gvk.frames[i].sgsrConvertView :
+			(gvk.frames[i].motionView ? gvk.frames[i].motionView :
+			 gvk.frames[i].sceneColourView);
+		imageDescriptors[i][1].imageLayout =
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		imageDescriptors[i][2].sampler = gvk.motionDepthSampler;
+		imageDescriptors[i][2].imageView = gvk.frames[i].depthView;
+		imageDescriptors[i][2].imageLayout =
+			VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+		// Frame contexts rotate 0/1. The other slot therefore contains the
+		// immediately preceding submitted scene and remains alive until this
+		// queue submission has finished sampling it.
+		const uint32 historyIndex =
+			(i+NUM_FRAME_CONTEXTS-1)%NUM_FRAME_CONTEXTS;
+		imageDescriptors[i][3].sampler = gvk.postFxSampler;
+		imageDescriptors[i][3].imageView =
+			(gvk.sgsrMode == SGSR2_RESOLVED_TEMPORAL_V3 ||
+			 gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY) ?
+			gvk.frames[historyIndex].resolvedHistoryView :
+			gvk.frames[historyIndex].sceneColourView;
+		imageDescriptors[i][3].imageLayout =
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		for(uint32 binding = 0; binding < 3; binding++){
+			writes[i][binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[i][binding].dstSet = descriptorSets[i];
+			writes[i][binding].dstBinding = binding;
+			writes[i][binding].descriptorCount = 1;
+			writes[i][binding].descriptorType =
 			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		writes[i].pImageInfo = &imageDescriptors[i];
+			writes[i][binding].pImageInfo = &imageDescriptors[i][binding];
+		}
+		bufferDescriptors[i].buffer = gvk.frames[i].motionBuffer;
+		bufferDescriptors[i].offset = 0;
+		bufferDescriptors[i].range = sizeof(MotionUniformData);
+		writes[i][3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i][3].dstSet = descriptorSets[i];
+		writes[i][3].dstBinding = 3;
+		writes[i][3].descriptorCount = 1;
+		writes[i][3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		writes[i][3].pBufferInfo = &bufferDescriptors[i];
+		writes[i][4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i][4].dstSet = descriptorSets[i];
+		writes[i][4].dstBinding = 4;
+		writes[i][4].descriptorCount = 1;
+		writes[i][4].descriptorType =
+			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[i][4].pImageInfo = &imageDescriptors[i][3];
 	}
-	vkUpdateDescriptorSets(gvk.device, NUM_FRAME_CONTEXTS, writes, 0, nil);
+	vkUpdateDescriptorSets(gvk.device, NUM_FRAME_CONTEXTS*5,
+	                      &writes[0][0], 0, nil);
 
 	VkPushConstantRange pushRange = {};
 	pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -705,16 +1159,19 @@ createPostFxResources(void)
 	depthStencil.depthTestEnable = VK_FALSE;
 	depthStencil.depthWriteEnable = VK_FALSE;
 
-	VkPipelineColorBlendAttachmentState blendAttachment = {};
-	blendAttachment.blendEnable = VK_FALSE;
-	blendAttachment.colorWriteMask =
+	VkPipelineColorBlendAttachmentState blendAttachments[2] = {};
+	blendAttachments[0].blendEnable = VK_FALSE;
+	blendAttachments[0].colorWriteMask =
 		VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 		VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+	blendAttachments[1] = blendAttachments[0];
 	VkPipelineColorBlendStateCreateInfo colourBlend = {};
 	colourBlend.sType =
 		VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-	colourBlend.attachmentCount = 1;
-	colourBlend.pAttachments = &blendAttachment;
+	colourBlend.attachmentCount =
+		(gvk.sgsrMode == SGSR2_RESOLVED_TEMPORAL_V3 ||
+		 gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY) ? 2 : 1;
+	colourBlend.pAttachments = blendAttachments;
 
 	const VkDynamicState dynamicStates[2] = {
 		VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR
@@ -750,7 +1207,233 @@ createPostFxResources(void)
 		return 0;
 	}
 
-	VKLOG("sampled multiview FXAA/post-FX resolve enabled");
+	VKLOG("sampled multiview FXAA/post-FX resolve enabled%s",
+	      gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY ?
+	      " (official Qualcomm SGSR2 Quality)" :
+	      (gvk.sgsrMode == SGSR2_RESOLVED_TEMPORAL_V3 ?
+	       " (stable resolved history)" : ""));
+	return 1;
+}
+
+static bool32
+createMotionResources(void)
+{
+	// The small temporal UBO and depth sampler are kept in every mode because
+	// the shared post shader declares them. The full-resolution RG16F image is
+	// still debug-only, and normal gameplay never writes depth back to memory.
+	VkSamplerCreateInfo samplerInfo = {};
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = VK_FILTER_NEAREST;
+	samplerInfo.minFilter = VK_FILTER_NEAREST;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.minLod = 0.0f;
+	samplerInfo.maxLod = 0.0f;
+	if(vkCreateSampler(gvk.device, &samplerInfo, nil,
+	                   &gvk.motionDepthSampler) != VK_SUCCESS)
+		return 0;
+	for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
+		FrameContext &frame = gvk.frames[i];
+		VkBufferCreateInfo bufferInfo = {};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = sizeof(MotionUniformData);
+		bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		if(vkCreateBuffer(gvk.device, &bufferInfo, nil,
+		                  &frame.motionBuffer) != VK_SUCCESS)
+			return 0;
+		VkMemoryRequirements requirements;
+		vkGetBufferMemoryRequirements(gvk.device, frame.motionBuffer,
+		                              &requirements);
+		uint32 memoryType = 0;
+		if(!findMemoryType(requirements.memoryTypeBits,
+		                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                   &memoryType))
+			return 0;
+		VkMemoryAllocateInfo allocInfo = {};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = requirements.size;
+		allocInfo.memoryTypeIndex = memoryType;
+		if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+		                    &frame.motionBufferMemory) != VK_SUCCESS ||
+		   vkBindBufferMemory(gvk.device, frame.motionBuffer,
+		                      frame.motionBufferMemory, 0) != VK_SUCCESS ||
+		   vkMapMemory(gvk.device, frame.motionBufferMemory, 0,
+		               sizeof(MotionUniformData), 0,
+			               &frame.motionMapped) != VK_SUCCESS)
+			return 0;
+	}
+	VKLOG("temporal motion uniform resources enabled%s",
+	      gvk.sgsrMode == SGSR2_MOTION_DEBUG ? " (debug target active)" :
+	      (gvk.sgsrMode == SGSR2_TEMPORAL_STABILIZER ?
+	       " (temporal stabilizer active)" : ""));
+	return 1;
+}
+
+static bool32
+createSgsr2ConvertResources(void)
+{
+	if(gvk.sgsrMode != SGSR2_OFFICIAL_QUALITY)
+		return 1;
+
+	VkDescriptorSetLayoutBinding bindings[3] = {};
+	for(uint32 i = 0; i < 2; i++){
+		bindings[i].binding = i;
+		bindings[i].descriptorType =
+			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	}
+	bindings[2].binding = 2;
+	bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	bindings[2].descriptorCount = 1;
+	bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 3;
+	layoutInfo.pBindings = bindings;
+	if(vkCreateDescriptorSetLayout(gvk.device, &layoutInfo, nil,
+	                               &gvk.sgsrConvertDescriptorLayout) !=
+	   VK_SUCCESS)
+		return 0;
+
+	VkDescriptorPoolSize sizes[2] = {};
+	sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	sizes[0].descriptorCount = NUM_FRAME_CONTEXTS*2;
+	sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	sizes[1].descriptorCount = NUM_FRAME_CONTEXTS;
+	VkDescriptorPoolCreateInfo poolInfo = {};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = NUM_FRAME_CONTEXTS;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = sizes;
+	if(vkCreateDescriptorPool(gvk.device, &poolInfo, nil,
+	                          &gvk.sgsrConvertDescriptorPool) != VK_SUCCESS)
+		return 0;
+
+	VkDescriptorSetLayout layouts[NUM_FRAME_CONTEXTS];
+	for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++)
+		layouts[i] = gvk.sgsrConvertDescriptorLayout;
+	VkDescriptorSet sets[NUM_FRAME_CONTEXTS] = {};
+	VkDescriptorSetAllocateInfo alloc = {};
+	alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	alloc.descriptorPool = gvk.sgsrConvertDescriptorPool;
+	alloc.descriptorSetCount = NUM_FRAME_CONTEXTS;
+	alloc.pSetLayouts = layouts;
+	if(vkAllocateDescriptorSets(gvk.device, &alloc, sets) != VK_SUCCESS)
+		return 0;
+
+	VkDescriptorImageInfo images[NUM_FRAME_CONTEXTS][2] = {};
+	VkDescriptorBufferInfo buffers[NUM_FRAME_CONTEXTS] = {};
+	VkWriteDescriptorSet writes[NUM_FRAME_CONTEXTS][3] = {};
+	for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
+		FrameContext &frame = gvk.frames[i];
+		frame.sgsrConvertDescriptor = sets[i];
+		images[i][0].sampler = gvk.motionDepthSampler;
+		images[i][0].imageView = frame.motionView;
+		images[i][0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		images[i][1].sampler = gvk.motionDepthSampler;
+		images[i][1].imageView = frame.depthView;
+		images[i][1].imageLayout =
+			VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+		for(uint32 binding = 0; binding < 2; binding++){
+			writes[i][binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[i][binding].dstSet = sets[i];
+			writes[i][binding].dstBinding = binding;
+			writes[i][binding].descriptorCount = 1;
+			writes[i][binding].descriptorType =
+				VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writes[i][binding].pImageInfo = &images[i][binding];
+		}
+		buffers[i].buffer = frame.motionBuffer;
+		buffers[i].range = sizeof(MotionUniformData);
+		writes[i][2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i][2].dstSet = sets[i];
+		writes[i][2].dstBinding = 2;
+		writes[i][2].descriptorCount = 1;
+		writes[i][2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		writes[i][2].pBufferInfo = &buffers[i];
+	}
+	vkUpdateDescriptorSets(gvk.device, NUM_FRAME_CONTEXTS*3,
+	                      &writes[0][0], 0, nil);
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &gvk.sgsrConvertDescriptorLayout;
+	if(vkCreatePipelineLayout(gvk.device, &pipelineLayoutInfo, nil,
+	                          &gvk.sgsrConvertPipelineLayout) != VK_SUCCESS)
+		return 0;
+
+	VkShaderModule vertex =
+		createPostFxModule(kPostFxVertSpv, sizeof(kPostFxVertSpv));
+	VkShaderModule fragment = createPostFxModule(
+		kSgsr2ConvertFragSpv, sizeof(kSgsr2ConvertFragSpv));
+	if(!vertex || !fragment)
+		return 0;
+	VkPipelineShaderStageCreateInfo stages[2] = {};
+	stages[0].sType = stages[1].sType =
+		VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vertex;
+	stages[0].pName = "main";
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = fragment;
+	stages[1].pName = "main";
+	VkPipelineVertexInputStateCreateInfo vertexInput = {};
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	VkPipelineInputAssemblyStateCreateInfo assembly = {};
+	assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	VkPipelineViewportStateCreateInfo viewport = {};
+	viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewport.viewportCount = viewport.scissorCount = 1;
+	VkPipelineRasterizationStateCreateInfo raster = {};
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+	VkPipelineMultisampleStateCreateInfo multisample = {};
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	VkPipelineColorBlendAttachmentState blendAttachment = {};
+	blendAttachment.colorWriteMask = 0xF;
+	VkPipelineColorBlendStateCreateInfo blend = {};
+	blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blend.attachmentCount = 1;
+	blend.pAttachments = &blendAttachment;
+	VkDynamicState dynamicStates[2] = {
+		VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR
+	};
+	VkPipelineDynamicStateCreateInfo dynamic = {};
+	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic.dynamicStateCount = 2;
+	dynamic.pDynamicStates = dynamicStates;
+	VkGraphicsPipelineCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	info.stageCount = 2;
+	info.pStages = stages;
+	info.pVertexInputState = &vertexInput;
+	info.pInputAssemblyState = &assembly;
+	info.pViewportState = &viewport;
+	info.pRasterizationState = &raster;
+	info.pMultisampleState = &multisample;
+	info.pColorBlendState = &blend;
+	info.pDynamicState = &dynamic;
+	info.layout = gvk.sgsrConvertPipelineLayout;
+	info.renderPass = gvk.sgsrConvertRenderPass;
+	const VkResult result = vkCreateGraphicsPipelines(
+		gvk.device, VK_NULL_HANDLE, 1, &info, nil,
+		&gvk.sgsrConvertPipeline);
+	vkDestroyShaderModule(gvk.device, vertex, nil);
+	vkDestroyShaderModule(gvk.device, fragment, nil);
+	if(result != VK_SUCCESS)
+		return 0;
+	VKLOG("official Qualcomm SGSR2 Convert pass enabled");
 	return 1;
 }
 
@@ -784,6 +1467,103 @@ readCompletedFrameTimestamps(FrameContext &frame)
 		          (double)gvk.deviceProperties.limits.timestampPeriod/
 		          1000000.0);
 	gvk.frameTimestampAvailable = 1;
+}
+
+static bool32
+invertMatrix4(float32 out[16], const float32 input[16])
+{
+	// Gauss-Jordan in row form. The backend stores matrices column-major, so
+	// transpose while loading/storing the augmented matrix.
+	float32 augmented[4][8] = {};
+	for(int32 row = 0; row < 4; row++)
+		for(int32 col = 0; col < 4; col++){
+			augmented[row][col] = input[col*4 + row];
+			augmented[row][4+col] = row == col ? 1.0f : 0.0f;
+		}
+	for(int32 pivot = 0; pivot < 4; pivot++){
+		int32 best = pivot;
+		for(int32 row = pivot+1; row < 4; row++)
+			if(fabsf(augmented[row][pivot]) >
+			   fabsf(augmented[best][pivot]))
+				best = row;
+		if(!isfinite(augmented[best][pivot]) ||
+		   fabsf(augmented[best][pivot]) < 1.0e-8f)
+			return 0;
+		if(best != pivot)
+			for(int32 col = 0; col < 8; col++){
+				const float32 value = augmented[pivot][col];
+				augmented[pivot][col] = augmented[best][col];
+				augmented[best][col] = value;
+			}
+		const float32 inversePivot = 1.0f/augmented[pivot][pivot];
+		for(int32 col = 0; col < 8; col++)
+			augmented[pivot][col] *= inversePivot;
+		for(int32 row = 0; row < 4; row++){
+			if(row == pivot)
+				continue;
+			const float32 scale = augmented[row][pivot];
+			for(int32 col = 0; col < 8; col++)
+				augmented[row][col] -= scale*augmented[pivot][col];
+		}
+	}
+	for(int32 row = 0; row < 4; row++)
+		for(int32 col = 0; col < 4; col++){
+			const float32 value = augmented[row][4+col];
+			if(!isfinite(value))
+				return 0;
+			out[col*4 + row] = value;
+		}
+	return 1;
+}
+
+static void
+setIdentityMatrix(float32 matrix[16])
+{
+	memset(matrix, 0, sizeof(float32)*16);
+	matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+}
+
+static void
+prepareMotionUniform(FrameContext &frame)
+{
+	if(gvk.sgsrMode == SGSR_OFF || frame.motionMapped == nil)
+		return;
+	MotionUniformData data = {};
+	// Frontend, loading and cutscene frames do not have a stable immersive
+	// world camera. Never feed those frames into gameplay history.
+	bool32 historyValid =
+		gvk.temporalHistoryValid && gvk.firstPersonActive;
+	for(int32 eye = 0; eye < 2; eye++){
+		float32 currentWorldClip[16];
+		float32 inverseCurrent[16];
+		// Qualcomm's reference path explicitly uses ProjectionMatrixNoJitter
+		// here. The jitter is consumed separately by the Upscale pass; folding it
+		// into this transform as well double-counts sub-pixel motion and softens
+		// distant static detail.
+		multiplyMatrix(currentWorldClip,
+		               gvk.stereoViewProjectionUnjittered[eye],
+		               gvk.worldToPlay);
+		if(historyValid && invertMatrix4(inverseCurrent, currentWorldClip))
+			multiplyMatrix(data.clipToPrevClip[eye],
+			               gvk.previousWorldClip[eye], inverseCurrent);
+		else{
+			setIdentityMatrix(data.clipToPrevClip[eye]);
+			historyValid = 0;
+		}
+		memcpy(gvk.previousWorldClip[eye], currentWorldClip,
+		       sizeof(currentWorldClip));
+	}
+	data.temporalParams[0] = (float32)gvk.sceneWidth;
+	data.temporalParams[1] = (float32)gvk.sceneHeight;
+	data.temporalParams[2] = historyValid ? 1.0f : 0.0f;
+	data.temporalParams[3] = (float32)gvk.sgsrMode;
+	data.sgsrParams[0] = gvk.sgsrJitter[0];
+	data.sgsrParams[1] = gvk.sgsrJitter[1];
+	data.sgsrParams[2] = gvk.sgsrHorizontalTanHalfFov > 0.0f ?
+		gvk.sgsrHorizontalTanHalfFov : 1.0f;
+	data.sgsrParams[3] = historyValid ? 0.0f : 1.0f;
+	memcpy(frame.motionMapped, &data, sizeof(data));
+	gvk.temporalHistoryValid = gvk.firstPersonActive;
 }
 
 bool32
@@ -829,11 +1609,15 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 			VKERR("OpenXR framebuffer cache exhausted");
 			return 0;
 		}
-		const VkImageView attachments[1] = { colourView };
+		const VkImageView attachments[2] = {
+			colourView, frame.resolvedHistoryView
+		};
 		VkFramebufferCreateInfo framebufferInfo = {};
 		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 		framebufferInfo.renderPass = gvk.postFxRenderPass;
-		framebufferInfo.attachmentCount = 1;
+		framebufferInfo.attachmentCount =
+			(gvk.sgsrMode == SGSR2_RESOLVED_TEMPORAL_V3 ||
+			 gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY) ? 2 : 1;
 		framebufferInfo.pAttachments = attachments;
 		framebufferInfo.width = gvk.width;
 		framebufferInfo.height = gvk.height;
@@ -858,6 +1642,56 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(gvk.frameCommands, &beginInfo);
+	VkImageMemoryBarrier sceneWriteBarrier = {};
+	sceneWriteBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	sceneWriteBarrier.srcAccessMask = frame.sceneColourInitialised ?
+		VK_ACCESS_SHADER_READ_BIT : 0;
+	sceneWriteBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	sceneWriteBarrier.oldLayout = frame.sceneColourInitialised ?
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+	sceneWriteBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	sceneWriteBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	sceneWriteBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	sceneWriteBarrier.image = frame.sceneColourImage;
+	sceneWriteBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	sceneWriteBarrier.subresourceRange.levelCount = 1;
+	sceneWriteBarrier.subresourceRange.layerCount = gvk.viewCount;
+	vkCmdPipelineBarrier(gvk.frameCommands,
+		frame.sceneColourInitialised ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT :
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		0, 0, nil, 0, nil, 1, &sceneWriteBarrier);
+	frame.sceneColourInitialised = 1;
+	if(gvk.sgsrMode == SGSR2_RESOLVED_TEMPORAL_V3 ||
+	   gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY){
+		VkImageMemoryBarrier historyWriteBarrier = {};
+		historyWriteBarrier.sType =
+			VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		historyWriteBarrier.srcAccessMask =
+			frame.resolvedHistoryInitialised ? VK_ACCESS_SHADER_READ_BIT : 0;
+		historyWriteBarrier.dstAccessMask =
+			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		historyWriteBarrier.oldLayout =
+			frame.resolvedHistoryInitialised ?
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL :
+			VK_IMAGE_LAYOUT_UNDEFINED;
+		historyWriteBarrier.newLayout =
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		historyWriteBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		historyWriteBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		historyWriteBarrier.image = frame.resolvedHistoryImage;
+		historyWriteBarrier.subresourceRange.aspectMask =
+			VK_IMAGE_ASPECT_COLOR_BIT;
+		historyWriteBarrier.subresourceRange.levelCount = 1;
+		historyWriteBarrier.subresourceRange.layerCount = gvk.viewCount;
+		vkCmdPipelineBarrier(gvk.frameCommands,
+			frame.resolvedHistoryInitialised ?
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT :
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			0, 0, nil, 0, nil, 1, &historyWriteBarrier);
+		frame.resolvedHistoryInitialised = 1;
+	}
 	if(gvk.frameTimestampEnabled &&
 	   frame.timestampQueryPool != VK_NULL_HANDLE){
 		vkCmdResetQueryPool(gvk.frameCommands,
@@ -870,6 +1704,18 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	// Safe to rewind the immediate-mode allocator here: the fence wait above
 	// already guarantees the previous frame finished reading it.
 	resetDynamic();
+	gvk.motionFrameSerial++;
+	SceneData *scene = getSceneData();
+	for(int32 eye = 0; eye < 2; eye++){
+		memcpy(scene->previousViewProj[eye],
+		       gvk.temporalHistoryValid ?
+		       gvk.previousStereoViewProjectionUnjittered[eye] :
+		       gvk.stereoViewProjectionUnjittered[eye], sizeof(float32)*16);
+		memcpy(gvk.previousStereoViewProjection[eye],
+		       gvk.stereoViewProjection[eye], sizeof(float32)*16);
+		memcpy(gvk.previousStereoViewProjectionUnjittered[eye],
+		       gvk.stereoViewProjectionUnjittered[eye], sizeof(float32)*16);
+	}
 	uploadSceneData();
 
 	// Open the multiview pass for the whole frame. Every draw the game issues
@@ -879,21 +1725,25 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	// full-screen 2D gradient quads, which on the headset land on the floating
 	// panel as a grey glass pane mid-view; the Quest build skips those quads
 	// and clears the whole view to the timecycle colour instead.
-	VkClearValue clears[2];
+	VkClearValue clears[3];
 	memset(clears, 0, sizeof(clears));
 	clears[0].color.float32[0] = gvk.clearColour[0];
 	clears[0].color.float32[1] = gvk.clearColour[1];
 	clears[0].color.float32[2] = gvk.clearColour[2];
 	clears[0].color.float32[3] = 1.0f;
 	clears[1].depthStencil.depth = 1.0f;
+	clears[2].color.float32[0] = 0.0f;
+	clears[2].color.float32[1] = 0.0f;
 
 	VkRenderPassBeginInfo passInfo = {};
 	passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	passInfo.renderPass = gvk.renderPass;
 	passInfo.framebuffer = frame.sceneFramebuffer;
-	passInfo.renderArea.extent.width = gvk.width;
-	passInfo.renderArea.extent.height = gvk.height;
-	passInfo.clearValueCount = 2;
+	passInfo.renderArea.extent.width = gvk.sceneWidth;
+	passInfo.renderArea.extent.height = gvk.sceneHeight;
+	passInfo.clearValueCount =
+		(gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT ||
+		 gvk.sgsrMode != SGSR_OFF) ? 3 : 2;
 	passInfo.pClearValues = clears;
 	vkCmdBeginRenderPass(gvk.frameCommands, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -905,12 +1755,12 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	                        getPipelineLayout(), 0, 1, &sceneSet, 0, nil);
 
 	VkViewport viewport = {};
-	viewport.width = (float32)gvk.width;
-	viewport.height = (float32)gvk.height;
+	viewport.width = (float32)gvk.sceneWidth;
+	viewport.height = (float32)gvk.sceneHeight;
 	viewport.maxDepth = 1.0f;
 	VkRect2D scissor = {};
-	scissor.extent.width = gvk.width;
-	scissor.extent.height = gvk.height;
+	scissor.extent.width = gvk.sceneWidth;
+	scissor.extent.height = gvk.sceneHeight;
 	vkCmdSetViewport(gvk.frameCommands, 0, 1, &viewport);
 	vkCmdSetScissor(gvk.frameCommands, 0, 1, &scissor);
 
@@ -930,6 +1780,71 @@ endFrame(void)
 	// full-image dependency rather than BY_REGION because FXAA reads adjacent
 	// pixels.
 	vkCmdEndRenderPass(gvk.frameCommands);
+	if(gvk.sgsrMode != SGSR_OFF){
+		prepareMotionUniform(frame);
+		VkImageMemoryBarrier depthBarrier = {};
+		depthBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		depthBarrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		depthBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		depthBarrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+		depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+		depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		depthBarrier.image = frame.depthImage;
+		depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		depthBarrier.subresourceRange.levelCount = 1;
+		depthBarrier.subresourceRange.layerCount = gvk.viewCount;
+		vkCmdPipelineBarrier(gvk.frameCommands,
+		                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                     0, 0, nil, 0, nil, 1, &depthBarrier);
+
+		VkImageMemoryBarrier motionBarrier = {};
+		motionBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		motionBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		motionBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		motionBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		motionBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		motionBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		motionBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		motionBarrier.image = frame.motionImage;
+		motionBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		motionBarrier.subresourceRange.levelCount = 1;
+		motionBarrier.subresourceRange.layerCount = gvk.viewCount;
+		vkCmdPipelineBarrier(gvk.frameCommands,
+		                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                     0, 0, nil, 0, nil, 1, &motionBarrier);
+
+		if(gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY){
+			VkRenderPassBeginInfo convertPass = {};
+			convertPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			convertPass.renderPass = gvk.sgsrConvertRenderPass;
+			convertPass.framebuffer = frame.sgsrConvertFramebuffer;
+			convertPass.renderArea.extent.width = gvk.sceneWidth;
+			convertPass.renderArea.extent.height = gvk.sceneHeight;
+			vkCmdBeginRenderPass(gvk.frameCommands, &convertPass,
+			                     VK_SUBPASS_CONTENTS_INLINE);
+			VkViewport convertViewport = {};
+			convertViewport.width = (float32)gvk.sceneWidth;
+			convertViewport.height = (float32)gvk.sceneHeight;
+			convertViewport.maxDepth = 1.0f;
+			VkRect2D convertScissor = {};
+			convertScissor.extent.width = gvk.sceneWidth;
+			convertScissor.extent.height = gvk.sceneHeight;
+			vkCmdSetViewport(gvk.frameCommands, 0, 1, &convertViewport);
+			vkCmdSetScissor(gvk.frameCommands, 0, 1, &convertScissor);
+			vkCmdBindPipeline(gvk.frameCommands,
+			                  VK_PIPELINE_BIND_POINT_GRAPHICS,
+			                  gvk.sgsrConvertPipeline);
+			vkCmdBindDescriptorSets(gvk.frameCommands,
+			                        VK_PIPELINE_BIND_POINT_GRAPHICS,
+			                        gvk.sgsrConvertPipelineLayout, 0, 1,
+			                        &frame.sgsrConvertDescriptor, 0, nil);
+			vkCmdDraw(gvk.frameCommands, 3, 1, 0, 0);
+			vkCmdEndRenderPass(gvk.frameCommands);
+		}
+	}
 	VkImageMemoryBarrier sceneBarrier = {};
 	sceneBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 	sceneBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1062,10 +1977,106 @@ setStereoViewProjection(const float32 left[16], const float32 right[16])
 {
 	memcpy(gvk.stereoViewProjection[0], left, sizeof(float32)*16);
 	memcpy(gvk.stereoViewProjection[1], right, sizeof(float32)*16);
+	memcpy(gvk.stereoViewProjectionUnjittered[0], left, sizeof(float32)*16);
+	memcpy(gvk.stereoViewProjectionUnjittered[1], right, sizeof(float32)*16);
+	gvk.stereoCullPlanesValid = 1;
+	for(int32 eye = 0; eye < 2; eye++){
+		const float32 *matrix = gvk.stereoViewProjection[eye];
+		static const int32 rows[5][2] = {
+			{ 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { 3, 0 }
+		};
+		for(int32 planeIndex = 0; planeIndex < 5; planeIndex++){
+			float32 *plane = gvk.stereoCullPlanes[eye][planeIndex];
+			if(rows[planeIndex][0] == 3){
+				plane[0] = matrix[3];
+				plane[1] = matrix[7];
+				plane[2] = matrix[11];
+				plane[3] = matrix[15];
+			}else{
+				const int32 row = rows[planeIndex][0];
+				const float32 sign = (float32)rows[planeIndex][1];
+				plane[0] = matrix[3]  + sign*matrix[row];
+				plane[1] = matrix[7]  + sign*matrix[4+row];
+				plane[2] = matrix[11] + sign*matrix[8+row];
+				plane[3] = matrix[15] + sign*matrix[12+row];
+			}
+			const float32 length = sqrtf(plane[0]*plane[0] +
+				plane[1]*plane[1] + plane[2]*plane[2]);
+			if(!isfinite(length) || length <= 0.000001f){
+				gvk.stereoCullPlanesValid = 0;
+				continue;
+			}
+			for(int32 component = 0; component < 4; component++)
+				plane[component] /= length;
+		}
+	}
+	gvk.sgsrJitter[0] = gvk.sgsrJitter[1] = 0.0f;
+	if(gvk.sgsrMode == SGSR2_JITTERED_TAA_2X &&
+	   gvk.firstPersonActive && gvk.temporalHistoryValid){
+		// Two opposite quarter-pixel samples. Adding jitter*clip.w to clip.xy
+		// works for the already-composed asymmetric per-eye view-projection.
+		// Cull planes above intentionally remain unjittered.
+		const float32 phaseX =
+			(gvk.motionFrameSerial & 1u) ? 0.25f : -0.25f;
+		const float32 phaseY = phaseX;
+		const float32 jitterNdcX = 2.0f*phaseX/(float32)gvk.sceneWidth;
+		// projectionFromFov already flips clip Y and our viewport height is
+		// positive, so NDC and framebuffer UV have the same Y direction.
+		const float32 jitterNdcY = 2.0f*phaseY/(float32)gvk.sceneHeight;
+		for(int32 eye = 0; eye < 2; eye++)
+			for(int32 col = 0; col < 4; col++){
+				gvk.stereoViewProjection[eye][col*4+0] +=
+					jitterNdcX*gvk.stereoViewProjection[eye][col*4+3];
+				gvk.stereoViewProjection[eye][col*4+1] +=
+					jitterNdcY*gvk.stereoViewProjection[eye][col*4+3];
+			}
+	}
+	if(gvk.sgsrMode == SGSR2_OFFICIAL_QUALITY &&
+	   gvk.firstPersonActive){
+		// Match the stable PC temporal path: a short eight-sample Halton cycle.
+		// The Convert shader removes this exact offset before reconstructing
+		// camera motion from depth, so jitter contributes new edge samples but
+		// cannot move the resolved world or leak into either eye's history lookup.
+		auto halton = [](uint32 index, uint32 base) -> float32 {
+			float32 value = 0.0f;
+			float32 fraction = 1.0f/(float32)base;
+			while(index > 0){
+				value += (float32)(index%base)*fraction;
+				index /= base;
+				fraction /= (float32)base;
+			}
+			return value;
+		};
+		const uint32 sample = (uint32)(gvk.motionFrameSerial%8u)+1u;
+		gvk.sgsrJitter[0] = halton(sample, 2u)-0.5f;
+		gvk.sgsrJitter[1] = halton(sample, 3u)-0.5f;
+		const float32 jitterNdcX =
+			2.0f*gvk.sgsrJitter[0]/(float32)gvk.sceneWidth;
+		const float32 jitterNdcY =
+			2.0f*gvk.sgsrJitter[1]/(float32)gvk.sceneHeight;
+		for(int32 eye = 0; eye < 2; eye++)
+			for(int32 col = 0; col < 4; col++){
+				gvk.stereoViewProjection[eye][col*4+0] +=
+					jitterNdcX*gvk.stereoViewProjection[eye][col*4+3];
+				gvk.stereoViewProjection[eye][col*4+1] +=
+					jitterNdcY*gvk.stereoViewProjection[eye][col*4+3];
+			}
+	}
 
 	SceneData *scene = getSceneData();
-	memcpy(scene->viewProj[0], left, sizeof(float32)*16);
-	memcpy(scene->viewProj[1], right, sizeof(float32)*16);
+	memcpy(scene->viewProj[0], gvk.stereoViewProjection[0], sizeof(float32)*16);
+	memcpy(scene->viewProj[1], gvk.stereoViewProjection[1], sizeof(float32)*16);
+}
+
+void
+setSgsrHorizontalFovDegrees(float32 degrees)
+{
+	if(!isfinite(degrees) || degrees < 1.0f || degrees > 179.0f){
+		gvk.sgsrHorizontalTanHalfFov = 1.0f;
+		return;
+	}
+	gvk.sgsrHorizontalTanHalfFov =
+		tanf(degrees*0.5f*3.14159265358979323846f/180.0f);
 }
 
 // Plants play space on the game camera, so world geometry reaches clip space
@@ -1228,6 +2239,43 @@ getFirstPersonViewFrame(float32 rwRight[3], float32 rwUp[3],
 	return 1;
 }
 
+void
+setFirstPersonEyePoses(const float32 positions[2][3],
+                       const float32 orientations[2][4])
+{
+	if(positions == nil || orientations == nil){
+		gvk.eyePosesValid = 0;
+		return;
+	}
+	memcpy(gvk.eyePosition, positions, sizeof(gvk.eyePosition));
+	memcpy(gvk.eyeQuat, orientations, sizeof(gvk.eyeQuat));
+	gvk.eyePosesValid = 1;
+}
+
+void
+clearFirstPersonEyePoses(void)
+{
+	gvk.eyePosesValid = 0;
+}
+
+bool32
+getFirstPersonEyeViewFrame(uint32 eye, float32 rwRight[3],
+                           float32 rwUp[3], float32 rwAt[3],
+                           float32 position[3])
+{
+	if(!gvk.firstPersonActive || !gvk.eyePosesValid || eye >= 2 ||
+	   rwRight == nil || rwUp == nil || rwAt == nil || position == nil)
+		return 0;
+	float32 worldRight[3];
+	if(!playPoseToFirstPersonWorld(gvk.eyePosition[eye], gvk.eyeQuat[eye],
+	     worldRight, rwUp, rwAt, position))
+		return 0;
+	// RenderWare camera convention points the matrix Right column leftward.
+	for(int32 axis = 0; axis < 3; axis++)
+		rwRight[axis] = -worldRight[axis];
+	return 1;
+}
+
 bool32
 playPoseToFirstPersonWorld(const float32 playPosition[3],
                            const float32 playQuaternion[4],
@@ -1266,10 +2314,149 @@ playPoseToFirstPersonWorld(const float32 playPosition[3],
 	return 1;
 }
 
+bool32
+firstPersonWorldVectorToPlay(const float32 worldVector[3],
+                             float32 playVector[3])
+{
+	if(!gvk.firstPersonActive || !worldVector || !playVector)
+		return 0;
+	float32 px[3], py[3], pz[3];
+	getFirstPersonPlayBasis(px, py, pz);
+	playVector[0] = worldVector[0]*px[0]+worldVector[1]*px[1]+worldVector[2]*px[2];
+	playVector[1] = worldVector[0]*py[0]+worldVector[1]*py[1]+worldVector[2]*py[2];
+	playVector[2] = worldVector[0]*pz[0]+worldVector[1]*pz[1]+worldVector[2]*pz[2];
+	return 1;
+}
+
+static bool32
+sphereIntersectsClipSidePlanes(const float32 planes[5][4],
+                               const float32 centre[3], float32 radius)
+{
+	for(int32 i = 0; i < 5; i++){
+		const float32 *plane = planes[i];
+		const float32 signedValue =
+			plane[0]*centre[0] + plane[1]*centre[1] +
+			plane[2]*centre[2] + plane[3];
+		if(!isfinite(signedValue))
+			return 1;
+		if(signedValue < -radius)
+			return 0;
+	}
+	return 1;
+}
+
+bool32
+isFirstPersonWorldSphereVisibleInStereo(const float32 worldCentre[3],
+                                        float32 radius,
+                                        float32 angularMarginTangent)
+{
+	if(!gvk.firstPersonActive || !gvk.stereoCullPlanesValid ||
+	   worldCentre == nil)
+		return 1;
+	if(!isfinite(worldCentre[0]) || !isfinite(worldCentre[1]) ||
+	   !isfinite(worldCentre[2]) || !isfinite(radius) ||
+	   !isfinite(angularMarginTangent))
+		return 1;
+
+	// worldToPlay is the exact rigid transform applied to every world draw in
+	// beginUpdate. Testing in that same play space avoids reconstructing eye
+	// poses or approximating their asymmetric FOV on the game side.
+	const float32 *m = gvk.worldToPlay;
+	float32 playCentre[3];
+	for(int32 row = 0; row < 3; row++)
+		playCentre[row] =
+			m[row]*worldCentre[0] + m[4+row]*worldCentre[1] +
+			m[8+row]*worldCentre[2] + m[12+row];
+	if(!isfinite(playCentre[0]) || !isfinite(playCentre[1]) ||
+	   !isfinite(playCentre[2]))
+		return 1;
+
+	const float32 dx = worldCentre[0] - gvk.fpHeadWorld[0];
+	const float32 dy = worldCentre[1] - gvk.fpHeadWorld[1];
+	const float32 dz = worldCentre[2] - gvk.fpHeadWorld[2];
+	const float32 distance = sqrtf(dx*dx + dy*dy + dz*dz);
+	if(!isfinite(distance))
+		return 1;
+	const float32 clampedMarginTangent =
+		fmaxf(0.0f, fminf(angularMarginTangent, 0.17632698f));
+	const float32 safeRadius = fmaxf(0.0f, radius) + 0.25f +
+		distance*clampedMarginTangent;
+
+	return sphereIntersectsClipSidePlanes(
+		gvk.stereoCullPlanes[0], playCentre, safeRadius) ||
+		sphereIntersectsClipSidePlanes(
+			gvk.stereoCullPlanes[1], playCentre, safeRadius);
+}
+
+bool32
+isFirstPersonWorldBoxVisibleInStereo(const float32 worldCorners[8][3],
+                                     float32 angularMarginTangent)
+{
+	if(!gvk.firstPersonActive || !gvk.stereoCullPlanesValid ||
+	   worldCorners == nil || !isfinite(angularMarginTangent))
+		return 1;
+	const float32 clampedMarginTangent =
+		fmaxf(0.0f, fminf(angularMarginTangent, 0.17632698f));
+	float32 playCorners[8][3];
+	float32 farthestDistance = 0.0f;
+	const float32 *m = gvk.worldToPlay;
+	for(int32 corner = 0; corner < 8; corner++){
+		const float32 *world = worldCorners[corner];
+		if(!isfinite(world[0]) || !isfinite(world[1]) ||
+		   !isfinite(world[2]))
+			return 1;
+		for(int32 row = 0; row < 3; row++)
+			playCorners[corner][row] =
+				m[row]*world[0] + m[4+row]*world[1] +
+				m[8+row]*world[2] + m[12+row];
+		const float32 dx = world[0]-gvk.fpHeadWorld[0];
+		const float32 dy = world[1]-gvk.fpHeadWorld[1];
+		const float32 dz = world[2]-gvk.fpHeadWorld[2];
+		const float32 distance = sqrtf(dx*dx+dy*dy+dz*dz);
+		if(!isfinite(distance))
+			return 1;
+		farthestDistance = fmaxf(farthestDistance, distance);
+	}
+	const float32 safeMargin = 0.25f+
+		farthestDistance*clampedMarginTangent;
+	for(int32 eye = 0; eye < 2; eye++){
+		bool32 eyeVisible = 1;
+		for(int32 planeIndex = 0; planeIndex < 5; planeIndex++){
+			const float32 *plane =
+				gvk.stereoCullPlanes[eye][planeIndex];
+			bool32 allOutside = 1;
+			for(int32 corner = 0; corner < 8; corner++){
+				const float32 signedValue =
+					plane[0]*playCorners[corner][0] +
+					plane[1]*playCorners[corner][1] +
+					plane[2]*playCorners[corner][2] + plane[3];
+				if(!isfinite(signedValue))
+					return 1;
+				if(signedValue >= -safeMargin){
+					allOutside = 0;
+					break;
+				}
+			}
+			if(allOutside){
+				eyeVisible = 0;
+				break;
+			}
+		}
+		if(eyeVisible)
+			return 1;
+	}
+	return 0;
+}
+
 void
 setFirstPersonAnchor(const float32 headWorld[3], float32 headingYaw,
                      bool32 followHeading, bool32 active)
 {
+	if(gvk.firstPersonActive != active)
+	{
+		gvk.temporalHistoryValid = 0;
+		resetAtomicMotionHistory();
+	}
 	if(active && (!gvk.firstPersonActive ||
 	              gvk.fpFollowHeading != followHeading ||
 	              gvk.fpUseFullBasis)){
@@ -1298,6 +2485,11 @@ setFirstPersonAnchorBasis(const float32 headWorld[3],
                           const float32 forward[3],
                           float32 headingYaw, bool32 active)
 {
+	if(gvk.firstPersonActive != active)
+	{
+		gvk.temporalHistoryValid = 0;
+		resetAtomicMotionHistory();
+	}
 	if(active && (!gvk.firstPersonActive ||
 	              !gvk.fpFollowHeading ||
 	              !gvk.fpUseFullBasis)){
@@ -1373,14 +2565,50 @@ setPostFx(uint32 mode, uint32 red, uint32 green, uint32 blue,
 	// 0 = pass-through, 1 = Vice City colour treatment, 2 = an opaque
 	// transition mask used while the cutscene world/camera is being rebuilt.
 	gvk.postFxConstants.mode[0] = mode <= 2 ? mode : 0u;
-	gvk.postFxConstants.mode[2] = gvk.width;
-	gvk.postFxConstants.mode[3] = gvk.height;
+	gvk.postFxConstants.mode[2] = gvk.sceneWidth;
+	gvk.postFxConstants.mode[3] = gvk.sceneHeight;
+	gvk.postFxConstants.upscale[0] = gvk.width;
+	gvk.postFxConstants.upscale[1] = gvk.height;
+	gvk.postFxConstants.upscale[2] = gvk.sgsrMode;
+	gvk.postFxConstants.upscale[3] =
+		(uint32)(gvk.renderScaleEffectivePercent+0.5f);
 }
 
 void
 setFxaaEnabled(bool32 enabled)
 {
 	gvk.postFxConstants.mode[1] = enabled ? 1u : 0u;
+}
+
+void
+setSpatialAaMode(uint32 mode)
+{
+	const uint32 accepted = mode ? 1u : 0u;
+	if(gvk.postFxConstants.mode[1] != accepted)
+		VKLOG("spatial AA mode %u -> %u", gvk.postFxConstants.mode[1],
+		      accepted);
+	gvk.postFxConstants.mode[1] = accepted;
+}
+
+bool32
+getSgsrStatus(uint32 *mode, uint32 *sceneWidth, uint32 *sceneHeight,
+              uint32 *outputWidth, uint32 *outputHeight)
+{
+	if(!gvk.initialised)
+		return 0;
+	if(mode) *mode = gvk.sgsrMode;
+	if(sceneWidth) *sceneWidth = gvk.sceneWidth;
+	if(sceneHeight) *sceneHeight = gvk.sceneHeight;
+	if(outputWidth) *outputWidth = gvk.width;
+	if(outputHeight) *outputHeight = gvk.height;
+	return 1;
+}
+
+uint32
+getSceneSampleCount(void)
+{
+	return gvk.sceneSamples == VK_SAMPLE_COUNT_4_BIT ? 4u :
+	       gvk.sceneSamples == VK_SAMPLE_COUNT_2_BIT ? 2u : 1u;
 }
 
 bool32
@@ -1537,6 +2765,7 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 {
 	switch(req){
 	case DEVICEOPEN: {
+		gLastDeviceOpenRenderTargetFailure = 0;
 		EngineOpenParams *params = (EngineOpenParams*)arg;
 		if(params == nil || params->device == VK_NULL_HANDLE){
 			VKERR("DEVICEOPEN without an OpenXR-created Vulkan device");
@@ -1549,6 +2778,25 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 		gvk.queueFamilyIndex = params->queueFamilyIndex;
 		gvk.width = params->width;
 		gvk.height = params->height;
+		gvk.renderScaleEffectivePercent =
+			params->renderScaleEffectivePercent >= 50.0f &&
+			params->renderScaleEffectivePercent <= 400.0f ?
+			params->renderScaleEffectivePercent : 100.0f;
+		gvk.sceneWidth = params->sceneWidth ? params->sceneWidth : gvk.width;
+		gvk.sceneHeight = params->sceneHeight ? params->sceneHeight : gvk.height;
+		gvk.sceneWidth = gvk.sceneWidth > gvk.width ? gvk.width : gvk.sceneWidth;
+		gvk.sceneHeight = gvk.sceneHeight > gvk.height ? gvk.height : gvk.sceneHeight;
+		gvk.sgsrMode = params->sgsrMode < SGSR_MODE_COUNT ?
+			params->sgsrMode : SGSR_OFF;
+		// Valid even before the first gameplay SetPostFx call. Startup/logo
+		// frames can reach the resolve path before timecycle colour is updated.
+		gvk.postFxConstants.mode[2] = gvk.sceneWidth;
+		gvk.postFxConstants.mode[3] = gvk.sceneHeight;
+		gvk.postFxConstants.upscale[0] = gvk.width;
+		gvk.postFxConstants.upscale[1] = gvk.height;
+		gvk.postFxConstants.upscale[2] = gvk.sgsrMode;
+		gvk.postFxConstants.upscale[3] =
+			(uint32)(gvk.renderScaleEffectivePercent+0.5f);
 		gvk.viewCount = params->viewCount ? params->viewCount : 1;
 		gvk.colourFormat = params->colourFormat;
 
@@ -1556,10 +2804,41 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 		vkGetPhysicalDeviceMemoryProperties(gvk.physicalDevice, &gvk.memoryProperties);
 		vkGetPhysicalDeviceFeatures(gvk.physicalDevice, &gvk.deviceFeatures);
 		gvk.supportsBC = gvk.deviceFeatures.textureCompressionBC ? 1 : 0;
+		const VkSampleCountFlags framebufferSamples =
+			gvk.deviceProperties.limits.framebufferColorSampleCounts &
+			gvk.deviceProperties.limits.framebufferDepthSampleCounts;
+		gvk.sceneSamples = VK_SAMPLE_COUNT_1_BIT;
+		if(gvk.sgsrMode == SGSR_OFF){
+			if(params->sceneSampleCount >= 4 &&
+			   (framebufferSamples & VK_SAMPLE_COUNT_4_BIT))
+				gvk.sceneSamples = VK_SAMPLE_COUNT_4_BIT;
+			else if(params->sceneSampleCount >= 2 &&
+			        (framebufferSamples & VK_SAMPLE_COUNT_2_BIT))
+				gvk.sceneSamples = VK_SAMPLE_COUNT_2_BIT;
+		}
+		// Camera motion is reconstructed directly from depth at full precision.
+		// Dynamic object roots occupy a small NDC range, so x8 encoded RG8 SNORM
+		// halves attachment memory and bandwidth. Fall back on unusual hardware.
+		gvk.motionFormat = VK_FORMAT_R8G8_SNORM;
+		VkFormatProperties motionProperties = {};
+		vkGetPhysicalDeviceFormatProperties(gvk.physicalDevice,
+			gvk.motionFormat, &motionProperties);
+		const VkFormatFeatureFlags motionRequired =
+			VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+			VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+			VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+		if((motionProperties.optimalTilingFeatures & motionRequired) !=
+		   motionRequired)
+			gvk.motionFormat = VK_FORMAT_R16G16_SFLOAT;
 
-		VKLOG("adopting device %s, %ux%u x%u views, BC=%d",
-		      gvk.deviceProperties.deviceName, gvk.width, gvk.height,
-		      gvk.viewCount, (int)gvk.supportsBC);
+		VKLOG("adopting device %s, output=%ux%u scene=%ux%u x%u views, "
+		      "SGSR2-foundation=%u MSAA=%ux motion-format=%d BC=%d", gvk.deviceProperties.deviceName,
+		      gvk.width, gvk.height, gvk.sceneWidth, gvk.sceneHeight,
+		      gvk.viewCount, gvk.sgsrMode,
+		      gvk.sceneSamples == VK_SAMPLE_COUNT_4_BIT ? 4u :
+		      gvk.sceneSamples == VK_SAMPLE_COUNT_2_BIT ? 2u : 1u,
+		      (int)gvk.motionFormat,
+		      (int)gvk.supportsBC);
 
 		VkCommandPoolCreateInfo poolInfo = {};
 		poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1638,16 +2917,55 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 			      gvk.queueFamilyIndex);
 
 		for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
-			if(!createDepthBuffer(gvk.frames[i]))
+			if(!createDepthBuffer(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
 				return 0;
-			if(!createSceneColour(gvk.frames[i]))
+			}
+			if(!createSceneColour(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
 				return 0;
+			}
+			if(!createSceneMsaaColour(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
+			if(!createResolvedHistory(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
+			if(!createSgsr2ConvertImage(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
+			if(!createMotionImage(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
 		}
 		if(!createRenderPass())
 			return 0;
-		for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++)
-			if(!createSceneFramebuffer(gvk.frames[i]))
+		for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
+			if(!createSceneFramebuffer(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
 				return 0;
+			}
+			if(!createMotionFramebuffer(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
+			if(!createSgsr2ConvertFramebuffer(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
+		}
+		if(!createMotionResources()){
+			gLastDeviceOpenRenderTargetFailure = 1;
+			return 0;
+		}
+		if(!createSgsr2ConvertResources()){
+			gLastDeviceOpenRenderTargetFailure = 1;
+			return 0;
+		}
 		if(!createPostFxResources())
 			return 0;
 
@@ -1660,6 +2978,9 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 		gvk.nextFrame = 0;
 		gvk.lastSubmittedFrame = 0;
 		gvk.hasSubmittedFrame = 0;
+		gvk.temporalHistoryValid = 0;
+		gvk.motionFrameSerial = 0;
+		resetAtomicMotionHistory();
 		gvk.frameCommands = gvk.frames[0].commandBuffer;
 		setStateFrame(0);
 		gvk.initialised = 1;
@@ -1670,6 +2991,7 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 	case DEVICECLOSE:
 		if(gvk.device != VK_NULL_HANDLE){
 			vkDeviceWaitIdle(gvk.device);
+			resetAtomicMotionHistory();
 			for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++)
 				flushRetired(i);
 			stateShutdown();
@@ -1683,13 +3005,38 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 					if(frame.framebuffers[i])
 						vkDestroyFramebuffer(
 							gvk.device, frame.framebuffers[i], nil);
+				if(frame.motionFramebuffer)
+					vkDestroyFramebuffer(
+						gvk.device, frame.motionFramebuffer, nil);
+				if(frame.sgsrConvertFramebuffer)
+					vkDestroyFramebuffer(
+						gvk.device, frame.sgsrConvertFramebuffer, nil);
 			}
+			if(gvk.sgsrConvertPipeline)
+				vkDestroyPipeline(gvk.device, gvk.sgsrConvertPipeline, nil);
+			if(gvk.sgsrConvertPipelineLayout)
+				vkDestroyPipelineLayout(gvk.device,
+				                        gvk.sgsrConvertPipelineLayout, nil);
+			if(gvk.sgsrConvertDescriptorPool)
+				vkDestroyDescriptorPool(gvk.device,
+				                        gvk.sgsrConvertDescriptorPool, nil);
+			if(gvk.sgsrConvertDescriptorLayout)
+				vkDestroyDescriptorSetLayout(gvk.device,
+				                              gvk.sgsrConvertDescriptorLayout, nil);
+			if(gvk.motionPipeline) vkDestroyPipeline(gvk.device, gvk.motionPipeline, nil);
+			if(gvk.motionPipelineLayout) vkDestroyPipelineLayout(gvk.device, gvk.motionPipelineLayout, nil);
+			if(gvk.motionDescriptorPool) vkDestroyDescriptorPool(gvk.device, gvk.motionDescriptorPool, nil);
+			if(gvk.motionDescriptorLayout) vkDestroyDescriptorSetLayout(gvk.device, gvk.motionDescriptorLayout, nil);
+			if(gvk.motionDepthSampler) vkDestroySampler(gvk.device, gvk.motionDepthSampler, nil);
 			if(gvk.postFxPipeline) vkDestroyPipeline(gvk.device, gvk.postFxPipeline, nil);
 			if(gvk.postFxPipelineLayout) vkDestroyPipelineLayout(gvk.device, gvk.postFxPipelineLayout, nil);
 			if(gvk.postFxDescriptorPool) vkDestroyDescriptorPool(gvk.device, gvk.postFxDescriptorPool, nil);
 			if(gvk.postFxDescriptorLayout) vkDestroyDescriptorSetLayout(gvk.device, gvk.postFxDescriptorLayout, nil);
 			if(gvk.postFxSampler) vkDestroySampler(gvk.device, gvk.postFxSampler, nil);
 			if(gvk.postFxRenderPass) vkDestroyRenderPass(gvk.device, gvk.postFxRenderPass, nil);
+			if(gvk.motionRenderPass) vkDestroyRenderPass(gvk.device, gvk.motionRenderPass, nil);
+			if(gvk.sgsrConvertRenderPass)
+				vkDestroyRenderPass(gvk.device, gvk.sgsrConvertRenderPass, nil);
 			if(gvk.renderPass) vkDestroyRenderPass(gvk.device, gvk.renderPass, nil);
 			for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
 				FrameContext &frame = gvk.frames[i];
@@ -1701,7 +3048,46 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 					               frame.sceneColourImage, nil);
 				if(frame.sceneColourMemory)
 					vkFreeMemory(gvk.device,
-					             frame.sceneColourMemory, nil);
+						             frame.sceneColourMemory, nil);
+				if(frame.sceneMsaaView)
+					vkDestroyImageView(gvk.device,
+					                   frame.sceneMsaaView, nil);
+				if(frame.sceneMsaaImage)
+					vkDestroyImage(gvk.device,
+					               frame.sceneMsaaImage, nil);
+				if(frame.sceneMsaaMemory)
+					vkFreeMemory(gvk.device,
+					             frame.sceneMsaaMemory, nil);
+				if(frame.resolvedHistoryView)
+					vkDestroyImageView(gvk.device,
+					                   frame.resolvedHistoryView, nil);
+				if(frame.resolvedHistoryImage)
+					vkDestroyImage(gvk.device,
+					               frame.resolvedHistoryImage, nil);
+				if(frame.resolvedHistoryMemory)
+					vkFreeMemory(gvk.device,
+					             frame.resolvedHistoryMemory, nil);
+				if(frame.motionMapped && frame.motionBufferMemory)
+					vkUnmapMemory(gvk.device, frame.motionBufferMemory);
+				if(frame.motionBuffer)
+					vkDestroyBuffer(gvk.device, frame.motionBuffer, nil);
+				if(frame.motionBufferMemory)
+					vkFreeMemory(gvk.device, frame.motionBufferMemory, nil);
+				if(frame.motionView)
+					vkDestroyImageView(gvk.device, frame.motionView, nil);
+				if(frame.motionImage)
+					vkDestroyImage(gvk.device, frame.motionImage, nil);
+				if(frame.motionMemory)
+					vkFreeMemory(gvk.device, frame.motionMemory, nil);
+				if(frame.sgsrConvertView)
+					vkDestroyImageView(gvk.device,
+					                   frame.sgsrConvertView, nil);
+				if(frame.sgsrConvertImage)
+					vkDestroyImage(gvk.device,
+					               frame.sgsrConvertImage, nil);
+				if(frame.sgsrConvertMemory)
+					vkFreeMemory(gvk.device,
+					             frame.sgsrConvertMemory, nil);
 				if(frame.depthView)
 					vkDestroyImageView(gvk.device, frame.depthView, nil);
 				if(frame.depthImage)
@@ -1761,6 +3147,12 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 	default:
 		return 0;
 	}
+}
+
+bool32
+didLastDeviceOpenFailForRenderTarget(void)
+{
+	return gLastDeviceOpenRenderTargetFailure;
 }
 
 // ---------------------------------------------------------------------------

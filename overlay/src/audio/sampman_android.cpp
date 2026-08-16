@@ -38,6 +38,7 @@ struct AndroidChannel {
 	uint32 pan = 63;
 	float maxDistance = 100.0f;
 	double cursor = 0.0;
+	uint32 revision = 0;
 	bool valid = false;
 	bool playing = false;
 };
@@ -68,10 +69,18 @@ audioCallback(AAudioStream *, void *, void *audioData, int32_t numFrames)
 	int16_t *output = static_cast<int16_t *>(audioData);
 	memset(output, 0, size_t(numFrames) * 2 * sizeof(int16_t));
 
-	if(!gMixerMutex.try_lock())
-		return AAUDIO_CALLBACK_RESULT_CONTINUE;
+	// Never hold the control mutex while mixing a complete AAudio burst.  The
+	// game thread updates several channel properties every frame; keeping this
+	// mutex across all channels and samples could stall DMAudio.Service for a
+	// whole callback.  Snapshotting makes both critical sections tiny without
+	// dropping or repeating an entire burst when an update happens concurrently.
+	AndroidChannel channels[MAXCHANNELS + MAX2DCHANNELS];
+	{
+		std::lock_guard<std::mutex> lock(gMixerMutex);
+		memcpy(channels, gChannels, sizeof(channels));
+	}
 
-	for(AndroidChannel &channel : gChannels){
+	for(AndroidChannel &channel : channels){
 		if(!channel.playing || !channel.valid || channel.frameCount == 0)
 			continue;
 
@@ -116,7 +125,21 @@ audioCallback(AAudioStream *, void *, void *audioData, int32_t numFrames)
 		}
 	}
 
-	gMixerMutex.unlock();
+	// Commit only playback progress.  A revision change means the game thread
+	// reinitialised, restarted, stopped, or changed loop semantics while this
+	// snapshot was being mixed, so its newer state must win.
+	{
+		std::lock_guard<std::mutex> lock(gMixerMutex);
+		for(size_t i = 0; i < ARRAY_SIZE(gChannels); ++i){
+			AndroidChannel &live = gChannels[i];
+			const AndroidChannel &mixed = channels[i];
+			if(live.revision != mixed.revision || !live.valid)
+				continue;
+			live.cursor = mixed.cursor;
+			live.loopCount = mixed.loopCount;
+			live.playing = mixed.playing;
+		}
+	}
 	return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -388,7 +411,9 @@ cSampleManager::InitialiseChannel(uint32 channel, uint32 sfx, uint8 bank)
 		return false;
 	std::lock_guard<std::mutex> lock(gMixerMutex);
 	AndroidChannel &out = gChannels[channel];
+	const uint32 revision = out.revision + 1;
 	out = AndroidChannel{};
+	out.revision = revision;
 	out.sample = sfx;
 	out.frameCount = sample.nSize / 2;
 	out.loopEnd = out.frameCount;
@@ -453,12 +478,14 @@ void cSampleManager::SetChannelLoopPoints(uint32 channel, uint32 start, int32 en
 	gChannels[channel].loopStart = start / 2;
 	gChannels[channel].loopEnd = end < 0 ? gChannels[channel].frameCount :
 		std::min<uint32>(uint32(end) / 2, gChannels[channel].frameCount);
+	gChannels[channel].revision++;
 }
 void cSampleManager::SetChannelLoopCount(uint32 channel, uint32 count)
 {
 	if(channel >= MAXCHANNELS + MAX2DCHANNELS) return;
 	std::lock_guard<std::mutex> lock(gMixerMutex);
 	gChannels[channel].loopCount = count;
+	gChannels[channel].revision++;
 }
 bool cSampleManager::GetChannelUsedFlag(uint32 channel)
 {
@@ -473,6 +500,7 @@ void cSampleManager::StartChannel(uint32 channel)
 	if(gChannels[channel].valid){
 		gChannels[channel].cursor = 0.0;
 		gChannels[channel].playing = true;
+		gChannels[channel].revision++;
 	}
 }
 void cSampleManager::StopChannel(uint32 channel)
@@ -480,6 +508,7 @@ void cSampleManager::StopChannel(uint32 channel)
 	if(channel >= MAXCHANNELS + MAX2DCHANNELS) return;
 	std::lock_guard<std::mutex> lock(gMixerMutex);
 	gChannels[channel].playing = false;
+	gChannels[channel].revision++;
 }
 
 void cSampleManager::PreloadStreamedFile(uint32 file, uint8 stream)

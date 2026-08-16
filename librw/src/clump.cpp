@@ -53,9 +53,16 @@ Clump::clone(void)
 	Frame *root = this->getFrame()->cloneAndLink();
 	clump->setFrame(root);
 	FORLIST(lnk, this->atomics){
+		// A badly converted model can carry a frameless atomic; cloning it
+		// dereferenced the missing frame on every spawn. Skip the orphan.
 		Atomic *a = Atomic::fromClump(lnk);
+		Frame *sourceFrame = a->getFrame();
+		if(sourceFrame == nil)
+			continue;
 		Atomic *atomic = a->clone();
-		atomic->setFrame(a->getFrame()->root);
+		if(atomic == nil)
+			continue;
+		atomic->setFrame(sourceFrame->root);
 		clump->addAtomic(atomic);
 	}
 	this->getFrame()->purgeClone();

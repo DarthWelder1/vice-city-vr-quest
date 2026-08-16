@@ -201,6 +201,24 @@ ShadeChannel(float shade)
 }
 }
 
+void
+Shutdown(void)
+{
+	if(gAlbedo){
+		RwTextureDestroy(gAlbedo);
+		gAlbedo = nil;
+	}
+	gAlbedoAttempted = false;
+	for(int hand = 0; hand < HAND_COUNT; hand++){
+		HandMesh &mesh = gHands[hand];
+		mesh.attempted = false;
+		mesh.loaded = false;
+		std::vector<HandVertex>().swap(mesh.vertices);
+		std::vector<RwImVertexIndex>().swap(mesh.indices);
+		std::vector<RwIm3DVertex>().swap(mesh.renderVertices);
+	}
+}
+
 bool
 Render(int hand, const CVector &position, const CVector &right,
 	const CVector &up, const CVector &forward, float grip, float trigger)

@@ -20,6 +20,7 @@ layout(location = 5) in uvec4 inBoneIndices;
 layout(location = 0) out vec4 fragColour;
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out float fragFog;
+layout(location = 3) flat out vec2 fragDynamicMotion;
 
 layout(set = 2, binding = 0) uniform BoneData {
 	mat4 bone[RW_MAX_BONES];
@@ -36,11 +37,14 @@ void main()
 		bones.bone[inBoneIndices.w] * inWeights.w;
 
 	vec4 skinned = pose * vec4(inPosition, 1.0);
-	vec4 world = push.model * skinned;
+	mat4 model = RwModelMatrix();
+	vec4 world = model * skinned;
 	gl_Position = scene.viewProj[gl_ViewIndex] * world;
+	vec4 rootMotion = RwRootScreenMotion();
+	fragDynamicMotion = gl_ViewIndex == 0 ? rootMotion.xy : rootMotion.zw;
 
 	// Same additive fixed-function sum as rw_world.vert; see the comment there.
-	vec3 normal = normalize(mat3(push.model) * mat3(pose) * inNormal);
+	vec3 normal = normalize(mat3(model) * mat3(pose) * inNormal);
 	vec3 colour = inColour.rgb + push.ambientLight.rgb * push.surfaceProps.x;
 	vec4 dirColour = unpackUnorm4x8(floatBitsToUint(push.lightDirColour.w));
 	colour += dirColour.rgb *
