@@ -46,11 +46,17 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
 - Physical steering for cars and motorcycles, including model steering wheels.
 - In-headset VR, calibration, cheats, traffic, graphics and model-set menus.
 - Stereo-safe building culling with an exact OFF fallback.
-- Optional Physics Director with ORIGINAL/OFF fallback and detailed profiler.
+- Physics Director V2 is enabled by default for CPU headroom, remains
+  experimental, and has an exact ORIGINAL/OFF fallback in the Traffic menu.
 - Classic/Modern asset categories; no external model pack is included.
 - Default quality profile: 125% render scale, sustained CPU/GPU hints,
-  Spatial AA, safe culling, Modern world textures/weapons and Classic vehicles,
-  pedestrians and vegetation when a user-built Modern overlay is available.
+  Spatial AA, AUTHORED occlusion culling, Modern world textures/weapons and
+  Classic vehicles, pedestrians and vegetation when a user-built Modern
+  overlay is available. AUTHORED gives substantially better performance but
+  remains experimental; use STEREO SAFE or OFF if geometry differs between
+  eyes or disappears incorrectly.
+- Modern vehicles can be expensive on Quest, especially with high traffic;
+  Classic vehicles remain the default and the recommended fallback.
 - Normal frontend/save loading on first launch; the developer Quick Test Start
   shortcut remains available but is off by default.
 

@@ -2247,7 +2247,7 @@ index 0c4b11a..61e7c4e 100644
  #if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
  bool CRenderer::ms_bVrOmnidirectionalScan;
  bool CRenderer::ms_bVrPerViewCulling;
-+int32 CRenderer::ms_nVrOcclusionCullingMode = VR_OCCLUSION_CULLING_SAFE;
++int32 CRenderer::ms_nVrOcclusionCullingMode = VR_OCCLUSION_CULLING_AUTHORED;
  #endif
  bool CRenderer::m_loadingPriority;
  float CRenderer::ms_lodDistScale = 1.2f;

@@ -122,7 +122,7 @@ static bool gQuestQuickTestStart;
 static int gQuestRenderScalePercent = 125;
 static int gQuestSgsrMode = rw::vulkan::SGSR_OFF;
 static int gQuestMsaaSamples = 1;
-static int gOcclusionCullingMode = VR_OCCLUSION_CULLING_SAFE;
+static int gOcclusionCullingMode = VR_OCCLUSION_CULLING_AUTHORED;
 static bool gGameplayHudEnabled = true;
 static int gHudWidthPercent = 100;
 static int gHudScalePercent = 130;
@@ -460,10 +460,10 @@ LoadVrSettings(void)
 		(int)VR_FOUNTAIN_OFF), (int)VR_FOUNTAIN_QUALITY_COUNT-1));
 	{
 		// Migrate the old boolean without rewriting it. OFF remains the exact
-		// original full-360 render path; SAFE is the former enabled behaviour.
+		// original full-360 render path; AUTHORED is the recommended default.
 		const int legacyOcclusion = GetPrivateProfileIntA("VR",
 			"OcclusionCulling", 1, ".\\vr_settings.ini") != 0 ?
-			VR_OCCLUSION_CULLING_SAFE : VR_OCCLUSION_CULLING_OFF;
+			VR_OCCLUSION_CULLING_AUTHORED : VR_OCCLUSION_CULLING_OFF;
 		// V2 adds a correctness-first STEREO SAFE mode before the two authored
 		// experimental modes. Do not reinterpret the old value 2 (AGGRESSIVE) as
 		// a new experimental mode after an update; migrate everyone to SAFE/OFF.
@@ -2234,16 +2234,24 @@ DrawQuestAboutPage(void)
 		"CALIBRATE WEAPONS IF A MODEL OR GRIP IS MISALIGNED",
 		"MODEL ASSETS CAN MIX CLASSIC AND MODERN CONTENT",
 		"CLASSIC VEGETATION IS RECOMMENDED FOR QUEST PERFORMANCE",
+		"MODERN VEHICLES + HIGH TRAFFIC CAN HEAVILY LOAD THE GPU",
+		"AUTHORED CULLING HELPS PERFORMANCE BUT MAY SHOW RARE ARTIFACTS",
+		"IF EYES DISAGREE: GRAPHICS > OCCLUSION > STEREO SAFE OR OFF",
+		"PHYSICS DIRECTOR V2 IS EXPERIMENTAL",
+		"IF TRAFFIC MISBEHAVES: TRAFFIC > PHYSICS DIRECTOR > ORIGINAL",
 		"THE FULL CAMPAIGN IS PLAYABLE, BUT THE MOD IS STILL IN DEVELOPMENT",
 		"DISCUSSION: FLAT2VR DISCORD",
 		"discord.com/channels/747967102895390741/1529621098751197365",
 		"PRESS ANY BUTTON TO CLOSE"
 	};
-	for(int index = 0; index < (int)ARRAY_SIZE(lines); index++)
-		DrawVrMenuText(lines[index], VR_MENU_WIDTH/2, 220+index*40,
-			2, index == (int)ARRAY_SIZE(lines)-1 ? 255 : 215,
-			index == (int)ARRAY_SIZE(lines)-1 ? 205 : 225,
-			index == (int)ARRAY_SIZE(lines)-1 ? 80 : 235);
+	for(int index = 0; index < (int)ARRAY_SIZE(lines); index++){
+		const bool warning = index >= 6 && index <= 10;
+		const bool close = index == (int)ARRAY_SIZE(lines)-1;
+		DrawVrMenuText(lines[index], VR_MENU_WIDTH/2, 170+index*32,
+			2, close ? 255 : (warning ? 255 : 215),
+			close ? 205 : (warning ? 145 : 225),
+			close ? 80 : (warning ? 70 : 235));
+	}
 }
 
 static const char *

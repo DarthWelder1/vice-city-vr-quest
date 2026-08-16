@@ -1165,7 +1165,7 @@ createSwapchain(void)
 			{ "CpuPerformanceMode", "1" },
 			{ "GpuPerformanceMode", "1" },
 			{ "OcclusionCulling", "1" },
-			{ "OcclusionCullingModeV2", "1" },
+			{ "OcclusionCullingModeV2", "2" },
 			{ "PhysicsDirectorMode", "3" },
 			{ "PhysicsDirectorPreset", "0" },
 			{ "VehicleVisualBudgetMode", "0" },
