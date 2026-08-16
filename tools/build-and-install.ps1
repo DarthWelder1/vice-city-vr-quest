@@ -158,35 +158,30 @@ function Find-Git {
     return $gitExe
 }
 
-function Find-AndroidSdk {
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    if (-not [string]::IsNullOrWhiteSpace($AndroidSdk)) { $candidates.Add($AndroidSdk) }
-    if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_HOME)) { $candidates.Add($env:ANDROID_HOME) }
-    if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) { $candidates.Add($env:ANDROID_SDK_ROOT) }
-    $candidates.Add((Join-Path $env:LOCALAPPDATA "Android\Sdk"))
+function Ensure-AndroidCommandLineTools {
+    param([Parameter(Mandatory = $true)][string]$SdkRoot)
 
-    foreach ($candidate in $candidates) {
-        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-        $hasAdb = Test-Path -LiteralPath (Join-Path $candidate "platform-tools\adb.exe") -PathType Leaf
-        $hasManager = Test-Path -LiteralPath (Join-Path $candidate "cmdline-tools\latest\bin\sdkmanager.bat") -PathType Leaf
-        if ($hasAdb -or $hasManager) {
-            return (Resolve-Path -LiteralPath $candidate).Path
-        }
-    }
+    $managerCandidates = @(
+        (Join-Path $SdkRoot "cmdline-tools\latest\bin\sdkmanager.bat"),
+        (Join-Path $SdkRoot "cmdline-tools\bin\sdkmanager.bat")
+    )
+    $existingManager = $managerCandidates | Where-Object {
+        Test-Path -LiteralPath $_ -PathType Leaf
+    } | Select-Object -First 1
+    if ($null -ne $existingManager) { return $existingManager }
 
     $sdkWorkRoot = [IO.Path]::GetFullPath($WorkDir)
-    $sdkRoot = Join-Path $sdkWorkRoot ".android-sdk"
     $sdkDownloads = Join-Path $sdkWorkRoot ".downloads"
     $sdkTools = Join-Path $sdkWorkRoot ".tools"
     $toolsZip = Join-Path $sdkDownloads "commandlinetools-win-$androidCommandLineToolsVersion.zip"
     $extractRoot = Join-Path $sdkTools "android-command-line-tools-$androidCommandLineToolsVersion"
     $latestRoot = Join-Path $sdkRoot "cmdline-tools\latest"
     $sdkManager = Join-Path $latestRoot "bin\sdkmanager.bat"
-    New-Item -ItemType Directory -Path $sdkDownloads,$sdkTools,$sdkRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $sdkDownloads,$sdkTools,$SdkRoot -Force | Out-Null
 
     if (-not (Test-Path -LiteralPath $sdkManager -PathType Leaf)) {
         if (-not (Test-Path -LiteralPath $toolsZip -PathType Leaf)) {
-            Write-Host "Android SDK was not found; downloading official command-line tools..." -ForegroundColor Yellow
+            Write-Host "Android SDK command-line tools are missing; downloading them from Google..." -ForegroundColor Yellow
             Invoke-WebRequest -UseBasicParsing -Uri $androidCommandLineToolsUrl -OutFile $toolsZip
         }
         $observedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $toolsZip).Hash
@@ -204,6 +199,29 @@ function Find-AndroidSdk {
     if (-not (Test-Path -LiteralPath $sdkManager -PathType Leaf)) {
         throw "Android SDK bootstrap did not create $sdkManager"
     }
+    return $sdkManager
+}
+
+function Find-AndroidSdk {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($AndroidSdk)) { $candidates.Add($AndroidSdk) }
+    if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_HOME)) { $candidates.Add($env:ANDROID_HOME) }
+    if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_SDK_ROOT)) { $candidates.Add($env:ANDROID_SDK_ROOT) }
+    $candidates.Add((Join-Path $env:LOCALAPPDATA "Android\Sdk"))
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $hasAdb = Test-Path -LiteralPath (Join-Path $candidate "platform-tools\adb.exe") -PathType Leaf
+        $hasManager = (Test-Path -LiteralPath (Join-Path $candidate "cmdline-tools\latest\bin\sdkmanager.bat") -PathType Leaf) -or
+            (Test-Path -LiteralPath (Join-Path $candidate "cmdline-tools\bin\sdkmanager.bat") -PathType Leaf)
+        if ($hasAdb -or $hasManager) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+
+    $sdkRoot = Join-Path ([IO.Path]::GetFullPath($WorkDir)) ".android-sdk"
+    New-Item -ItemType Directory -Path $sdkRoot -Force | Out-Null
+    Ensure-AndroidCommandLineTools -SdkRoot $sdkRoot | Out-Null
     return $sdkRoot
 }
 
@@ -228,17 +246,7 @@ function Ensure-SdkPackages {
 
     Write-Host "Missing Android SDK components:" -ForegroundColor Yellow
     $missing | ForEach-Object { Write-Host "  $($_.Package)" }
-    $sdkManagerCandidates = @(
-        (Join-Path $SdkRoot "cmdline-tools\latest\bin\sdkmanager.bat"),
-        (Join-Path $SdkRoot "cmdline-tools\bin\sdkmanager.bat")
-    )
-    $sdkManager = $sdkManagerCandidates | Where-Object {
-        Test-Path -LiteralPath $_ -PathType Leaf
-    } | Select-Object -First 1
-
-    if ($null -eq $sdkManager) {
-        throw "Install the listed components in Android Studio SDK Manager, including Android SDK Command-line Tools (latest), then rerun."
-    }
+    $sdkManager = Ensure-AndroidCommandLineTools -SdkRoot $SdkRoot
     if ($NonInteractive) {
         throw "Required Android SDK components are missing; automatic installation needs an interactive license confirmation."
     }
@@ -356,13 +364,16 @@ try {
     }
 
     Write-Step 3 "Obtaining the exact tested reVC source"
-    $revcDir = Join-Path $resolvedWork "reVC-base"
+    # A versioned public-base directory avoids reusing the private-fork checkout
+    # created by the short-lived older wizard.
+    $revcDir = Join-Path $resolvedWork "reVC-public-026cd10"
+    $safeRevcDir = $revcDir.Replace('\', '/')
     if (-not (Test-Path -LiteralPath $revcDir)) {
         Invoke-Checked -FilePath $gitExe -Arguments @(
             "clone", "--no-checkout", "-b", $revcBranch, $revcUrl, $revcDir
         ) -FailureMessage "reVC clone failed"
         Invoke-Checked -FilePath $gitExe -Arguments @(
-            "-C", $revcDir, "checkout", "--detach", $testedRevcCommit
+            "-c", "safe.directory=$safeRevcDir", "-C", $revcDir, "checkout", "--detach", $testedRevcCommit
         ) -FailureMessage "Could not select the tested reVC commit"
     } else {
         if (-not (Test-Path -LiteralPath (Join-Path $revcDir ".git"))) {
@@ -371,9 +382,9 @@ try {
         $savedErrorPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            $headOutput = & $gitExe -C $revcDir rev-parse HEAD 2>&1
+            $headOutput = & $gitExe -c "safe.directory=$safeRevcDir" -C $revcDir rev-parse HEAD 2>&1
             $headExit = $LASTEXITCODE
-            $dirtyOutput = & $gitExe -C $revcDir status --porcelain 2>&1
+            $dirtyOutput = & $gitExe -c "safe.directory=$safeRevcDir" -C $revcDir status --porcelain 2>&1
             $dirtyExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorPreference
