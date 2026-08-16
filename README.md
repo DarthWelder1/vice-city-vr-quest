@@ -1,5 +1,13 @@
 # Vice City VR for Meta Quest — source build kit
 
+> **NO APK IS PROVIDED. THIS IS A SOURCE-BUILD RELEASE.**
+>
+> On Windows, install the Android Studio SDK components listed below, connect
+> the Quest, then double-click **`BUILD_AND_INSTALL.bat`**. The wizard obtains
+> the exact reVC source, assembles the port, builds your personal APK, installs
+> it without clearing existing data, and can copy only the required folders
+> from your legally owned Vice City installation.
+
 This repository contains the original Quest/OpenXR port layer, Vulkan backend
 changes, build scripts and reVC patch files needed to build Vice City VR for a
 Meta Quest headset.
@@ -25,17 +33,25 @@ hand asset under `overlay/gamefiles/models/vrhands/`.
 
 ## Required external source
 
-Obtain the reVC `miami` branch yourself from:
+The exact patch base is obtained separately from the public development fork:
 
-<https://github.com/mrxenginner/reVC>
+<https://github.com/dubrovskiy-yevhen-stakelogic/re3-miami-vr>
 
 The tested base is commit
 `06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87`. The assembly scripts never modify
 that checkout: they copy it to a new directory, apply this project's patches,
 and add the Quest-only files.
 
+The upstream reVC project is <https://github.com/mrxenginner/reVC>. Its current
+`miami` history does not contain the exact tested patch-base commit, so do not
+substitute an arbitrary upstream revision when using the manual build path.
+
 Complete prerequisites and copy-paste commands are in
 [BUILDING.md](BUILDING.md).
+
+For most Windows users, the recommended route is the guided
+[`BUILD_AND_INSTALL.bat`](BUILD_AND_INSTALL.bat) wizard instead of entering
+those commands manually.
 
 The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
 
