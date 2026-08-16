@@ -8,17 +8,31 @@ The Quest port supports the same category-based model overlay shell as PC:
 - Peds
 - Weapons
 
-Classic vegetation is the default and recommended choice. HD palm/tree models
+Classic vegetation is mandatory in the tested Quest build. HD palm/tree models
 can be dramatically more expensive on a mobile GPU even when draw-call counts
-look modest.
+look modest, so the one-button builder does not download or use the separate
+vegetation pack.
 
-## Prepare the overlay on PC
+## One-button download, build and installation
 
-Use the public PC Modern model-set builder:
+The player needs only:
 
-<https://github.com/dubrovskiy-yevhen-stakelogic/vice-city-vr/blob/main/MODERN_MODELS.md>
+- a legal original GTA Vice City PC installation;
+- the Quest connected by USB with the computer authorized;
+- the APK already installed by `BUILD_AND_INSTALL.bat`;
+- about 4 GB of download bandwidth and at least 24 GB of temporary free space.
 
-It must produce at least:
+Double-click `INSTALL_MODERN_MODELS.bat` and choose the original GTA Vice City
+folder. The wizard downloads and pins the exact tested
+[GTA VC HD + Weapons](https://drive.google.com/file/d/1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj/view)
+and [Mods / Atmosphere](https://drive.google.com/file/d/1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d/view)
+archives. It then extracts, builds, validates and installs the overlay without
+requiring 7-Zip, Git, Android Studio or any manual ADB command. Downloads are
+cached under `C:\VCVRBuild\modern-assets` and resume after interruption.
+
+No third-party assets are stored in this source kit. The generated directory
+contains original game and external mod data and must not be redistributed.
+The completed overlay contains at least:
 
 ```text
 modelsets/modern/models/gta3.img
@@ -26,27 +40,30 @@ modelsets/modern/models/gta3.dir
 modelsets/modern/vegetation_models.txt
 ```
 
-Do not redistribute the generated directory: it contains data derived from the
-player's original game and external model packs.
+The LibertyCity/HD vegetation archive is not part of this workflow. The small
+`vegetation_models.txt` file contains only names used by the runtime to select
+the original Classic palm/tree entries. Matching Modern vegetation DFF entries
+are physically removed from the generated archive as an additional fallback.
 
-## Copy to Quest
-
-Close the game, create the destination directories, then copy the complete
-generated `modern` folder below:
+The wizard installs the complete folder at:
 
 ```text
 /sdcard/Android/data/com.miamivr.quest/files/gamedata/modelsets/modern
 ```
 
-The normal Windows route is simply:
+The installer stages and verifies the complete folder before replacing any
+previous Modern overlay. Wait for `DOWNLOAD, BUILD AND QUEST INSTALL COMPLETED`,
+then fully restart the game.
 
-1. Connect and authorize the Quest.
-2. Double-click `INSTALL_MODERN_MODELS.bat` in the source kit.
-3. Select the generated `modern` folder.
-4. Wait for `MODERN MODELS INSTALLED`, then fully restart the game.
+## Advanced manual transfer
 
-The installer validates and stages the complete folder before replacing any
-previous Modern overlay. The commands below are the manual fallback.
+If an overlay was already generated, it can be uploaded without rebuilding:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\install-modern-models.ps1 -ModernDir "C:\path\to\modern"
+```
+
+The commands below are a lower-level fallback.
 
 The Windows wizard normally installs ADB under
 `C:\VCVRBuild\.android-sdk\platform-tools\adb.exe`. For example, in PowerShell:
@@ -68,7 +85,7 @@ The final device path must not contain `modern/modern`. Verify it with:
 
 In the headset open `VR MENU > MODEL ASSETS`. Category changes are startup
 choices: select the desired categories and fully restart the game. Keep
-Vegetation on Classic unless testing the performance cost intentionally.
+Vegetation on Classic.
 
 If the manifest is absent, the menu reports Vegetation as unavailable and the
 loader forces that category to Classic instead of guessing model names.

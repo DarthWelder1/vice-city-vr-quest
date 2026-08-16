@@ -96,27 +96,30 @@ is documented in [overlay/docs/QUEST_MODELSETS.md](overlay/docs/QUEST_MODELSETS.
 
 ## Install the optional Modern models after the APK
 
-The build wizard installs the game and Classic GTA VC data. It does **not**
-download or redistribute the optional third-party Modern model pack. Build the
-`modelsets\modern` folder on the PC first by following the public
-[Modern model builder guide](https://github.com/dubrovskiy-yevhen-stakelogic/vice-city-vr/blob/main/MODERN_MODELS.md).
+No APK rebuild is needed. Connect and authorize the Quest, then double-click
+**`INSTALL_MODERN_MODELS.bat`**. Select the folder containing a legal original
+GTA Vice City PC installation when asked. That is the only asset input the
+player must supply.
 
-The generated folder must contain at least:
+The wizard automatically downloads and verifies the two external packs used by
+the tested build, extracts them, builds the per-user `modelsets\modern` overlay,
+and installs it on the connected Quest. Expect about 4 GB of downloads and keep
+at least 24 GB free for downloads, extraction and the staged build. Interrupted
+downloads are retained and resumed. These are the exact external inputs:
 
-```text
-modern/
-  vegetation_models.txt
-  models/
-    gta3.img
-    gta3.dir
-```
+- [GTA VC HD + Weapons](https://drive.google.com/file/d/1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj/view)
+- [Mods / Atmosphere](https://drive.google.com/file/d/1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d/view)
 
-No APK rebuild or reinstall is needed. Connect and authorize the Quest, then
-double-click **`INSTALL_MODERN_MODELS.bat`** and select the generated `modern`
-folder. The installer finds the ADB installed by the main wizard, validates the
-three required files, stops the game, uploads through a temporary directory,
-and activates the new folder only after the complete copy is verified. The
-previous Modern folder is not replaced by a partial transfer.
+The HD vegetation/LibertyCity pack is deliberately **not** downloaded or used.
+The builder also removes matching palm/tree geometry found in the HD base and
+generates a manifest that routes those models to the original Classic assets.
+No original game data or third-party pack is bundled in this repository, and
+the generated overlay must not be redistributed.
+
+Before replacing an existing overlay, the installer validates the complete
+build, uploads it through a temporary directory, and verifies the required
+files on the headset. A failed download, build or transfer does not silently
+replace a working Modern folder.
 
 The following manual PowerShell method remains available for troubleshooting.
 Change `$modern` to the actual generated folder on the PC. The `$adb` path is
@@ -135,13 +138,15 @@ $modern = "C:\Games\Vice City VR\modelsets\modern"
 & $adb shell ls /sdcard/Android/data/com.miamivr.quest/files/gamedata/modelsets/modern/vegetation_models.txt
 ```
 
+For troubleshooting, an already generated folder can still be transferred by
+running `tools\install-modern-models.ps1 -ModernDir "C:\path\to\modern"`.
 The final Quest path must be exactly
 `gamedata/modelsets/modern`, never `modern/modern`. Fully restart the game after
 copying. The default/recommended Quest mix is Modern world textures and
 weapons, with Classic vehicles, pedestrians and vegetation. Other categories
 can be changed under `VR MENU > MODEL ASSETS`; every change requires a full
 process restart. Modern vehicles are GPU-heavy, particularly with high traffic,
-and Modern vegetation should remain Classic unless testing intentionally.
+and vegetation is intentionally kept Classic.
 
 ## Distribution boundary
 

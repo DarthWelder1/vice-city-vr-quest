@@ -195,9 +195,12 @@ The final directory must directly contain `BigHandLeft.uxrh`,
 `vrhands/vrhands` directory.
 
 Optional third-party Modern models are installed separately after the APK and
-base game data. Double-click `INSTALL_MODERN_MODELS.bat` and select the locally
-generated `modern` folder; no APK rebuild is required. See the manual fallback
-and copy-paste Quest transfer instructions in
+base game data. Connect and authorize the Quest, then double-click
+`INSTALL_MODERN_MODELS.bat` and select the legal original GTA Vice City PC
+folder. The one-button wizard downloads and verifies the two tested external
+packs, builds the personal overlay, and installs it; no APK rebuild is required.
+The vegetation pack is not used and palms remain Classic. See the exact inputs,
+space requirements and manual fallback in
 [README.md](README.md#install-the-optional-modern-models-after-the-apk) and the
 detailed category notes in
 [overlay/docs/QUEST_MODELSETS.md](overlay/docs/QUEST_MODELSETS.md). No Modern

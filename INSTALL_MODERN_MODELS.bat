@@ -1,14 +1,14 @@
 @echo off
 setlocal
-title Vice City VR - Install Modern Models
+title Vice City VR - Download Build and Install Modern Models
 cd /d "%~dp0"
 
 echo ================================================================
-echo  VICE CITY VR - INSTALL OPTIONAL MODERN MODELS ON QUEST
+echo  VICE CITY VR - DOWNLOAD, BUILD AND INSTALL MODERN MODELS
 echo ================================================================
 echo.
 
-set "INSTALLER=%~dp0tools\install-modern-models.ps1"
+set "INSTALLER=%~dp0tools\prepare-modern-models.ps1"
 if not exist "%INSTALLER%" (
     echo ERROR: Required file is missing:
     echo   %INSTALLER%

@@ -5,6 +5,7 @@
 *.aar
 *.so
 *.exe
+!tools/modelsets/txdcompress.exe
 *.dll
 *.lib
 *.obj
