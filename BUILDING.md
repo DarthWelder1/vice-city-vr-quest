@@ -19,12 +19,18 @@ the window open and always prints the location of the persistent diagnostic
 log: `%TEMP%\ViceCityVR-Build-And-Install.log`. If the build fails, attach that
 file instead of sending a video of a closing console window.
 
-The wizard downloads and verifies Gradle, obtains the exact tested reVC
-commit, assembles the private tree, builds a personal debug APK, installs it
-with `adb install -r`, bootstraps application-owned storage, and asks for the
-legally owned Vice City folder when game data must be copied. It never
-uninstalls the app, clears its data, uploads anything, or bundles an APK/GTA
-data into this repository.
+The wizard downloads and SHA256-verifies a pinned official Eclipse Temurin JDK
+21 when Android Studio does not expose a suitable Java runtime. It likewise
+downloads and verifies Gradle, obtains the exact tested reVC commit, assembles
+the private tree, builds a personal debug APK, installs it with
+`adb install -r`, bootstraps application-owned storage, and asks for the legally
+owned Vice City folder when game data must be copied. It never uninstalls the
+app, clears its data, uploads anything, or bundles an APK/GTA data into this
+repository.
+
+If somebody downloaded only `BUILD_AND_INSTALL.bat`, the BAT downloads and
+extracts the complete public source kit automatically before starting the
+wizard. Extracting the repository ZIP manually is still supported.
 
 Advanced command-line example:
 

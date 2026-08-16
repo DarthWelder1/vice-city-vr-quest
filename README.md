@@ -7,6 +7,11 @@
 > the exact reVC source, assembles the port, builds your personal APK, installs
 > it without clearing existing data, and can copy only the required folders
 > from your legally owned Vice City installation.
+> Missing JDK 21 and Gradle distributions are downloaded from their official
+> sources and verified against pinned SHA256 hashes automatically.
+> You may also download only **`BUILD_AND_INSTALL.bat`**. If the rest of the
+> source kit is not beside it, the BAT downloads and extracts the complete
+> public repository automatically.
 >
 > Run the `.bat`, not the internal PowerShell file. The window remains open on
 > errors and writes `%TEMP%\ViceCityVR-Build-And-Install.log`; send that log

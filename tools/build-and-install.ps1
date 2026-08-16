@@ -19,6 +19,9 @@ $ProgressPreference = "SilentlyContinue"
 
 $testedRevcCommit = "06d3ca5a7cce0021b84e6b7e1320a4f4e0ad3c87"
 $revcUrl = "https://github.com/dubrovskiy-yevhen-stakelogic/re3-miami-vr.git"
+$jdkVersion = "21.0.11+10"
+$jdkUrl = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_x64_windows_hotspot_21.0.11_10.zip"
+$jdkSha256 = "D3625E7CADF23787EA540229544B6E2AB494B3B54DA1801879E583E1DFEE0A64"
 $gradleVersion = "8.13"
 $gradleUrl = "https://services.gradle.org/distributions/gradle-$gradleVersion-bin.zip"
 $gradleSha256 = "20F1B1176237254A6FC204D8434196FA11A4CFB387567519C61556E8710AED78"
@@ -90,11 +93,33 @@ function Find-JavaHome {
             return (Resolve-Path -LiteralPath $candidate).Path
         }
     }
-    throw @"
-JDK 21 was not found. Install Android Studio, or install JDK 21, then rerun.
-If JDK 21 is in a custom location, use:
-  .\BUILD_AND_INSTALL.bat -JavaHome "C:\path\to\jdk-21"
-"@
+
+    # Android Studio installations do not always expose their bundled JBR in
+    # a standard location. Keep the one-click path deterministic by fetching a
+    # pinned official Eclipse Temurin JDK when no suitable local Java exists.
+    $javaWorkRoot = [IO.Path]::GetFullPath($WorkDir)
+    $javaDownloads = Join-Path $javaWorkRoot ".downloads"
+    $javaTools = Join-Path $javaWorkRoot ".tools"
+    $javaZip = Join-Path $javaDownloads "OpenJDK21U-jdk_x64_windows_hotspot_21.0.11_10.zip"
+    $downloadedJavaHome = Join-Path $javaTools "jdk-$jdkVersion"
+    $downloadedJava = Join-Path $downloadedJavaHome "bin\java.exe"
+    New-Item -ItemType Directory -Path $javaDownloads,$javaTools -Force | Out-Null
+
+    if (-not (Test-Path -LiteralPath $downloadedJava -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $javaZip -PathType Leaf)) {
+            Write-Host "JDK 21 was not found; downloading official Eclipse Temurin $jdkVersion..." -ForegroundColor Yellow
+            Invoke-WebRequest -UseBasicParsing -Uri $jdkUrl -OutFile $javaZip
+        }
+        $observedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $javaZip).Hash
+        if ($observedHash -ne $jdkSha256) {
+            throw "Temurin JDK archive hash mismatch. Expected $jdkSha256, got $observedHash. Delete $javaZip and retry."
+        }
+        Expand-Archive -LiteralPath $javaZip -DestinationPath $javaTools -Force
+    }
+    if (-not (Test-Path -LiteralPath $downloadedJava -PathType Leaf)) {
+        throw "Temurin JDK extraction did not create $downloadedJava"
+    }
+    return $downloadedJavaHome
 }
 
 function Find-AndroidSdk {
@@ -283,9 +308,22 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $revcDir ".git"))) {
             throw "$revcDir exists but is not the wizard's reVC checkout. Choose another -WorkDir."
         }
-        $head = (& $gitCommand.Source -C $revcDir rev-parse HEAD).Trim()
-        $dirty = (& $gitCommand.Source -C $revcDir status --porcelain | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0 -or $head -ne $testedRevcCommit -or $dirty.Length -ne 0) {
+        $savedErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $headOutput = & $gitCommand.Source -C $revcDir rev-parse HEAD 2>&1
+            $headExit = $LASTEXITCODE
+            $dirtyOutput = & $gitCommand.Source -C $revcDir status --porcelain 2>&1
+            $dirtyExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorPreference
+        }
+        if ($headExit -ne 0 -or $dirtyExit -ne 0) {
+            throw "Could not verify the existing reVC checkout at $revcDir. Git said: $($headOutput | Out-String) $($dirtyOutput | Out-String)"
+        }
+        $head = ($headOutput | Out-String).Trim()
+        $dirty = ($dirtyOutput | Out-String).Trim()
+        if ($head -ne $testedRevcCommit -or $dirty.Length -ne 0) {
             throw "$revcDir is not a clean checkout of $testedRevcCommit. Preserve your work and choose another -WorkDir."
         }
         Invoke-Checked -FilePath $gitCommand.Source -Arguments @(
