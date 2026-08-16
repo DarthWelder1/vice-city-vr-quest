@@ -7,6 +7,10 @@
 > the exact reVC source, assembles the port, builds your personal APK, installs
 > it without clearing existing data, and can copy only the required folders
 > from your legally owned Vice City installation.
+>
+> Run the `.bat`, not the internal PowerShell file. The window remains open on
+> errors and writes `%TEMP%\ViceCityVR-Build-And-Install.log`; send that log
+> when asking for help.
 
 This repository contains the original Quest/OpenXR port layer, Vulkan backend
 changes, build scripts and reVC patch files needed to build Vice City VR for a

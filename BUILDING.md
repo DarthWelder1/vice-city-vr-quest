@@ -14,6 +14,11 @@ below produce a personal debug-signed APK on your own machine.
    inside the headset.
 5. Double-click **`BUILD_AND_INSTALL.bat`** in this repository.
 
+Do not launch `tools\build-and-install.ps1` directly. The `.bat` wrapper keeps
+the window open and always prints the location of the persistent diagnostic
+log: `%TEMP%\ViceCityVR-Build-And-Install.log`. If the build fails, attach that
+file instead of sending a video of a closing console window.
+
 The wizard downloads and verifies Gradle, obtains the exact tested reVC
 commit, assembles the private tree, builds a personal debug APK, installs it
 with `adb install -r`, bootstraps application-owned storage, and asks for the

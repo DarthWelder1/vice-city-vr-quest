@@ -8,6 +8,7 @@ param(
     [string]$AndroidSdk,
     [string]$JavaHome,
     [string]$Serial,
+    [string]$LogPath = (Join-Path $env:TEMP "ViceCityVR-Build-And-Install.log"),
     [switch]$BuildOnly,
     [switch]$SkipGameData,
     [switch]$NonInteractive
@@ -26,6 +27,24 @@ $cmakeVersion = "3.22.1"
 $remoteGameData = "/sdcard/Android/data/com.miamivr.quest/files/gamedata"
 $saveProviderUri = "content://com.miamivr.quest.saves/slot/1"
 $repoRoot = Split-Path $PSScriptRoot -Parent
+$script:transcriptStarted = $false
+
+try {
+    $logDirectory = Split-Path -Parent $LogPath
+    if (-not [string]::IsNullOrWhiteSpace($logDirectory)) {
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    }
+    Start-Transcript -Path $LogPath -Force | Out-Null
+    $script:transcriptStarted = $true
+} catch {
+    Write-Host "Warning: diagnostic logging could not start: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+function Stop-DiagnosticLog {
+    if (-not $script:transcriptStarted) { return }
+    try { Stop-Transcript | Out-Null } catch { }
+    $script:transcriptStarted = $false
+}
 
 function Write-Step {
     param([int]$Number, [string]$Text)
@@ -328,7 +347,9 @@ try {
 
     if ($BuildOnly) {
         Write-Host "Build-only mode complete." -ForegroundColor Green
-        exit 0
+        Write-Host "Diagnostic log: $LogPath"
+        Stop-DiagnosticLog
+        return
     }
 
     Write-Step 7 "Installing on the connected Quest without clearing data"
@@ -395,9 +416,13 @@ try {
     Write-Host "The app was left stopped. Put on the headset and launch Vice City VR."
     Write-Host "Build directory: $assembledDir"
     Write-Host "APK SHA256: $apkHash"
+    Write-Host "Diagnostic log: $LogPath"
+    Stop-DiagnosticLog
 } catch {
     Write-Host ""
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "No failure was treated as success. Fix the reported item and rerun."
+    Write-Host "Diagnostic log: $LogPath"
+    Stop-DiagnosticLog
     exit 1
 }
