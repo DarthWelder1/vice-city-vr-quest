@@ -4,6 +4,8 @@ This repository contains the original Quest/OpenXR port layer, Vulkan backend
 changes, build scripts and reVC patch files needed to build Vice City VR for a
 Meta Quest headset.
 
+Current source-kit version: **v0.5.1 alpha**.
+
 It intentionally contains **no APK, complete reVC source tree, original game
 files, saves, logs or third-party Modern model packs**. Every user builds their
 own APK and supplies data from a legally owned PC copy of GTA Vice City.

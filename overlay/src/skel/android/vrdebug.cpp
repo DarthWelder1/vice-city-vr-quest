@@ -2226,7 +2226,7 @@ DrawQuestAboutPage(void)
 {
 	BeginFullVrMenuPage(gVrWelcomeFirstRun ?
 		"WELCOME TO VICE CITY VR" : "ABOUT VICE CITY VR",
-		"VERSION 0.5.0 ALPHA - NOT FOR SALE");
+		"VERSION 0.5.1 ALPHA - NOT FOR SALE");
 	static const char *lines[] = {
 		"OPEN THE VR MENU: HOLD BOTH GRIPS + MENU",
 		"CHEATS: HOLD BOTH GRIPS + B",

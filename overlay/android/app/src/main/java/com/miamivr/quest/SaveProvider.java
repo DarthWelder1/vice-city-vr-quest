@@ -25,6 +25,25 @@ import java.io.FileNotFoundException;
 public final class SaveProvider extends ContentProvider {
     private static final int ROOT_UID = 0;
     private static final int SHELL_UID = 2000;
+    private static final String[] GAME_DATA_DIRECTORIES = {
+            "data", "TEXT", "anim", "txd", "skins", "mp3", "movies",
+            "models", "Audio", "data/maps", "data/maps/airport",
+            "data/maps/airportN", "data/maps/bank", "data/maps/bar",
+            "data/maps/bridge", "data/maps/cisland", "data/maps/club",
+            "data/maps/concerth", "data/maps/docks", "data/maps/downtown",
+            "data/maps/downtows", "data/maps/generic", "data/maps/golf",
+            "data/maps/haiti", "data/maps/haitiN", "data/maps/hotel",
+            "data/maps/islandsf", "data/maps/lawyers", "data/maps/littleha",
+            "data/maps/mall", "data/maps/mansion", "data/maps/nbeach",
+            "data/maps/nbeachbt", "data/maps/nbeachw", "data/maps/oceandn",
+            "data/maps/oceandrv", "data/maps/stadint", "data/maps/starisl",
+            "data/maps/stripclb", "data/maps/washintn",
+            "data/maps/washints", "data/maps/yacht", "data/paths",
+            "models/coll", "models/generic", "models/vrhands", "modelsets",
+            "modelsets/modern", "modelsets/modern/models",
+            "modelsets/modern/models/coll", "modelsets/modern/models/generic",
+            "modelsets/modern/txd"
+    };
 
     @Override
     public boolean onCreate() {
@@ -69,6 +88,17 @@ public final class SaveProvider extends ContentProvider {
         final File gameData = new File(externalRoot, "gamedata");
         if (!gameData.isDirectory() && !gameData.mkdirs()) {
             throw new FileNotFoundException("Cannot create the game-data directory");
+        }
+        // ADB's shell UID may write files into an existing app-specific
+        // directory, but current Horizon OS refuses to create its children.
+        // Bootstrap the documented retail-data layout as the app UID so a
+        // completely clean install can be populated with ordinary adb push.
+        for (String directory : GAME_DATA_DIRECTORIES) {
+            final File child = new File(gameData, directory);
+            if (!child.isDirectory() && !child.mkdirs()) {
+                throw new FileNotFoundException(
+                        "Cannot create game-data child " + directory);
+            }
         }
         return new File(gameData, slot + ".b");
     }

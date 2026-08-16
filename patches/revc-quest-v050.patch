@@ -258,7 +258,7 @@ index 0a1eeef..a187b88 100644
  		// atlas' reliable uppercase ASCII range so every language pack displays it.
 -		AsciiToUnicode("VICE CITY VR V0.4.0 ALPHA", releaseName);
 -		AsciiToUnicode("WORK IN PROGRESS", releaseStatus);
-+		AsciiToUnicode("VICE CITY VR V0.5.0 ALPHA", releaseName);
++		AsciiToUnicode("VICE CITY VR V0.5.1 ALPHA", releaseName);
 +		AsciiToUnicode("NOT FOR SALE", releaseStatus);
  		AsciiToUnicode("", releaseCredit);
  

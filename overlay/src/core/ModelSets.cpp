@@ -230,7 +230,6 @@ void InitializeStartup(const char *gameRoot)
 	if(requested == MODEL_SET_MODERN && !gModernArchivePairAvailable){
 		debug("Model set: requested Modern overlay is incomplete; using base install\n");
 		requested = MODEL_SET_CLASSIC;
-		WritePrivateProfileStringA("VR", "ModelSet", "0", gSettingsPath);
 	}
 	gRequestedModelSet = (eModelSet)requested;
 	gActiveModelSet = gRequestedModelSet;

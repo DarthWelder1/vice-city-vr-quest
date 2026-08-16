@@ -34,12 +34,18 @@ safest setup.
 
 ## Copy data with adb
 
-Create the destination first:
+For a completely fresh installation, install the APK and invoke its narrow save
+provider **before** using `adb push`:
 
 ```sh
-adb shell mkdir -p /sdcard/Android/data/com.miamivr.quest/files/gamedata
-adb shell mkdir -p /sdcard/Android/data/com.miamivr.quest/files/userfiles
+adb shell content query --uri content://com.miamivr.quest.saves/slot/1 --projection _display_name:_size
 ```
+
+The expected result is a zero-byte `GTAVCsf1.b` row. This creates
+`files/gamedata` and the standard retail-data children as the application UID.
+Never create `/sdcard/Android/data/com.miamivr.quest/files` yourself before
+this bootstrap, because current Horizon OS can assign it to the shell UID and
+the game will be unable to enter its own data directory.
 
 Scoped storage can refuse to create deep children during `adb push`. If that
 happens, create the required tree with `adb shell mkdir -p` first. Push each

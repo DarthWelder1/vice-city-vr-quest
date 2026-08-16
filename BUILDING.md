@@ -101,6 +101,20 @@ adb install -r C:\src\vice-city-vr-build\android\app\build\outputs\apk\debug\app
 `-r` updates the application in place and preserves its settings and saves.
 Do not uninstall or clear application data when you want to retain them.
 
+On a completely fresh install, bootstrap the external-data layout through the
+APK's narrow save provider before copying any files:
+
+```powershell
+adb shell content query --uri content://com.miamivr.quest.saves/slot/1 `
+  --projection _display_name:_size
+```
+
+The expected result is a zero-byte `GTAVCsf1.b` row. This creates the root and
+the documented retail-data child directories as the application UID. Do
+**not** pre-create `/sdcard/Android/data/com.miamivr.quest/files` with
+`adb shell mkdir -p`: on current Horizon OS that can leave it owned by the ADB
+shell and the game immediately exits with `cannot enter game data directory`.
+
 ## 6. Supply your own game data
 
 The APK contains no GTA Vice City data. Copy the required directories from
@@ -117,10 +131,11 @@ The expected top-level data includes `data`, `TEXT`, `anim`, `txd`, `skins`,
 /sdcard/Android/data/com.miamivr.quest/files/userfiles/
 ```
 
-Android scoped storage may reject a recursive `adb push` if child directories
-do not exist. Create them first with `adb shell mkdir -p`, then push each
-top-level folder into `gamedata`, not into another folder of the same name.
-Detailed examples are in [overlay/docs/QUEST_PORT.md](overlay/docs/QUEST_PORT.md).
+After the provider bootstrap has created the application-owned root, Android
+scoped storage may still require individual child directories. At that point
+they may be created with `adb shell mkdir -p`. Push each top-level folder into
+`gamedata`, not into another folder of the same name. Detailed examples are in
+[overlay/docs/QUEST_PORT.md](overlay/docs/QUEST_PORT.md).
 
 The VR hand meshes are original MIT-licensed port assets, not GTA data and not
 part of the APK. Copy them once from the assembled tree:
