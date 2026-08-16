@@ -10,6 +10,10 @@
 > Missing build tools and SDK packages are downloaded from their official
 > sources and verified against pinned SHA256 hashes automatically. Google SDK
 > licenses are still shown for the user to accept.
+> If an older installation has an incompatible signing key, the wizard warns
+> that replacing it can erase saves/game data and uninstalls it only after an
+> explicit `Y` confirmation. It validates the supplied Vice City PC folder
+> before removal so the required game data can be restored afterward.
 > You may also download only **`BUILD_AND_INSTALL.bat`**. If the rest of the
 > source kit is not beside it, the BAT downloads and extracts the complete
 > public repository automatically.

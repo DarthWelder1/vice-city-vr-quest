@@ -26,8 +26,12 @@ required SDK packages, obtains the exact tested public reVC commit, assembles
 the private tree, builds a personal debug APK, installs it with
 `adb install -r`, bootstraps application-owned storage, and asks for the legally
 owned Vice City folder when game data must be copied. It never uninstalls the
-app, clears its data, uploads anything, or bundles an APK/GTA data into this
-repository.
+app or clears its data silently. If Android reports that an older installation
+was signed with a different key, the wizard explains that replacement can erase
+saves and game data and asks for explicit confirmation before uninstalling it.
+It validates the supplied Vice City PC folder before deleting the old app and
+then restores the required game data after installing the new build.
+It never uploads anything or bundles an APK/GTA data into this repository.
 
 If somebody downloaded only `BUILD_AND_INSTALL.bat`, the BAT downloads and
 extracts the complete public source kit automatically before starting the

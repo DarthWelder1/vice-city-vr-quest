@@ -38,6 +38,8 @@ $remoteGameData = "/sdcard/Android/data/com.miamivr.quest/files/gamedata"
 $saveProviderUri = "content://com.miamivr.quest.saves/slot/1"
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $script:transcriptStarted = $false
+$script:replacedIncompatibleInstall = $false
+$script:replacementGameDir = $null
 
 try {
     $logDirectory = Split-Path -Parent $LogPath
@@ -313,14 +315,21 @@ function Select-QuestDevice {
 }
 
 function Resolve-GameFolder {
-    param([string]$Requested)
+    param([string]$Requested, [switch]$Required)
     if ([string]::IsNullOrWhiteSpace($Requested)) {
         if ($NonInteractive) { throw "-GameDir is required unless -SkipGameData or -BuildOnly is used." }
         Write-Host ""
         Write-Host "Enter your legally owned GTA Vice City PC installation folder." -ForegroundColor Yellow
-        Write-Host "Press Enter to skip copying data if it is already installed on the Quest."
+        if ($Required) {
+            Write-Host "The previous app was removed, so its Quest data may have been erased. This folder is required to restore the game data." -ForegroundColor Yellow
+        } else {
+            Write-Host "Press Enter to skip copying data if it is already installed on the Quest."
+        }
         $Requested = Read-Host "Vice City folder"
-        if ([string]::IsNullOrWhiteSpace($Requested)) { return $null }
+        if ([string]::IsNullOrWhiteSpace($Requested)) {
+            if ($Required) { throw "A GTA Vice City PC folder is required after replacing an incompatible installed app." }
+            return $null
+        }
     }
     if (-not (Test-Path -LiteralPath $Requested -PathType Container)) {
         throw "Vice City folder does not exist: $Requested"
@@ -458,11 +467,50 @@ try {
         return
     }
 
-    Write-Step 7 "Installing on the connected Quest without clearing data"
+    Write-Step 7 "Installing on the connected Quest"
     Select-QuestDevice
     Write-Host "Quest: $Serial"
-    Invoke-AdbChecked -Arguments @("install", "-r", $apk) `
-        -FailureMessage "APK installation failed"
+    $installArguments = Get-AdbArguments @("install", "-r", $apk)
+    $savedErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $installOutput = @(& $script:adb @installArguments 2>&1)
+        $installExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorPreference
+    }
+    $installOutput | ForEach-Object { Write-Host $_ }
+    if ($installExitCode -ne 0) {
+        $installText = $installOutput | Out-String
+        if ($installText -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
+            Write-Host ""
+            Write-Host "The Quest already contains Vice City VR signed with a different key." -ForegroundColor Yellow
+            Write-Host "Android cannot update it in place." -ForegroundColor Yellow
+            Write-Host "WARNING: uninstalling the old app can erase its saves and all GTA data stored under the app." -ForegroundColor Red
+            if ($NonInteractive) {
+                throw "Incompatible installed signature. Interactive confirmation is required before uninstalling com.miamivr.quest."
+            }
+            $replaceAnswer = Read-Host "Uninstall the old Vice City VR and install this build now? [y/N]"
+            if ($replaceAnswer -notmatch '^[Yy]') {
+                throw "The old app was left untouched. Back up anything you need, then rerun and approve replacement."
+            }
+            if ($SkipGameData) {
+                throw "The old app was left untouched. Rerun without -SkipGameData and provide the GTA Vice City PC folder so erased game data can be restored after replacement."
+            }
+            # Validate the replacement data source before performing the
+            # destructive uninstall. An empty/invalid answer leaves the old
+            # application and all of its data untouched.
+            $script:replacementGameDir = Resolve-GameFolder -Requested $GameDir -Required
+            Invoke-AdbChecked -Arguments @("uninstall", "com.miamivr.quest") `
+                -FailureMessage "Could not uninstall the incompatible Vice City VR package"
+            Invoke-AdbChecked -Arguments @("install", $apk) `
+                -FailureMessage "APK installation after removing the incompatible package failed"
+            $script:replacedIncompatibleInstall = $true
+            Write-Host "The incompatible app was removed and the new APK was installed." -ForegroundColor Green
+        } else {
+            throw "APK installation failed (exit code $installExitCode)."
+        }
+    }
     $providerArguments = Get-AdbArguments @(
         "shell", "content", "query", "--uri", $saveProviderUri,
         "--projection", "_display_name:_size"
@@ -475,7 +523,11 @@ try {
 
     Write-Step 8 "Copying the user's game data and bundled VR hands"
     if (-not $SkipGameData) {
-        $resolvedGame = Resolve-GameFolder -Requested $GameDir
+        if ($script:replacedIncompatibleInstall) {
+            $resolvedGame = $script:replacementGameDir
+        } else {
+            $resolvedGame = Resolve-GameFolder -Requested $GameDir
+        }
         if ($null -ne $resolvedGame) {
             $required = @("data", "TEXT", "anim", "txd", "skins", "mp3", "movies", "models", "Audio")
             $resolvedFolders = @{}
