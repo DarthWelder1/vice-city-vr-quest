@@ -194,6 +194,15 @@ The final directory must directly contain `BigHandLeft.uxrh`,
 `BigHandRight.uxrh` and `BigHandsAlbedo.png`; avoid a nested
 `vrhands/vrhands` directory.
 
+Optional third-party Modern models are installed separately after the APK and
+base game data. Double-click `INSTALL_MODERN_MODELS.bat` and select the locally
+generated `modern` folder; no APK rebuild is required. See the manual fallback
+and copy-paste Quest transfer instructions in
+[README.md](README.md#install-the-optional-modern-models-after-the-apk) and the
+detailed category notes in
+[overlay/docs/QUEST_MODELSETS.md](overlay/docs/QUEST_MODELSETS.md). No Modern
+assets are included in this repository.
+
 ## Troubleshooting
 
 - `patch does not apply`: reset reVC to the exact tested commit and update its

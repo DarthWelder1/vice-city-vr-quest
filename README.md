@@ -94,6 +94,55 @@ Runtime/data layout is documented in
 [overlay/docs/QUEST_PORT.md](overlay/docs/QUEST_PORT.md). Optional model mixing
 is documented in [overlay/docs/QUEST_MODELSETS.md](overlay/docs/QUEST_MODELSETS.md).
 
+## Install the optional Modern models after the APK
+
+The build wizard installs the game and Classic GTA VC data. It does **not**
+download or redistribute the optional third-party Modern model pack. Build the
+`modelsets\modern` folder on the PC first by following the public
+[Modern model builder guide](https://github.com/dubrovskiy-yevhen-stakelogic/vice-city-vr/blob/main/MODERN_MODELS.md).
+
+The generated folder must contain at least:
+
+```text
+modern/
+  vegetation_models.txt
+  models/
+    gta3.img
+    gta3.dir
+```
+
+No APK rebuild or reinstall is needed. Connect and authorize the Quest, then
+double-click **`INSTALL_MODERN_MODELS.bat`** and select the generated `modern`
+folder. The installer finds the ADB installed by the main wizard, validates the
+three required files, stops the game, uploads through a temporary directory,
+and activates the new folder only after the complete copy is verified. The
+previous Modern folder is not replaced by a partial transfer.
+
+The following manual PowerShell method remains available for troubleshooting.
+Change `$modern` to the actual generated folder on the PC. The `$adb` path is
+the default created by `BUILD_AND_INSTALL.bat`; use the matching path if
+`-WorkDir` was changed.
+
+```powershell
+$adb = "C:\VCVRBuild\.android-sdk\platform-tools\adb.exe"
+$modern = "C:\Games\Vice City VR\modelsets\modern"
+
+& $adb devices
+& $adb shell am force-stop com.miamivr.quest
+& $adb shell mkdir -p /sdcard/Android/data/com.miamivr.quest/files/gamedata/modelsets
+& $adb push $modern /sdcard/Android/data/com.miamivr.quest/files/gamedata/modelsets
+& $adb shell ls /sdcard/Android/data/com.miamivr.quest/files/gamedata/modelsets/modern/models
+& $adb shell ls /sdcard/Android/data/com.miamivr.quest/files/gamedata/modelsets/modern/vegetation_models.txt
+```
+
+The final Quest path must be exactly
+`gamedata/modelsets/modern`, never `modern/modern`. Fully restart the game after
+copying. The default/recommended Quest mix is Modern world textures and
+weapons, with Classic vehicles, pedestrians and vegetation. Other categories
+can be changed under `VR MENU > MODEL ASSETS`; every change requires a full
+process restart. Modern vehicles are GPU-heavy, particularly with high traffic,
+and Modern vegetation should remain Classic unless testing intentionally.
+
 ## Distribution boundary
 
 Do not upload assembled source trees, APKs, original game files, saves, built
