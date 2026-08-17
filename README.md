@@ -105,7 +105,10 @@ The wizard automatically downloads and verifies the two external packs used by
 the tested build, extracts them, builds the per-user `modelsets\modern` overlay,
 and installs it on the connected Quest. Expect about 4 GB of downloads and keep
 at least 24 GB free for downloads, extraction and the staged build. Interrupted
-downloads are retained and resumed. These are the exact external inputs:
+downloads are retained and resumed. If installation fails after the local build
+finishes, run the same BAT again: it detects the completed overlay and retries
+only the Quest transfer. Verified downloads and extractions are also reused
+instead of being downloaded again. These are the exact external inputs:
 
 - [GTA VC HD + Weapons](https://drive.google.com/file/d/1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj/view)
 - [Mods / Atmosphere](https://drive.google.com/file/d/1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d/view)

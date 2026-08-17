@@ -18,6 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$wizardVersion = "0.5.1-models-2"
 $hdUrl = "https://drive.usercontent.google.com/download?id=1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj&export=download&confirm=t"
 $modsUrl = "https://drive.usercontent.google.com/download?id=1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d&export=download&confirm=t"
 $hdSize = 1878280127L
@@ -197,8 +198,43 @@ function Ensure-Extracted {
     return $Destination
 }
 
+function Get-ExpectedBuilderVersion {
+    $builderText = Get-Content -LiteralPath $builder -Raw
+    if ($builderText -notmatch '\$BuildScriptVersion\s*=\s*"([^"]+)"') {
+        throw "Could not read the bundled Modern builder version from: $builder"
+    }
+    return $Matches[1]
+}
+
+function Test-CompletedOverlay {
+    param([string]$Path, [string]$ExpectedBuilderVersion)
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $false
+    }
+    foreach ($relative in @(
+        "vegetation_models.txt", "BUILD_INFO.txt",
+        "models\gta3.img", "models\gta3.dir"
+    )) {
+        $candidate = Join-Path $Path $relative
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or
+            (Get-Item -LiteralPath $candidate).Length -le 0) {
+            return $false
+        }
+    }
+    $img = Get-Item -LiteralPath (Join-Path $Path "models\gta3.img")
+    $dir = Get-Item -LiteralPath (Join-Path $Path "models\gta3.dir")
+    if ($img.Length -lt 1GB -or $dir.Length -lt 32 -or
+        ($dir.Length % 32) -ne 0) {
+        return $false
+    }
+    $buildInfo = Get-Content -LiteralPath (Join-Path $Path "BUILD_INFO.txt") -Raw
+    return $buildInfo -match "(?m)^BuilderVersion=$([regex]::Escape($ExpectedBuilderVersion))\s*$" -and
+        $buildInfo -match "(?m)^ModernVegetationGeometry=REMOVED\s*$"
+}
+
 try {
-    Write-Host "Vice City VR - download, build and install Modern models" -ForegroundColor Green
+    Write-Host "Vice City VR - download, build and install Modern models ($wizardVersion)" -ForegroundColor Green
     Write-Host "Required input: only a legal original GTA Vice City PC installation."
     Write-Host "The wizard downloads two external packs used by the tested build; no pack is bundled or redistributed by this repository."
     Write-Host "Modern vegetation/palms are deliberately excluded and remain Classic on Quest."
@@ -215,48 +251,59 @@ try {
         $OutputDir = Join-Path $game "modelsets\modern"
     }
     $output = [IO.Path]::GetFullPath($OutputDir)
-    Assert-FreeSpace -Game $game -Work $work
+    $expectedBuilderVersion = Get-ExpectedBuilderVersion
+    $reuseCompletedOverlay = Test-CompletedOverlay -Path $output `
+        -ExpectedBuilderVersion $expectedBuilderVersion
+    if ($reuseCompletedOverlay) {
+        Write-Host "Reusing completed verified Modern overlay: $output" -ForegroundColor Green
+        Write-Host "Downloads, extraction and rebuilding are not needed on this run."
+    } else {
+        if (Test-Path -LiteralPath $output) {
+            Write-Host "Existing Modern output is incomplete or from an older builder; rebuilding it safely." -ForegroundColor Yellow
+        }
+        Assert-FreeSpace -Game $game -Work $work
 
-    if (-not $AcceptDownloads -and
-        ([string]::IsNullOrWhiteSpace($HdArchive) -or [string]::IsNullOrWhiteSpace($ModsArchive))) {
-        if ($NonInteractive) {
-            throw "-AcceptDownloads is required in non-interactive mode when local verified archives are not supplied."
+        if (-not $AcceptDownloads -and
+            ([string]::IsNullOrWhiteSpace($HdArchive) -or [string]::IsNullOrWhiteSpace($ModsArchive))) {
+            if ($NonInteractive) {
+                throw "-AcceptDownloads is required in non-interactive mode when local verified archives are not supplied."
+            }
+            Write-Host ""
+            Write-Host "About 4.0 GB will be downloaded from the two external links supplied for this project." -ForegroundColor Yellow
+            Write-Host "The extracted/build workspace can temporarily use about 20-24 GB." -ForegroundColor Yellow
+            $answer = Read-Host "Download, verify and build the Modern overlay now? [Y/n]"
+            if (-not [string]::IsNullOrWhiteSpace($answer) -and $answer -notmatch '^[Yy]') {
+                throw "Modern model download was cancelled; nothing was changed on the Quest."
+            }
         }
-        Write-Host ""
-        Write-Host "About 4.0 GB will be downloaded from the two external links supplied for this project." -ForegroundColor Yellow
-        Write-Host "The extracted/build workspace can temporarily use about 20-24 GB." -ForegroundColor Yellow
-        $answer = Read-Host "Download, verify and build the Modern overlay now? [Y/n]"
-        if (-not [string]::IsNullOrWhiteSpace($answer) -and $answer -notmatch '^[Yy]') {
-            throw "Modern model download was cancelled; nothing was changed on the Quest."
-        }
+
+        $downloads = Join-Path $work "downloads"
+        $sources = Join-Path $work "sources"
+        New-Item -ItemType Directory -Path $downloads,$sources -Force | Out-Null
+        $hdZip = Ensure-Download -Name "GTA VC HD + Weapons" -Url $hdUrl `
+            -Destination (Join-Path $downloads "GTA VC HD + Weapons.zip") `
+            -Size $hdSize -Sha256 $hdSha256 -Provided $HdArchive
+        $modsZip = Ensure-Download -Name "Mods / Atmosphere" -Url $modsUrl `
+            -Destination (Join-Path $downloads "Mods.zip") `
+            -Size $modsSize -Sha256 $modsSha256 -Provided $ModsArchive
+
+        $hdSource = Ensure-Extracted -Name "GTA VC HD + Weapons" -Archive $hdZip `
+            -Destination (Join-Path $sources "hd-pack") -Sha256 $hdSha256
+        $modsSource = Ensure-Extracted -Name "Mods / Atmosphere" -Archive $modsZip `
+            -Destination (Join-Path $sources "mods-pack") -Sha256 $modsSha256
+
+        Write-Host "Building the optimized Quest Modern overlay. This can take several minutes..." -ForegroundColor Cyan
+        $builderArguments = @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $builder,
+            "-GameDir", $game,
+            "-HdPack", $hdSource,
+            "-AtmospherePack", $modsSource,
+            "-Out", $output,
+            "-Force"
+        )
+        Invoke-NativeChecked -FilePath "powershell.exe" -Arguments $builderArguments `
+            -FailureMessage "Modern overlay build failed"
     }
-
-    $downloads = Join-Path $work "downloads"
-    $sources = Join-Path $work "sources"
-    New-Item -ItemType Directory -Path $downloads,$sources -Force | Out-Null
-    $hdZip = Ensure-Download -Name "GTA VC HD + Weapons" -Url $hdUrl `
-        -Destination (Join-Path $downloads "GTA VC HD + Weapons.zip") `
-        -Size $hdSize -Sha256 $hdSha256 -Provided $HdArchive
-    $modsZip = Ensure-Download -Name "Mods / Atmosphere" -Url $modsUrl `
-        -Destination (Join-Path $downloads "Mods.zip") `
-        -Size $modsSize -Sha256 $modsSha256 -Provided $ModsArchive
-
-    $hdSource = Ensure-Extracted -Name "GTA VC HD + Weapons" -Archive $hdZip `
-        -Destination (Join-Path $sources "hd-pack") -Sha256 $hdSha256
-    $modsSource = Ensure-Extracted -Name "Mods / Atmosphere" -Archive $modsZip `
-        -Destination (Join-Path $sources "mods-pack") -Sha256 $modsSha256
-
-    Write-Host "Building the optimized Quest Modern overlay. This can take several minutes..." -ForegroundColor Cyan
-    $builderArguments = @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $builder,
-        "-GameDir", $game,
-        "-HdPack", $hdSource,
-        "-AtmospherePack", $modsSource,
-        "-Out", $output,
-        "-Force"
-    )
-    Invoke-NativeChecked -FilePath "powershell.exe" -Arguments $builderArguments `
-        -FailureMessage "Modern overlay build failed"
 
     if ($BuildOnly) {
         Write-Host ""
@@ -291,7 +338,8 @@ try {
 } catch {
     Write-Host ""
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Existing verified downloads are kept for resume/reuse. No model pack is uploaded until the complete build succeeds."
+    Write-Host "Verified downloads, extractions and completed local builds are kept for reuse."
+    Write-Host "No model pack is uploaded until the complete build succeeds."
     Write-Host "Diagnostic log: $LogPath"
     Stop-DiagnosticLog
     exit 1

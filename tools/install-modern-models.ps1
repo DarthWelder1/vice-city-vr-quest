@@ -11,6 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$installerVersion = "0.5.1-models-2"
 $packageName = "com.miamivr.quest"
 $remoteModelSets = "/sdcard/Android/data/$packageName/files/gamedata/modelsets"
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -75,6 +76,11 @@ function Invoke-AdbChecked {
         throw "$FailureMessage (exit code $($result.ExitCode)). $details"
     }
     return $result
+}
+
+function Get-RelativeRemotePath {
+    param([string]$Root, [string]$Path)
+    return $Path.Substring($Root.Length).TrimStart([char[]]"\/").Replace("\", "/")
 }
 
 function Find-Adb {
@@ -190,7 +196,7 @@ function Select-QuestDevice {
 }
 
 try {
-    Write-Host "Vice City VR - Modern model installer" -ForegroundColor Green
+    Write-Host "Vice City VR - Modern model installer ($installerVersion)" -ForegroundColor Green
     Write-Host "This copies a model overlay generated locally by the player; it downloads no model assets."
 
     $modern = Resolve-ModernFolder -Requested $ModernDir
@@ -224,13 +230,33 @@ try {
     Invoke-AdbChecked -Arguments @("shell", "mkdir", "-p", $script:stagingRemote) `
         -FailureMessage "Could not create the temporary Modern directory" -Quiet | Out-Null
 
-    $items = @(Get-ChildItem -LiteralPath $modern -Force)
-    if ($items.Count -eq 0) { throw "The selected Modern folder is empty." }
-    Write-Host "Copying $($items.Count) top-level Modern items. This can take several minutes..." -ForegroundColor Cyan
-    foreach ($item in $items) {
-        Write-Host "  $($item.Name)"
-        Invoke-AdbChecked -Arguments @("push", $item.FullName, "$script:stagingRemote/") `
-            -FailureMessage "Failed while copying $($item.Name)" | Out-Null
+    $directories = @(Get-ChildItem -LiteralPath $modern -Directory -Recurse -Force |
+        Sort-Object { $_.FullName.Length })
+    foreach ($directory in $directories) {
+        $relative = Get-RelativeRemotePath -Root $modern -Path $directory.FullName
+        Invoke-AdbChecked -Arguments @("shell", "mkdir", "-p", "$script:stagingRemote/$relative") `
+            -FailureMessage "Could not create temporary Modern directory: $relative" -Quiet | Out-Null
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $modern -File -Recurse -Force)
+    if ($files.Count -eq 0) { throw "The selected Modern folder is empty." }
+    Write-Host "Copying $($files.Count) Modern files into pre-created app storage. This can take several minutes..." -ForegroundColor Cyan
+    $fileIndex = 0
+    foreach ($file in $files) {
+        $fileIndex++
+        $relative = Get-RelativeRemotePath -Root $modern -Path $file.FullName
+        $destinationRemote = "$script:stagingRemote/$relative"
+        Write-Host "  [$fileIndex/$($files.Count)] $relative"
+        Invoke-AdbChecked -Arguments @("push", $file.FullName, $destinationRemote) `
+            -FailureMessage "Failed while transferring $relative" | Out-Null
+        $sizeResult = Invoke-AdbChecked -Arguments @("shell", "stat", "-c", "%s", $destinationRemote) `
+            -FailureMessage "Could not verify copied size for $relative" -Quiet
+        $remoteSizeText = (($sizeResult.Lines | Out-String).Trim() -replace '[^0-9]', '')
+        $remoteSize = 0L
+        if (-not [long]::TryParse($remoteSizeText, [ref]$remoteSize) -or
+            $remoteSize -ne $file.Length) {
+            throw "Copied size mismatch for $relative (PC $($file.Length), Quest $remoteSizeText)."
+        }
     }
 
     foreach ($requiredRemote in @(

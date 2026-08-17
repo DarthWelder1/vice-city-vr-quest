@@ -28,7 +28,10 @@ folder. The wizard downloads and pins the exact tested
 and [Mods / Atmosphere](https://drive.google.com/file/d/1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d/view)
 archives. It then extracts, builds, validates and installs the overlay without
 requiring 7-Zip, Git, Android Studio or any manual ADB command. Downloads are
-cached under `C:\VCVRBuild\modern-assets` and resume after interruption.
+cached under `C:\VCVRBuild\modern-assets` and resume after interruption. A
+second run reuses verified downloads and extractions. If a complete overlay was
+already built, it skips downloading, extracting and rebuilding and retries only
+the Quest installation.
 
 No third-party assets are stored in this source kit. The generated directory
 contains original game and external mod data and must not be redistributed.
