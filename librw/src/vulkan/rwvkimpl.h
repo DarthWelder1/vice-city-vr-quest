@@ -247,6 +247,12 @@ struct Globals
 	float32 fpHeadWorld[3];
 	float32 fpAnchorYaw;
 	float32 fpLatchedHeadYaw;
+	// Play-space head position latched together with fpLatchedHeadYaw. The
+	// game anchor is placed on THIS position, never on the live one, so the
+	// difference between them -- leaning, ducking, stepping in the room --
+	// survives as positional (6DOF) tracking. Anchoring on the live position
+	// cancels exactly against the per-eye poses and leaves rotation only.
+	float32 fpLatchedHeadPos[3];
 	// Play-space +X/+Y/+Z expressed in game world space. Used while a
 	// vehicle is allowed to carry pitch/roll into the headset camera.
 	float32 fpPlayX[3];

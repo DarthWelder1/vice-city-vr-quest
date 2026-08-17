@@ -2135,10 +2135,16 @@ updateWorldToPlay(Camera *cam)
 		m[1]  = py[0]; m[5] = py[1]; m[9]  = py[2];
 		m[2]  = pz[0]; m[6] = pz[1]; m[10] = pz[2];
 		m[3]  = 0.0f;  m[7] = 0.0f;  m[11] = 0.0f;
+		// The anchor lands on the LATCHED head position; the per-eye poses
+		// carry the live one. Their difference is exactly the physical head
+		// movement, so leaning towards the dashboard or ducking behind cover
+		// moves the viewpoint in the world. Anchoring on the live position
+		// cancelled that out and made the build feel 3DOF.
 		const float32 *w = gvk.fpHeadWorld;
-		m[12] = -(px[0]*w[0] + px[1]*w[1] + px[2]*w[2]) + gvk.headPosition[0];
-		m[13] = -(py[0]*w[0] + py[1]*w[1] + py[2]*w[2]) + gvk.headPosition[1];
-		m[14] = -(pz[0]*w[0] + pz[1]*w[1] + pz[2]*w[2]) + gvk.headPosition[2];
+		const float32 *l = gvk.fpLatchedHeadPos;
+		m[12] = -(px[0]*w[0] + px[1]*w[1] + px[2]*w[2]) + l[0];
+		m[13] = -(py[0]*w[0] + py[1]*w[1] + py[2]*w[2]) + l[1];
+		m[14] = -(pz[0]*w[0] + pz[1]*w[1] + pz[2]*w[2]) + l[2];
 		m[15] = 1.0f;
 		return;
 	}
@@ -2208,6 +2214,26 @@ setHeadPose(const float32 position[3], float32 yaw, const float32 quat[4])
 	memcpy(gvk.headPosition, position, sizeof(gvk.headPosition));
 	gvk.headYaw = yaw;
 	memcpy(gvk.headQuat, quat, sizeof(gvk.headQuat));
+
+	if(!gvk.firstPersonActive){
+		// Outside first person the latch simply follows the head, so first
+		// person always starts from a current neutral pose no matter how the
+		// anchor updates and the pose updates interleave.
+		memcpy(gvk.fpLatchedHeadPos, gvk.headPosition,
+		       sizeof(gvk.fpLatchedHeadPos));
+		return;
+	}
+	// A system recenter (long Meta press), a Guardian rebuild or tracking
+	// loss moves the reference space under the game; the neutral pose would
+	// then stay wrong for the rest of the session. Room-scale movement never
+	// covers three metres between two frames, so re-anchor on such a jump
+	// instead of dragging the world along with it.
+	const float32 dx = gvk.headPosition[0] - gvk.fpLatchedHeadPos[0];
+	const float32 dy = gvk.headPosition[1] - gvk.fpLatchedHeadPos[1];
+	const float32 dz = gvk.headPosition[2] - gvk.fpLatchedHeadPos[2];
+	if(dx*dx + dy*dy + dz*dz > 9.0f)
+		memcpy(gvk.fpLatchedHeadPos, gvk.headPosition,
+		       sizeof(gvk.fpLatchedHeadPos));
 }
 
 bool32
@@ -2235,7 +2261,16 @@ getFirstPersonViewFrame(float32 rwRight[3], float32 rwUp[3],
 		rwUp[i]    =   px[i]*hu[0] + py[i]*hu[1] + pz[i]*hu[2];
 		rwAt[i]    =   px[i]*hf[0] + py[i]*hf[1] + pz[i]*hf[2];
 	}
-	memcpy(position, gvk.fpHeadWorld, 3*sizeof(float32));
+	// Where the eye actually is: the game anchor displaced by the physical
+	// offset from the latched head. Callers aim, trace and place tracked
+	// geometry from here, so it has to agree with the rendered viewpoint.
+	const float32 relative[3] = {
+		gvk.headPosition[0] - gvk.fpLatchedHeadPos[0],
+		gvk.headPosition[1] - gvk.fpLatchedHeadPos[1],
+		gvk.headPosition[2] - gvk.fpLatchedHeadPos[2] };
+	for(int i = 0; i < 3; i++)
+		position[i] = gvk.fpHeadWorld[i] +
+			px[i]*relative[0] + py[i]*relative[1] + pz[i]*relative[2];
 	return 1;
 }
 
@@ -2296,10 +2331,14 @@ playPoseToFirstPersonWorld(const float32 playPosition[3],
 
 	float32 px[3], py[3], pz[3];
 	getFirstPersonPlayBasis(px, py, pz);
+	// Relative to the LATCHED head, the origin updateWorldToPlay maps the
+	// game anchor onto. Measuring from the live head instead would drag eyes,
+	// hands and weapons along with every lean, leaving them where the
+	// rendered world no longer is.
 	const float32 relative[3] = {
-		playPosition[0] - gvk.headPosition[0],
-		playPosition[1] - gvk.headPosition[1],
-		playPosition[2] - gvk.headPosition[2] };
+		playPosition[0] - gvk.fpLatchedHeadPos[0],
+		playPosition[1] - gvk.fpLatchedHeadPos[1],
+		playPosition[2] - gvk.fpLatchedHeadPos[2] };
 
 	for(int i = 0; i < 3; i++){
 		worldRight[i] =
@@ -2465,6 +2504,10 @@ setFirstPersonAnchor(const float32 headWorld[3], float32 headingYaw,
 		// change makes entering a vehicle start looking down its nose.
 		gvk.fpLatchedHeadYaw = gvk.headYaw;
 		gvk.fpAnchorYaw = headingYaw - gvk.headYaw;
+		// The position latches with the yaw: standing where you stand
+		// becomes the neutral pose the world is built around.
+		memcpy(gvk.fpLatchedHeadPos, gvk.headPosition,
+		       sizeof(gvk.fpLatchedHeadPos));
 	}
 	gvk.firstPersonActive = active;
 	gvk.fpFollowHeading = followHeading;
@@ -2494,6 +2537,8 @@ setFirstPersonAnchorBasis(const float32 headWorld[3],
 	              !gvk.fpFollowHeading ||
 	              !gvk.fpUseFullBasis)){
 		gvk.fpLatchedHeadYaw = gvk.headYaw;
+		memcpy(gvk.fpLatchedHeadPos, gvk.headPosition,
+		       sizeof(gvk.fpLatchedHeadPos));
 	}
 	gvk.firstPersonActive = active;
 	gvk.fpFollowHeading = active;
