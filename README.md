@@ -121,8 +121,11 @@ the generated overlay must not be redistributed.
 
 Before replacing an existing overlay, the installer validates the complete
 build, uploads it through a temporary directory, and verifies the required
-files on the headset. A failed download, build or transfer does not silently
-replace a working Modern folder.
+files on the headset, including SHA256 checks for the loose wheel model and
+texture dictionary. If the bundled builder version changes, the BAT safely
+rebuilds the local overlay and atomically replaces the old Quest folder only
+after all checks pass. Cached downloads/extractions are reused. A failed
+download, build or transfer does not silently replace a working Modern folder.
 
 The following manual PowerShell method remains available for troubleshooting.
 Change `$modern` to the actual generated folder on the PC. The `$adb` path is

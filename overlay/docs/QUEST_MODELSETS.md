@@ -31,7 +31,9 @@ requiring 7-Zip, Git, Android Studio or any manual ADB command. Downloads are
 cached under `C:\VCVRBuild\modern-assets` and resume after interruption. A
 second run reuses verified downloads and extractions. If a complete overlay was
 already built, it skips downloading, extracting and rebuilding and retries only
-the Quest installation.
+the Quest installation. When the bundled builder is updated, an older overlay
+is rebuilt automatically; the old Quest folder is replaced only after the new
+copy and the wheel asset hashes have been verified.
 
 No third-party assets are stored in this source kit. The generated directory
 contains original game and external mod data and must not be redistributed.
@@ -40,6 +42,8 @@ The completed overlay contains at least:
 ```text
 modelsets/modern/models/gta3.img
 modelsets/modern/models/gta3.dir
+modelsets/modern/models/generic/wheels.dff
+modelsets/modern/models/generic/wheels.txd
 modelsets/modern/vegetation_models.txt
 ```
 

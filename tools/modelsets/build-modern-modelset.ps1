@@ -13,7 +13,7 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
-$BuildScriptVersion = "0.5.1-quest-2"
+$BuildScriptVersion = "0.5.1-quest-3"
 $MinimumFreeBytes = 12GB
 
 $SourceUrls = [ordered]@{
@@ -29,6 +29,7 @@ $TestedSignatures = @{
     "HD pack gta3.dir"             = "DD606380513BB63841D3DAD517BCFA2F54598DF7EE6084E0C941C18D78C30D01"
     "Atmosphere vehicles.col"      = "64233744C532423ECDCAEFF088696E76BCFA4758A70CADA2FD6EDDA258911DF9"
     "Atmosphere wheels.dff"        = "3FAB043194EB5016D3F96D14090831D1ABCDDCB4B3793B465D30A581643D22DA"
+    "Atmosphere wheels.txd"        = "23F5752BE920896E86DE3AE21CE00B9D301DBF04E321162373BD893915B488C5"
     "HD pack generic.txd"          = "66DF98073FDDC2840DABE486156830065227921C5622CF4E03FA9282AD810465"
 }
 
@@ -254,6 +255,7 @@ $sourceHashes = [ordered]@{
     "HD pack generic.txd"           = File-Sha256 $hdGeneric
     "Atmosphere vehicles.col"       = File-Sha256 $vehicleColl
     "Atmosphere wheels.dff"         = File-Sha256 (Join-Path $vehicleGeneric "wheels.dff")
+    "Atmosphere wheels.txd"         = File-Sha256 (Join-Path $vehicleGeneric "wheels.txd")
 }
 foreach ($name in $sourceHashes.Keys) {
     Write-Host ("    {0}: {1}" -f $name, $sourceHashes[$name])

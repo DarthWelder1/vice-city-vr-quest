@@ -1,5 +1,6 @@
 * text=auto
 # the patch must survive checkout byte-exact on every platform
 patches/*.patch -text
+patches/*.patch whitespace=-space-before-tab
 *.png -text
 *.uxrh -text

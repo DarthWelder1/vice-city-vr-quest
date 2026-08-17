@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$installerVersion = "0.5.1-models-2"
+$installerVersion = "0.5.1-models-3"
 $packageName = "com.miamivr.quest"
 $remoteModelSets = "/sdcard/Android/data/$packageName/files/gamedata/modelsets"
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -116,7 +116,9 @@ function Test-ModernFolder {
     $required = @(
         "vegetation_models.txt",
         "models\gta3.img",
-        "models\gta3.dir"
+        "models\gta3.dir",
+        "models\generic\wheels.dff",
+        "models\generic\wheels.txd"
     )
     foreach ($relative in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $Path $relative) -PathType Leaf)) {
@@ -262,10 +264,29 @@ try {
     foreach ($requiredRemote in @(
         "$script:stagingRemote/vegetation_models.txt",
         "$script:stagingRemote/models/gta3.img",
-        "$script:stagingRemote/models/gta3.dir"
+        "$script:stagingRemote/models/gta3.dir",
+        "$script:stagingRemote/models/generic/wheels.dff",
+        "$script:stagingRemote/models/generic/wheels.txd"
     )) {
         Invoke-AdbChecked -Arguments @("shell", "test", "-f", $requiredRemote) `
             -FailureMessage "Required copied file is missing: $requiredRemote" -Quiet | Out-Null
+    }
+
+    # White wheels are the characteristic result of a missing/corrupt loose
+    # wheel TXD.  Hash the two small wheel assets explicitly; hashing the
+    # multi-gigabyte archive here would needlessly extend every installation.
+    foreach ($relative in @("models\generic\wheels.dff", "models\generic\wheels.txd")) {
+        $localWheel = Join-Path $modern $relative
+        $remoteWheel = "$script:stagingRemote/$($relative.Replace('\', '/'))"
+        $localHash = (Get-FileHash -LiteralPath $localWheel -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hashResult = Invoke-AdbChecked -Arguments @("shell", "sha256sum", $remoteWheel) `
+            -FailureMessage "Could not verify copied wheel asset: $relative" -Quiet
+        $remoteHashText = ($hashResult.Lines | Out-String)
+        $remoteHashMatch = [regex]::Match($remoteHashText, '(?i)\b[0-9a-f]{64}\b')
+        if (-not $remoteHashMatch.Success -or
+            $remoteHashMatch.Value.ToLowerInvariant() -ne $localHash) {
+            throw "Copied SHA256 mismatch for $relative. The previous Modern folder remains active."
+        }
     }
 
     $existingResult = Invoke-AdbCapture -Arguments @("shell", "test", "-d", $finalRemote)

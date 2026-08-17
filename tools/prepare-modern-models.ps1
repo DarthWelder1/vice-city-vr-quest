@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$wizardVersion = "0.5.1-models-2"
+$wizardVersion = "0.5.1-models-3"
 $hdUrl = "https://drive.usercontent.google.com/download?id=1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj&export=download&confirm=t"
 $modsUrl = "https://drive.usercontent.google.com/download?id=1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d&export=download&confirm=t"
 $hdSize = 1878280127L
@@ -214,7 +214,8 @@ function Test-CompletedOverlay {
     }
     foreach ($relative in @(
         "vegetation_models.txt", "BUILD_INFO.txt",
-        "models\gta3.img", "models\gta3.dir"
+        "models\gta3.img", "models\gta3.dir",
+        "models\generic\wheels.dff", "models\generic\wheels.txd"
     )) {
         $candidate = Join-Path $Path $relative
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or

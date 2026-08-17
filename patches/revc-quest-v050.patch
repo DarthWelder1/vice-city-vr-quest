@@ -169,7 +169,43 @@ index bf01725..bfffccd 100644
  
  char CFileLoader::ms_line[256];
  
-@@ -156,7 +169,7 @@ CFileLoader::LoadTexDictionary(const char *filename)
+@@ -86,6 +99,35 @@ CFileLoader::LoadLevel(const char *filename)
+ 			LoadCollisionFile(line+10, 0);
+ 		}else if(strncmp(line, "MODELFILE", 9) == 0){
+ 			LoadingScreenLoadingFile(line + 10);
++			// Some retail/modded default.dat variants do not load WHEELS.TXD
++			// before WHEELS.DFF.  The Modern wheel model then binds dummy white
++			// textures permanently, even though the correct TXD exists in the
++			// optional overlay.  Make this dependency explicit for Modern cars;
++			// it also keeps already-installed model packs repairable by APK only.
++			if(ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEHICLES) &&
++			   CGeneral::faststricmp(GetFilename(line + 10), "WHEELS.DFF") == 0){
++				static const char *wheelTextureNames[] = {
++					"alloy", "classic", "lighttruck", "lightvan", "offroad",
++					"rim", "saloon", "smallcar", "sport", "truck", "tyre"
++				};
++				int32 present = 0;
++				for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++)
++					if(RwTexDictionaryFindNamedTexture(savedTxd, wheelTextureNames[i]))
++						present++;
++				const int32 initiallyPresent = present;
++				if(present != ARRAY_SIZE(wheelTextureNames)){
++					RwTexDictionary *wheelTxd = LoadTexDictionary("MODELS\\GENERIC\\WHEELS.TXD");
++					AddTexDictionaries(savedTxd, wheelTxd);
++					RwTexDictionaryDestroy(wheelTxd);
++					present = 0;
++					for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++)
++						if(RwTexDictionaryFindNamedTexture(savedTxd, wheelTextureNames[i]))
++							present++;
++				}
++				printf("Modern wheel texture preflight: initial %d/%d, final %d/%d before WHEELS.DFF\n",
++					initiallyPresent, (int32)ARRAY_SIZE(wheelTextureNames),
++					present, (int32)ARRAY_SIZE(wheelTextureNames));
++			}
+ 			LoadModelFile(line + 10);
+ 		}else if(strncmp(line, "HIERFILE", 8) == 0){
+ 			LoadingScreenLoadingFile(line + 9);
+@@ -156,7 +198,7 @@ CFileLoader::LoadTexDictionary(const char *filename)
  	RwStream *stream;
  
  	txd = nil;
@@ -178,7 +214,7 @@ index bf01725..bfffccd 100644
  	debug("Loading texture dictionary file %s\n", filename);
  	if(stream){
  		if(RwStreamFindChunk(stream, rwID_TEXDICTIONARY, nil, nil))
-@@ -430,7 +443,9 @@ CFileLoader::LoadModelFile(const char *filename)
+@@ -430,7 +472,9 @@ CFileLoader::LoadModelFile(const char *filename)
  	RpClump *clump;
  
  	debug("Loading model file %s\n", filename);
@@ -189,7 +225,7 @@ index bf01725..bfffccd 100644
  	if(RwStreamFindChunk(stream, rwID_CLUMP, nil, nil)){
  		clump = RpClumpStreamRead(stream);
  		if(clump){
-@@ -452,7 +467,9 @@ CFileLoader::LoadClumpFile(const char *filename)
+@@ -452,7 +496,9 @@ CFileLoader::LoadClumpFile(const char *filename)
  	CClumpModelInfo *mi;
  
  	debug("Loading model file %s\n", filename);
@@ -200,7 +236,7 @@ index bf01725..bfffccd 100644
  	while(RwStreamFindChunk(stream, rwID_CLUMP, nil, nil)){
  		clump = RpClumpStreamRead(stream);
  		if(clump){
-@@ -563,7 +580,9 @@ CFileLoader::LoadAtomicFile2Return(const char *filename)
+@@ -563,7 +609,9 @@ CFileLoader::LoadAtomicFile2Return(const char *filename)
  
  	clump = nil;
  	debug("Loading model file %s\n", filename);
