@@ -1,0 +1,28 @@
+diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
+index e7bde25..4504c7c 100644
+--- a/src/render/Hud.cpp
++++ b/src/render/Hud.cpp
+@@ -382,6 +382,15 @@ void CHud::Draw()
+ 					RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+ 				}
+ 				else {
++					// The scope masks carry their transparency in the texture
++					// alpha, and the desktop D3D12 immediate pipeline blends
++					// 2D unconditionally. The Vulkan backend honours the
++					// VERTEXALPHA state instead, which CHud::Draw clears, so
++					// the sniper mask was written opaque and its transparent
++					// centre covered the world in solid black.
++					RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++					RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++					RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
+ 					int sprite = HUD_SITESNIPER;
+ 					float xOffset = SCREEN_SCALE_X(210.0f);
+ 					float yOffset = SCREEN_SCALE_Y(210.0f);
+@@ -464,6 +473,7 @@ void CHud::Draw()
+ 			RwRenderStateSet(rwRENDERSTATESRCBLEND, (void *)rwBLENDSRCALPHA);
+ 			RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void *)rwBLENDINVSRCALPHA);
+ 			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
++			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+ 		}
+ 		else {
+ 			SpriteBrightness = 0;

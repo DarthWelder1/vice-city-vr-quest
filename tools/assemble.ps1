@@ -72,6 +72,11 @@ if ($LASTEXITCODE -ne 0) {
     Pop-Location
     Write-Error "The runtime v6 patch did not apply after the runtime v5 patch."
 }
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v7.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v7 patch did not apply after the runtime v6 patch."
+}
 Remove-Item -Recurse -Force (Join-Path $Out ".git")
 Pop-Location
 

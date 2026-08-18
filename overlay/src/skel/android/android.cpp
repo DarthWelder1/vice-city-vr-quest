@@ -516,18 +516,42 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	   !player->DyingOrDead() && player->m_pFrames[PED_HEAD] != nil){
 		CVector forward = player->GetForward();
 		forward.Normalise();
+		// PC parity (main.cpp headModeOnFoot): in the head-driven modes the
+		// hidden ped continuously turns into the commanded movement
+		// direction. Anchoring the VR frame on his body then rotates the
+		// world a second time on every step, the physical head offset is
+		// re-applied against the new heading, and walking while looking
+		// sideways curves away. Keep the reference frame on the gameplay
+		// camera there, exactly as the desktop build does.
+		const bool headModeOnFoot = !gVrInVehicle &&
+			(androidgame::VrUsesHeadRelativeMovement() ||
+			 androidgame::VrUsesExperimentalHeadTurning());
+		if(headModeOnFoot){
+			CVector cameraUp = player->GetUp();
+			cameraUp.Normalise();
+			CVector cameraForward =
+				TheCamera.Cams[TheCamera.ActiveCam].Front;
+			cameraForward -= cameraUp*DotProduct(cameraForward, cameraUp);
+			if(cameraForward.MagnitudeSqr() > 0.000001f){
+				cameraForward.Normalise();
+				forward = cameraForward;
+			}
+		}
 		CVector horizontalForward = forward;
 		horizontalForward.z = 0.0f;
 		if(horizontalForward.MagnitudeSqr() > 0.0001f){
 			horizontalForward.Normalise();
 
 			// PlayerControlZelda derives on-foot movement from
-			// TheCamera.Orientation.  Quest writes the tracked view straight
-			// into the RenderWare camera, so the old chase-camera heading
-			// otherwise survives here and turns "forward" by 90 degrees.
-			// Keep the renderer anchor below in its standard atan2(y, x)
-			// convention; the game camera uses atan2(x, y).
-			if(!gVrInVehicle)
+			// TheCamera.Orientation.  With the frame welded to the body the
+			// stock chase-camera heading is the wrong reference (it turns
+			// "forward" by 90 degrees), so it is replaced here. In the head
+			// modes above the frame IS the gameplay camera, so the stock
+			// value is the correct reference and must be left alone -- the
+			// desktop build never writes it either.
+			// Renderer anchor keeps its standard atan2(y, x) convention;
+			// the game camera uses atan2(x, y).
+			if(!gVrInVehicle && !headModeOnFoot)
 				TheCamera.Orientation =
 					Atan2(horizontalForward.x, horizontalForward.y);
 		}
