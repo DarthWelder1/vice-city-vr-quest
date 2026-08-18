@@ -135,6 +135,9 @@ static int gBikeDrivingType;
 static int gMotionSteeringHand = 1;
 static bool gHandleHighlightsEnabled = true;
 static bool gBikeHorizonLocked = true;
+// Third-person vehicle view: the ordinary chase camera in stereo, with the
+// default controls. It is not a seating position, so no seat offset applies.
+static bool gVehicleThirdPerson = false;
 static bool gImmersiveCarWheelVisible = true;
 static bool gCalibrationPreview;
 
@@ -294,6 +297,8 @@ LoadDrivingSettings()
 		"VR", "BikeHandleHighlights", 1, kSettingsPath) != 0;
 	gBikeHorizonLocked = GetPrivateProfileIntA(
 		"VR", "BikeLockHorizon", 1, kSettingsPath) != 0;
+	gVehicleThirdPerson = GetPrivateProfileIntA(
+		"VR", "VehicleThirdPerson", 0, kSettingsPath) != 0;
 	gImmersiveCarWheelVisible = GetPrivateProfileIntA(
 		"VR", "ImmersiveCarWheelVisible", 1, kSettingsPath) != 0;
 	ReloadVehicleCalibration();
@@ -354,7 +359,10 @@ IsDrivingEnvironmentActive()
 {
 	LoadDrivingSettings();
 	CVehicle *vehicle = FindPlayerVehicle();
-	if(GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ||
+	// The third-person view has no cockpit to reach into, so the physical
+	// wheel and motion steering stay off and the controls remain DEFAULT.
+	if(gVehicleThirdPerson ||
+	   GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ||
 	   !gVrFirstPersonActive ||
 	   gGameState != GS_PLAYING_GAME ||
 	   FrontEndMenuManager.m_bGameNotLoaded ||
@@ -2721,6 +2729,22 @@ ToggleQuestBikeHorizonLock()
 	LoadDrivingSettings();
 	gBikeHorizonLocked = !gBikeHorizonLocked;
 	SaveSetting("BikeLockHorizon", gBikeHorizonLocked);
+}
+
+bool
+IsQuestVehicleThirdPerson()
+{
+	LoadDrivingSettings();
+	return gVehicleThirdPerson;
+}
+
+void
+ToggleQuestVehicleThirdPerson()
+{
+	LoadDrivingSettings();
+	gVehicleThirdPerson = !gVehicleThirdPerson;
+	SaveSetting("VehicleThirdPerson", gVehicleThirdPerson);
+	ResetQuestDrivingInteraction();
 }
 
 const char *

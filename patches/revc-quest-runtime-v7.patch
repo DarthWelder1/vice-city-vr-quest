@@ -1,8 +1,7 @@
 diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
-index e7bde25..4504c7c 100644
 --- a/src/render/Hud.cpp
 +++ b/src/render/Hud.cpp
-@@ -382,6 +382,15 @@ void CHud::Draw()
+@@ -382,6 +382,15 @@
  					RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
  				}
  				else {
@@ -18,7 +17,7 @@ index e7bde25..4504c7c 100644
  					int sprite = HUD_SITESNIPER;
  					float xOffset = SCREEN_SCALE_X(210.0f);
  					float yOffset = SCREEN_SCALE_Y(210.0f);
-@@ -464,6 +473,7 @@ void CHud::Draw()
+@@ -464,6 +473,7 @@
  			RwRenderStateSet(rwRENDERSTATESRCBLEND, (void *)rwBLENDSRCALPHA);
  			RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void *)rwBLENDINVSRCALPHA);
  			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
@@ -26,3 +25,59 @@ index e7bde25..4504c7c 100644
  		}
  		else {
  			SpriteBrightness = 0;
+diff --git a/src/core/Frontend.cpp b/src/core/Frontend.cpp
+--- a/src/core/Frontend.cpp
++++ b/src/core/Frontend.cpp
+@@ -34,7 +34,10 @@
+ #include "Messages.h"
+ #include "FileLoader.h"
+ #include "User.h"
+-#include "sampman.h"
++#include "sampman.h"
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++#include "OculusVR.h"
++#endif
+ 
+ // Similar story to Hud.cpp:
+ // Game has colors inlined in code.
+@@ -2459,8 +2462,9 @@
+ 		// FONT_STANDARD uses the original game's fixed glyph atlas: its '#' slot
+ 		// is an icon rather than a number sign.  Keep public-build text to the
+ 		// atlas' reliable uppercase ASCII range so every language pack displays it.
+-		AsciiToUnicode("VICE CITY VR V0.5.1 ALPHA", releaseName);
+-		AsciiToUnicode("NOT FOR SALE", releaseStatus);
++		AsciiToUnicode("VICE CITY VR V" MIAMIVR_VERSION_TEXT " ALPHA",
++			releaseName);
++		AsciiToUnicode("NOT FOR SALE", releaseStatus);
+ 		AsciiToUnicode("", releaseCredit);
+ 
+ 		CFont::SetBackgroundOff();
+@@ -2477,17 +2481,17 @@
+ 		CFont::SetDropColor(CRGBA(0, 0, 0, FadeIn(220)));
+ 		CFont::SetColor(CRGBA(255, 255, 255, FadeIn(235)));
+ 		const float releaseX = SCREEN_STRETCH_FROM_RIGHT(24.0f);
+-		const float statusY = SCREEN_SCALE_FROM_BOTTOM(46.0f);
+-		const float statusWidth = CFont::GetStringWidth(releaseStatus, true);
+-		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(68.0f), releaseName);
+-		CSprite2d::DrawRect(CRect(
+-			releaseX-statusWidth-SCREEN_SCALE_X(8.0f),
+-			statusY-SCREEN_SCALE_Y(2.0f),
+-			releaseX+SCREEN_SCALE_X(4.0f),
+-			statusY+SCREEN_SCALE_Y(15.0f)),
+-			CRGBA(150, 35, 105, FadeIn(220)));
+-		CFont::PrintString(releaseX, statusY, releaseStatus);
+-		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(24.0f), releaseCredit);
++		const float statusY = SCREEN_SCALE_FROM_BOTTOM(46.0f);
++		const float statusWidth = CFont::GetStringWidth(releaseStatus, true);
++		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(68.0f), releaseName);
++		CSprite2d::DrawRect(CRect(
++			releaseX-statusWidth-SCREEN_SCALE_X(8.0f),
++			statusY-SCREEN_SCALE_Y(2.0f),
++			releaseX+SCREEN_SCALE_X(4.0f),
++			statusY+SCREEN_SCALE_Y(15.0f)),
++			CRGBA(150, 35, 105, FadeIn(220)));
++		CFont::PrintString(releaseX, statusY, releaseStatus);
++		CFont::PrintString(releaseX, SCREEN_SCALE_FROM_BOTTOM(24.0f), releaseCredit);
+ 	}
+ 
+ 	CFont::DrawFonts();

@@ -76,8 +76,8 @@ android {
 		// Quest 3 / 3S ship Android 12L or newer. Nothing below that is a target.
 		minSdk = 32
 		targetSdk = 35
-		versionCode = 501
-		versionName = "0.5.1-quest-alpha"
+		versionCode = 502
+		versionName = "0.5.2-rc2-quest-alpha"
 
 		ndk {
 			abiFilters += "arm64-v8a"

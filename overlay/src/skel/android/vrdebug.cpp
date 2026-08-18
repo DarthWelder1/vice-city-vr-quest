@@ -274,7 +274,8 @@ enum eQuestCpuPerformanceMode {
 };
 
 enum eVrVehicleMenuItem {
-	VR_VEHICLE_CAR_DRIVING_TYPE = 0,
+	VR_VEHICLE_THIRD_PERSON = 0,
+	VR_VEHICLE_CAR_DRIVING_TYPE,
 	VR_VEHICLE_BIKE_DRIVING_TYPE,
 	VR_VEHICLE_DEFAULT_SEAT_HEIGHT,
 	VR_VEHICLE_DEFAULT_SEAT_FORWARD,
@@ -1273,12 +1274,25 @@ VrDebugUpdate(const PadInput &in)
 		}else if(gVrMenuPage == VR_MENU_PAGE_VEHICLE &&
 		         (positivePulse || decreasePulse)){
 			const int direction = decreasePulse ? -1 : 1;
+			// Everything below the view switch belongs to the cockpit, so it
+			// is inert while the third-person view is selected -- the rows
+			// are drawn greyed out to match.
+			const bool cockpitLocked =
+				OculusVR::IsQuestVehicleThirdPerson() &&
+				gVrVehicleSelection != VR_VEHICLE_THIRD_PERSON &&
+				gVrVehicleSelection != VR_VEHICLE_BACK;
+			if(!cockpitLocked)
 			switch(gVrVehicleSelection){
+			case VR_VEHICLE_THIRD_PERSON:
+				OculusVR::ToggleQuestVehicleThirdPerson();
+				break;
 			case VR_VEHICLE_CAR_DRIVING_TYPE:
-				OculusVR::CycleQuestCarDrivingType(direction);
+				if(!OculusVR::IsQuestVehicleThirdPerson())
+					OculusVR::CycleQuestCarDrivingType(direction);
 				break;
 			case VR_VEHICLE_BIKE_DRIVING_TYPE:
-				OculusVR::CycleQuestBikeDrivingType(direction);
+				if(!OculusVR::IsQuestVehicleThirdPerson())
+					OculusVR::CycleQuestBikeDrivingType(direction);
 				break;
 			case VR_VEHICLE_DEFAULT_SEAT_HEIGHT:
 				OculusVR::AdjustQuestDefaultVehicleSeatHeightCm(
@@ -1880,10 +1894,19 @@ DrawQuestVehiclePage(void)
 	BeginFullVrMenuPage("VEHICLE SETTINGS",
 		"DRIVING CONTROLS AND PER-VEHICLE CALIBRATION");
 	char rows[VR_VEHICLE_ITEM_COUNT][112];
+	snprintf(rows[VR_VEHICLE_THIRD_PERSON], sizeof(rows[0]),
+		"VEHICLE VIEW  < %s >",
+		OculusVR::IsQuestVehicleThirdPerson() ?
+			"THIRD PERSON" : "FIRST PERSON");
+	const bool thirdPersonView = OculusVR::IsQuestVehicleThirdPerson();
 	snprintf(rows[VR_VEHICLE_CAR_DRIVING_TYPE], sizeof(rows[0]),
-		"CAR DRIVING TYPE  < %s >", OculusVR::GetQuestCarDrivingTypeName());
+		"CAR DRIVING TYPE  < %s >", thirdPersonView ?
+			"DEFAULT (THIRD PERSON)" :
+			OculusVR::GetQuestCarDrivingTypeName());
 	snprintf(rows[VR_VEHICLE_BIKE_DRIVING_TYPE], sizeof(rows[0]),
-		"BIKE DRIVING TYPE  < %s >", OculusVR::GetQuestBikeDrivingTypeName());
+		"BIKE DRIVING TYPE  < %s >", thirdPersonView ?
+			"DEFAULT (THIRD PERSON)" :
+			OculusVR::GetQuestBikeDrivingTypeName());
 	if(OculusVR::HasQuestDefaultVehicleViewOffsetTarget()){
 		snprintf(rows[VR_VEHICLE_DEFAULT_SEAT_HEIGHT], sizeof(rows[0]),
 			"DEFAULT %s HEIGHT  < %+d CM >",
@@ -1950,7 +1973,13 @@ DrawQuestVehiclePage(void)
 	strcpy(rows[VR_VEHICLE_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_VEHICLE_ITEM_COUNT; item++){
 		bool available = true;
-		if(item >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
+		// The third-person view has no seat and nothing to reach for, so
+		// every cockpit control is greyed out instead of silently doing
+		// nothing. Only the view switch itself and BACK stay live.
+		if(thirdPersonView && item != VR_VEHICLE_THIRD_PERSON &&
+		   item != VR_VEHICLE_BACK)
+			available = false;
+		else if(item >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
 		   item <= VR_VEHICLE_DEFAULT_SEAT_FORWARD)
 			available = OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
 		else if(item >= VR_VEHICLE_GLOBAL_SEAT_HEIGHT &&
@@ -2226,7 +2255,7 @@ DrawQuestAboutPage(void)
 {
 	BeginFullVrMenuPage(gVrWelcomeFirstRun ?
 		"WELCOME TO VICE CITY VR" : "ABOUT VICE CITY VR",
-		"VERSION 0.5.1 ALPHA - NOT FOR SALE");
+		"VERSION " MIAMIVR_VERSION_TEXT " ALPHA - NOT FOR SALE");
 	static const char *lines[] = {
 		"OPEN THE VR MENU: HOLD BOTH GRIPS + MENU",
 		"CHEATS: HOLD BOTH GRIPS + B",

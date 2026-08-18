@@ -480,6 +480,41 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	CPlayerPed *player = FindPlayerPed();
 	const bool remoteMode =
 		CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode();
+	// Entry and exit animations: the desktop build puts the reference frame
+	// back on the PED for their whole duration, so the view turns with Tommy
+	// as he swings in or out. The third-person camera is excluded for the
+	// same window -- riding the chase camera while the game slides it between
+	// its vehicle and on-foot positions is what threw the view down from
+	// above on every exit.
+	const PedState playerVehicleState =
+		player != nil ? player->GetPedState() : PED_NONE;
+	const bool vehicleTransition = player != nil &&
+		(player->m_objective == OBJECTIVE_ENTER_CAR_AS_DRIVER ||
+		 player->m_objective == OBJECTIVE_ENTER_CAR_AS_PASSENGER ||
+		 player->m_objective == OBJECTIVE_LEAVE_CAR ||
+		 player->m_objective == OBJECTIVE_LEAVE_CAR_AND_DIE ||
+		 playerVehicleState == PED_SEEK_CAR ||
+		 playerVehicleState == PED_SEEK_IN_BOAT ||
+		 playerVehicleState == PED_OPEN_DOOR ||
+		 playerVehicleState == PED_CARJACK ||
+		 playerVehicleState == PED_ENTER_CAR ||
+		 playerVehicleState == PED_STEAL_CAR ||
+		 playerVehicleState == PED_EXIT_CAR ||
+		 playerVehicleState == PED_DRAG_FROM_CAR);
+	// THIRD PERSON vehicle view: leave the immersive seat entirely and let
+	// the stock chase camera drive the stereo view, the same way the RC
+	// missions already play. Everything downstream follows: the animated
+	// Tommy and the vehicle are drawn (the body is hidden only in first
+	// person), IMMERSIVE/MOTION driving deactivates because it requires the
+	// first-person environment, so the controls fall back to DEFAULT, and no
+	// seat offset applies because there is no seat anchor.
+#ifdef GTA_VR_WEAPONS
+	const bool thirdPersonVehicle = player != nil && player->InVehicle() &&
+		player->m_pMyVehicle != nil && !vehicleTransition &&
+		OculusVR::IsQuestVehicleThirdPerson();
+#else
+	const bool thirdPersonVehicle = false;
+#endif
 	const bool wantFirstPerson =
 		gGameState == GS_PLAYING_GAME &&
 		player != nil &&
@@ -493,15 +528,16 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	gVrFirstPersonActive = wantFirstPerson;
 	gVrPlayerEntity = (CEntity*)player;
 	gVrInVehicle = wantFirstPerson && player->InVehicle() &&
-		player->m_pMyVehicle != nil;
+		player->m_pMyVehicle != nil &&
+		!thirdPersonVehicle;
 	// Match the desktop policy: DEFAULT driving uses the original animated
 	// vehicle occupant, while on-foot VR and IMMERSIVE/MOTION driving replace
 	// Tommy with tracked hands.  CRenderer and CPed both consume this flag, so
 	// decide it once here instead of letting their early Vulkan exits hide the
 	// DEFAULT occupant unconditionally.
 #ifdef GTA_VR_WEAPONS
-	gVrHidePlayerBody = !gVrInVehicle ||
-		OculusVR::IsImmersiveDrivingActive();
+	gVrHidePlayerBody = !thirdPersonVehicle &&
+		(!gVrInVehicle || OculusVR::IsImmersiveDrivingActive());
 #else
 	gVrHidePlayerBody = true;
 #endif
@@ -523,7 +559,14 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		// re-applied against the new heading, and walking while looking
 		// sideways curves away. Keep the reference frame on the gameplay
 		// camera there, exactly as the desktop build does.
-		const bool headModeOnFoot = !gVrInVehicle &&
+		// PC parity: during the entry and exit animations the desktop build
+		// overrides the camera frame with the PED forward, so the view turns
+		// with Tommy as he swings into the seat and the seated re-latch onto
+		// the vehicle nose is then continuous. Holding the camera frame
+		// through the animation fights that rotation and lands the player
+		// facing the wrong way.
+		const bool headModeOnFoot = !gVrInVehicle && !thirdPersonVehicle &&
+			!vehicleTransition &&
 			(androidgame::VrUsesHeadRelativeMovement() ||
 			 androidgame::VrUsesExperimentalHeadTurning());
 		if(headModeOnFoot){
@@ -567,6 +610,20 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		}else
 			player->m_pedIK.GetComponentPosition(head, PED_HEAD);
 		head += forward * 0.12f;
+		if(thirdPersonVehicle){
+			// Ride the stock chase camera instead of a seat: its position
+			// and heading, but through the first-person machinery, so the
+			// basis stays yaw-only (level horizon), the eye field of view is
+			// applied, and everything projecting against the game camera --
+			// coronas, headlights, sprites -- lands where the world is.
+			CVector chaseForward = TheCamera.Cams[TheCamera.ActiveCam].Front;
+			chaseForward.z = 0.0f;
+			if(chaseForward.MagnitudeSqr() > 0.0001f){
+				chaseForward.Normalise();
+				forward = chaseForward;
+			}
+			head = TheCamera.GetPosition();
+		}
 #ifdef GTA_VR_WEAPONS
 		if(gVrInVehicle){
 			// The desktop vehicle view applies both the global vertical seat

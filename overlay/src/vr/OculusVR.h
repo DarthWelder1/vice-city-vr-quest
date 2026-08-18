@@ -8,6 +8,10 @@ class CControllerState;
 class CEntity;
 class CVehicle;
 
+// Single source of truth for the build name shown to players: the flat main
+// menu, the VR About page and the APK version must never disagree again.
+#define MIAMIVR_VERSION_TEXT "0.5.2 RC2"
+
 namespace OculusVR
 {
 enum ePerfPhase
@@ -228,6 +232,10 @@ void ToggleQuestVehicleModelWheelVisibility();
 bool AreQuestVehicleHandleHighlightsEnabled();
 void ToggleQuestVehicleHandleHighlights();
 bool IsQuestBikeHorizonLocked();
+// Third-person vehicle view: the stock chase camera in stereo with default
+// controls, for players who do not want to sit inside the vehicle.
+bool IsQuestVehicleThirdPerson();
+void ToggleQuestVehicleThirdPerson();
 void ToggleQuestBikeHorizonLock();
 const char *GetQuestActiveVehicleName();
 bool IsQuestVehicleCalibrationAvailable();
