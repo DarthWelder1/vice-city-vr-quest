@@ -39,12 +39,20 @@ void main()
 	// HUD and font vertices come from CSprite2d, whose depth is the near clip
 	// plane; clamping to the panel distance leaves those exactly where they
 	// already were.
-	vec4 plane = scene.im2dTransform * vec4(inPosition.xy, 0.0, 1.0);
+	// The plane arrives per draw in the model slot, so a single draw can be
+	// placed somewhere else -- the wrist minimap rides on that.
+	vec4 plane = push.model * vec4(inPosition.xy, 0.0, 1.0);
 	float panel = scene.im2dParams.x;
 	float depth = max(inPosition.w, panel);
 	vec3 eye = scene.im2dParams.yzw;
 	vec3 world = eye + (plane.xyz - eye) * (depth/panel);
 	gl_Position = scene.viewProj[gl_ViewIndex] * vec4(world, 1.0);
+	// Wrist minimap. That map renders into a small texture of its own, where
+	// the model slot is a straight screen-pixels-to-clip matrix and neither
+	// eye is involved: both multiview layers receive the same flat map, and
+	// what the eyes converge on is the quad the game hangs off the wrist.
+	if(push.surfaceProps.x > 1.5)
+		gl_Position = vec4(plane.xy, 0.5, 1.0);
 	// Radar-only depth masking must sit in front of the already-rendered
 	// cockpit/world. Preserve the tiny RenderWare screen-Z difference between
 	// the outside-circle mask and the textured tiles: strict LESS depends on

@@ -244,12 +244,39 @@ void setIm2DTransform(const float32 transform[16], float32 planeDistance,
 // enables this only while drawing the immersive gameplay interface, keeping
 // world-space sprites and theater/menu frames on their exact projection.
 void setIm2DSafeAreaScale(float32 scale);
+
+// Wrist panels.
+//
+// Interface that is not part of the head-locked plane: it renders into small
+// private textures, before the frame's multiview pass opens, and the game
+// hangs one textured quad each off the player's wrists. Being real geometry
+// out there, they are depth tested against the arm and the scene.
+//
+// setWristPanelRenderer installs the callback that issues a panel's Im2D
+// draws. It is invoked with that panel's target open and the model slot
+// mapping screen pixels straight onto it, so the same code that draws the flat
+// interface draws this one. The request is one-shot: the game re-arms it every
+// frame the panel is visible, so a paused or menu frame stops rendering it.
+enum {
+	WRIST_PANEL_MAP = 0,
+	WRIST_PANEL_STATUS,
+	WRIST_PANEL_COUNT
+};
+void setWristPanelRenderer(int32 panel, void (*renderer)(void));
+void setWristPanelWanted(int32 panel, bool32 wanted);
+// The finished panel. Null until its first offscreen render has completed.
+Raster *getWristPanelRaster(int32 panel);
 void setIm2DSafeAreaTransform(float32 scaleX, float32 scaleY,
                               float32 offsetX, float32 offsetY);
 
 // Radar tiles use the original RenderWare depth-mask trick: four invisible
 // corner fans write depth, then the map is accepted only inside the circle.
 // The role is supplied per immediate-mode draw by the game renderer.
+
+// Suspends the safe-area remap for the draws in between. The wrist minimap
+// quad carries a transform of its own onto the arm, and scaling its screen
+// coordinates around the panel centre would drag it off the wrist.
+void setIm2DSafeAreaSuspended(bool32 suspended);
 void setImmediate2DStrictDepth(bool32 enabled);
 bool32 getImmediate2DStrictDepth(void);
 

@@ -1,7 +1,370 @@
 diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 --- a/src/render/Hud.cpp
 +++ b/src/render/Hud.cpp
-@@ -382,6 +382,15 @@
+@@ -14,6 +14,7 @@
+ #include "Wanted.h"
+ #include "Sprite.h"
+ #include "Sprite2d.h"
++#include "GameRenderCommand.h"
+ #include "Text.h"
+ #include "Timer.h"
+ #include "Script.h"
+@@ -32,7 +33,19 @@
+ namespace androidgame {
+ bool VrGameplayHudEnabled(void);
+ bool VrShouldUseTheaterMode(void);
++bool VrWristPanelEnabled(int panel);
++bool VrHudWeaponPanelEnabled(void);
++bool VrHudClockEnabled(void);
++void *BeginVrWristPanel(int panel, float centreX, float centreY, float width,
++	float height);
++void EndVrWristPanel(void);
+ }
++// Panel indices, mirroring librw's WRIST_PANEL_* without pulling the
++// backend header into the HUD.
++enum {
++	VR_WRIST_PANEL_MAP = 0,
++	VR_WRIST_PANEL_STATUS = 1
++};
+ #endif
+ 
+ #if defined(FIX_BUGS)
+@@ -241,6 +254,334 @@
+ 		RwTexDictionaryFindNamedTexture(txd->texDict, weaponModel->GetModelName()) : nil;
+ }
+ 
++// The map, its disc and the blips, in screen coordinates. Kept apart from
++// CHud::Draw because the wrist minimap runs exactly this code into a texture
++// of its own, before the frame's render pass opens.
++static void
++DrawRadarContents(void)
++{
++	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
++	CRadar::DrawMap();
++	// DrawRadarMap intentionally leaves its strict depth state active
++	// for the circular mask. The disc and blips are HUD geometry and
++	// must remain visible over a vehicle cockpit.
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	if (FrontEndMenuManager.m_PrefsRadarMode != 1) {
++		CRect rect(0.0f, 0.0f, SCREEN_SCALE_X(RADAR_WIDTH), SCREEN_SCALE_Y(RADAR_HEIGHT));
++
++		rect.Translate(SCREEN_SCALE_X_FIX(RADAR_LEFT), SCREEN_SCALE_FROM_BOTTOM(RADAR_BOTTOM + RADAR_HEIGHT));
++
++#ifdef FIX_BUGS
++		rect.Grow(SCREEN_SCALE_X(6.0f), SCREEN_SCALE_X(6.0f), SCREEN_SCALE_Y(6.0f), SCREEN_SCALE_Y(6.0f));
++#else
++		rect.Grow(6.0f);
++#endif
++		rect.Translate(SCREEN_SCALE_X_FIX(0.0f), SCREEN_SCALE_Y_FIX(2.0f));
++		CHud::Sprites[HUD_RADARDISC].Draw(rect, CRGBA(0, 0, 0, 255));
++		rect.Translate(SCREEN_SCALE_X_FIX(0.0f), SCREEN_SCALE_Y_FIX(-2.0f));
++		CHud::Sprites[HUD_RADARDISC].Draw(rect, RADARDISC_COLOR);
++	}
++	CRadar::DrawBlips();
++}
++
++
++// Money, health, armour and the wanted level, in screen coordinates. Kept
++// apart from CHud::Draw for the same reason the radar is: the wrist status
++// panel runs exactly this code into a texture of its own, before the frame
++// opens its render pass.
++static void
++DrawStatusContents(void)
++{
++	CPlayerPed *playerPed = FindPlayerPed();
++	if (playerPed == nil)
++		return;
++	/*
++		DrawMoneyCounter
++	*/
++
++	wchar sPrint[16];
++	wchar sPrintIcon[16];
++	char sTemp[16];
++	float alpha;
++
++	if (CHud::m_LastDisplayScore == CWorld::Players[CWorld::PlayerInFocus].m_nVisibleMoney) {
++		alpha = CHud::DrawFadeState(HUD_SCORE_FADING, 0);
++	} else {
++		alpha = CHud::DrawFadeState(HUD_SCORE_FADING, 1);
++		CHud::m_LastDisplayScore = CWorld::Players[CWorld::PlayerInFocus].m_nVisibleMoney;
++	}
++	if (CHud::m_DisplayScoreState != FADED_OUT) {
++		sprintf(sTemp, "$%08d", CWorld::Players[CWorld::PlayerInFocus].m_nVisibleMoney);
++		AsciiToUnicode(sTemp, sPrint);
++
++		CFont::SetPropOff();
++		CFont::SetBackgroundOff();
++		CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
++		CFont::SetCentreOff();
++		CFont::SetRightJustifyOn();
++		CFont::SetRightJustifyWrap(0.0f);
++		CFont::SetBackGroundOnlyTextOff();
++		CFont::SetFontStyle(FONT_HEADING);
++		CFont::SetPropOff();
++		CFont::SetDropShadowPosition(2);
++		CFont::SetDropColor(CRGBA(0, 0, 0, alpha));
++		MONEY_COLOR.a = alpha;
++		CFont::SetColor(MONEY_COLOR);
++
++		if (FrontEndMenuManager.m_PrefsShowHud) {
++			CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f), SCREEN_SCALE_Y(43.0f), sPrint);
++		}
++	}
++
++	/*
++		DrawHealth
++	*/
++	if ( CHud::m_LastTimeEnergyLost == CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss ) {
++		CHud::DrawFadeState(HUD_ENERGY_FADING, 0);
++	} else {
++		CHud::DrawFadeState(HUD_ENERGY_FADING, 1);
++		CHud::m_LastTimeEnergyLost = CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss;
++	}
++
++	if (CHud::m_EnergyLostState != FADED_OUT) {
++		CFont::SetBackgroundOff();
++		CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
++		CFont::SetJustifyOff();
++		CFont::SetCentreOff();
++		CFont::SetRightJustifyWrap(0.0f);
++		CFont::SetRightJustifyOn();
++		CFont::SetPropOff();
++		CFont::SetFontStyle(FONT_HEADING);
++		CFont::SetDropShadowPosition(2);
++		CFont::SetDropColor(CRGBA(0, 0, 0, 255));
++
++		if (CHud::m_ItemToFlash == ITEM_HEALTH && CTimer::GetFrameCounter() & 8
++			|| CHud::m_ItemToFlash != ITEM_HEALTH
++			|| playerPed->m_fHealth < 10
++			&& CTimer::GetFrameCounter() & 8) {
++			if (playerPed->m_fHealth >= 10
++				|| playerPed->m_fHealth < 10 && CTimer::GetFrameCounter() & 8) {
++
++				AsciiToUnicode("{", sPrintIcon);
++#ifdef FIX_BUGS
++				sprintf(sTemp, "%03d", int32(playerPed->m_fHealth + 0.5f));
++#else
++				sprintf(sTemp, "%03d", (int32)playerPed->m_fHealth);
++#endif
++				AsciiToUnicode(sTemp, sPrint);
++
++				CFont::SetColor(HEALTH_COLOR);
++				if (FrontEndMenuManager.m_PrefsShowHud) {
++					CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f), SCREEN_SCALE_Y(65.0f), sPrint);
++
++					if (!CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss || CTimer::GetTimeInMilliseconds() > CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss + 2000 || CTimer::GetFrameCounter() & 4) {
++						// CFont::SetColor(HEALTH_COLOR);
++						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 54.0f), SCREEN_SCALE_Y(65.0f), sPrintIcon);
++					}
++				}
++			}
++		}
++
++		/*
++			DrawArmour
++		*/
++		if (CHud::m_ItemToFlash == ITEM_ARMOUR && CTimer::GetFrameCounter() & 8 || CHud::m_ItemToFlash != ITEM_ARMOUR) {
++			CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
++			if (playerPed->m_fArmour > 1.0f) {
++				AsciiToUnicode("<", sPrintIcon);
++#ifdef FIX_BUGS
++				sprintf(sTemp, "%03d", int32(playerPed->m_fArmour + 0.5f));
++#else
++				sprintf(sTemp, "%03d", (int32)playerPed->m_fArmour);
++#endif
++				AsciiToUnicode(sTemp, sPrint);
++
++				CFont::SetColor(ARMOUR_COLOR);
++				if (FrontEndMenuManager.m_PrefsShowHud) {
++
++					CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(182.0f), SCREEN_SCALE_Y(65.0f), sPrint);
++
++					if (!CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastArmourLoss || CTimer::GetTimeInMilliseconds() > CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastArmourLoss + 2000 || CTimer::GetFrameCounter() & 4) {
++						// CFont::SetColor(ARMOUR_COLOR);
++						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(182.0f + 52.0f), SCREEN_SCALE_Y(65.0f), sPrintIcon);
++					}
++				}
++			}
++		}
++	}
++
++	/*
++		DrawWantedLevel
++	*/
++	if (CHud::m_LastWanted == playerPed->m_pWanted->GetWantedLevel()) {
++		alpha = CHud::DrawFadeState(HUD_WANTED_FADING, 0);
++	} else {
++		alpha = CHud::DrawFadeState(HUD_WANTED_FADING, 1);
++		CHud::m_LastWanted = playerPed->m_pWanted->GetWantedLevel();
++	}
++
++	if (CHud::m_WantedState != FADED_OUT) {
++		CFont::SetBackgroundOff();
++		CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
++		CFont::SetJustifyOff();
++		CFont::SetCentreOff();
++		CFont::SetRightJustifyOn();
++		CFont::SetPropOn();
++		CFont::SetFontStyle(FONT_STANDARD);
++
++		AsciiToUnicode(">", sPrintIcon);
++
++		for (int i = 0; i < 6; i++) {
++			if (FrontEndMenuManager.m_PrefsShowHud) {
++				if (playerPed->m_pWanted->GetWantedLevel() > i
++					&& (CTimer::GetTimeInMilliseconds() > playerPed->m_pWanted->m_nLastWantedLevelChange
++						+ 2000 || CTimer::GetFrameCounter() & 4)) {
++
++					WANTED_COLOR.a = alpha;
++					CFont::SetColor(WANTED_COLOR);
++					CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 23.0f * i), SCREEN_SCALE_Y(87.0f), sPrintIcon);
++
++				} else if (playerPed->m_pWanted->m_nMinWantedLevel > i && CTimer::GetFrameCounter() & 4) {
++					WANTED_COLOR_FLASH.a = alpha;
++					CFont::SetColor(WANTED_COLOR_FLASH);
++					CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 23.0f * i), SCREEN_SCALE_Y(87.0f), sPrintIcon);
++
++				} else if (playerPed->m_pWanted->GetWantedLevel() <= i) {
++					NOTWANTED_COLOR.a = alpha;
++					CFont::SetColor(NOTWANTED_COLOR);
++					CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 23.0f * i), SCREEN_SCALE_Y(87.0f), sPrintIcon);
++				}
++			}
++		}
++	}
++}
++
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++// Called by the Vulkan backend with the wrist minimap's target open and the
++// interface transform mapping these screen coordinates straight onto it. The
++// frame has not drawn anything yet at this point, so the 2D states the map
++// expects are set here rather than inherited.
++void
++VrDrawWristRadarContents(void)
++{
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
++	DrawRadarContents();
++}
++
++// The finished map on the player's arm: one textured quad, depth tested like
++// anything else out there. False when the panel is off, so the flat interface
++// draws the radar as it always did.
++static bool
++DrawWristRadarQuad(void)
++{
++	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_MAP))
++		return false;
++	// A vehicle either hides the arms or puts them somewhere a panel cannot be
++	// read, so the classic interface comes back for the drive.
++	if (FindPlayerVehicle() != nil)
++		return false;
++
++	const float width = SCREEN_SCALE_X(RADAR_WIDTH)+SCREEN_SCALE_X(12.0f);
++	const float height = SCREEN_SCALE_Y(RADAR_HEIGHT)+SCREEN_SCALE_Y(12.0f);
++	const float centreX = SCREEN_SCALE_X_FIX(RADAR_LEFT)+
++		SCREEN_SCALE_X(RADAR_WIDTH)*0.5f;
++	const float centreY = SCREEN_SCALE_FROM_BOTTOM(RADAR_BOTTOM+RADAR_HEIGHT)+
++		SCREEN_SCALE_Y(RADAR_HEIGHT)*0.5f;
++	// This is also what asks for the next frame's render, so it runs even on
++	// the frames where there is nothing to show yet.
++	RwRaster *map = (RwRaster*)androidgame::BeginVrWristPanel(
++		VR_WRIST_PANEL_MAP, centreX, centreY, width, height);
++	if (map == nil)
++		return true;
++
++	CRect rect(centreX-width*0.5f, centreY-height*0.5f,
++		centreX+width*0.5f, centreY+height*0.5f);
++	const CRGBA white(255, 255, 255, 255);
++	CSprite2d::SetVertices(rect, white, white, white, white);
++	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, map);
++	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
++	// Blended so the map keeps its round shape, and depth tested because it is
++	// a thing on the arm now. No depth write: the transparent corners have no
++	// business masking anything.
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	GameRender::SubmitImmediate2D(rwPRIMTYPETRIFAN, CSprite2d::GetVertices(), 4);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	androidgame::EndVrWristPanel();
++	return true;
++}
++
++// Called by the Vulkan backend with the status panel's target open and the
++// interface transform mapping these screen coordinates straight onto it.
++void
++VrDrawWristStatusContents(void)
++{
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	DrawStatusContents();
++	// Text is batched and would otherwise be flushed long after this pass has
++	// closed -- straight onto the interface plane instead of into the panel.
++	CFont::DrawFonts();
++}
++
++// The finished readout on the player's other arm. False when the panel is
++// off, so the flat interface draws it as it always did.
++static bool
++DrawWristStatusQuad(void)
++{
++	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_STATUS) ||
++		FindPlayerVehicle() != nil)
++		return false;
++
++	// The block the money, health, armour and wanted rows occupy, with a
++	// little air around it.
++	const float left = SCREEN_SCALE_FROM_RIGHT(292.0f);
++	const float right = SCREEN_SCALE_FROM_RIGHT(96.0f);
++	const float top = SCREEN_SCALE_Y(30.0f);
++	const float bottom = SCREEN_SCALE_Y(106.0f);
++	const float width = right-left;
++	const float height = bottom-top;
++	// This is also what asks for the next frame's render, so it runs even on
++	// the frames where there is nothing to show yet.
++	RwRaster *panel = (RwRaster*)androidgame::BeginVrWristPanel(
++		VR_WRIST_PANEL_STATUS, (left+right)*0.5f, (top+bottom)*0.5f,
++		width, height);
++	if (panel == nil)
++		return true;
++
++	CRect rect(left, top, right, bottom);
++	const CRGBA white(255, 255, 255, 255);
++	CSprite2d::SetVertices(rect, white, white, white, white);
++	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, panel);
++	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	GameRender::SubmitImmediate2D(rwPRIMTYPETRIFAN, CSprite2d::GetVertices(), 4);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	androidgame::EndVrWristPanel();
++	return true;
++}
++#endif
++
++
+ void CHud::Draw()
+ {
+ 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
+@@ -382,6 +723,15 @@
  					RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
  				}
  				else {
@@ -17,7 +380,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  					int sprite = HUD_SITESNIPER;
  					float xOffset = SCREEN_SCALE_X(210.0f);
  					float yOffset = SCREEN_SCALE_Y(210.0f);
-@@ -464,6 +473,7 @@
+@@ -464,6 +814,7 @@
  			RwRenderStateSet(rwRENDERSTATESRCBLEND, (void *)rwBLENDSRCALPHA);
  			RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void *)rwBLENDINVSRCALPHA);
  			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
@@ -25,6 +388,252 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  		}
  		else {
  			SpriteBrightness = 0;
+@@ -473,42 +824,20 @@
+ 			return;
+ 
+ 		/*
+-			DrawMoneyCounter
++			DrawMoneyCounter, DrawHealth, DrawArmour, DrawWantedLevel
+ 		*/
+ 
+ 		wchar sPrint[16];
+-		wchar sPrintIcon[16];
+ 		char sTemp[16];
+ 		float alpha;
+ 
+-		if (m_LastDisplayScore == CWorld::Players[CWorld::PlayerInFocus].m_nVisibleMoney) {
+-			alpha = DrawFadeState(HUD_SCORE_FADING, 0);
+-		} else {
+-			alpha = DrawFadeState(HUD_SCORE_FADING, 1);
+-			m_LastDisplayScore = CWorld::Players[CWorld::PlayerInFocus].m_nVisibleMoney;
+-		}
+-		if (m_DisplayScoreState != FADED_OUT) {
+-			sprintf(sTemp, "$%08d", CWorld::Players[CWorld::PlayerInFocus].m_nVisibleMoney);
+-			AsciiToUnicode(sTemp, sPrint);
+-
+-			CFont::SetPropOff();
+-			CFont::SetBackgroundOff();
+-			CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
+-			CFont::SetCentreOff();
+-			CFont::SetRightJustifyOn();
+-			CFont::SetRightJustifyWrap(0.0f);
+-			CFont::SetBackGroundOnlyTextOff();
+-			CFont::SetFontStyle(FONT_HEADING);
+-			CFont::SetPropOff();
+-			CFont::SetDropShadowPosition(2);
+-			CFont::SetDropColor(CRGBA(0, 0, 0, alpha));
+-			MONEY_COLOR.a = alpha;
+-			CFont::SetColor(MONEY_COLOR);
+-
+-			if (FrontEndMenuManager.m_PrefsShowHud) {
+-				CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f), SCREEN_SCALE_Y(43.0f), sPrint);
+-			}
+-		}
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		// Money, health, armour and the wanted level live on the player's
++		// other wrist in that mode: they were rendered into a texture of
++		// their own before this frame opened its pass.
++		if (!DrawWristStatusQuad())
++#endif
++		DrawStatusContents();
+ 
+ 		/*
+ 			DrawAmmo
+@@ -548,7 +877,14 @@
+ 				DrawWeaponIcon
+ 			*/
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++			// Optional on the headset: the gun is in the player's hand, so the
++			// icon is telling them what they can already see.
++			if (FrontEndMenuManager.m_PrefsShowHud &&
++				androidgame::VrHudWeaponPanelEnabled()) {
++#else
+ 			if (FrontEndMenuManager.m_PrefsShowHud) {
++#endif
+ 				if (weaponInfo->m_nModelId <= 0) {
+ 					RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
+ 					if (FrontEndMenuManager.m_PrefsShowHud)
+@@ -611,127 +947,6 @@
+ 			}
+ 		}
+ 
+-		/*
+-			DrawHealth
+-		*/
+-		if ( m_LastTimeEnergyLost == CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss ) {
+-			CHud::DrawFadeState(HUD_ENERGY_FADING, 0);
+-		} else {
+-			CHud::DrawFadeState(HUD_ENERGY_FADING, 1);
+-			m_LastTimeEnergyLost = CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss;
+-		}
+-
+-		if (m_EnergyLostState != FADED_OUT) {
+-			CFont::SetBackgroundOff();
+-			CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
+-			CFont::SetJustifyOff();
+-			CFont::SetCentreOff();
+-			CFont::SetRightJustifyWrap(0.0f);
+-			CFont::SetRightJustifyOn();
+-			CFont::SetPropOff();
+-			CFont::SetFontStyle(FONT_HEADING);
+-			CFont::SetDropShadowPosition(2);
+-			CFont::SetDropColor(CRGBA(0, 0, 0, 255));
+-
+-			if (m_ItemToFlash == ITEM_HEALTH && CTimer::GetFrameCounter() & 8
+-				|| m_ItemToFlash != ITEM_HEALTH
+-				|| playerPed->m_fHealth < 10
+-				&& CTimer::GetFrameCounter() & 8) {
+-				if (playerPed->m_fHealth >= 10
+-					|| playerPed->m_fHealth < 10 && CTimer::GetFrameCounter() & 8) {
+-
+-					AsciiToUnicode("{", sPrintIcon);
+-#ifdef FIX_BUGS
+-					sprintf(sTemp, "%03d", int32(playerPed->m_fHealth + 0.5f));
+-#else
+-					sprintf(sTemp, "%03d", (int32)playerPed->m_fHealth);
+-#endif
+-					AsciiToUnicode(sTemp, sPrint);
+-
+-					CFont::SetColor(HEALTH_COLOR);
+-					if (FrontEndMenuManager.m_PrefsShowHud) {
+-						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f), SCREEN_SCALE_Y(65.0f), sPrint);
+-
+-						if (!CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss || CTimer::GetTimeInMilliseconds() > CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastHealthLoss + 2000 || CTimer::GetFrameCounter() & 4) {
+-							// CFont::SetColor(HEALTH_COLOR);
+-							CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 54.0f), SCREEN_SCALE_Y(65.0f), sPrintIcon);
+-						}
+-					}
+-				}
+-			}
+-
+-			/*
+-				DrawArmour
+-			*/
+-			if (m_ItemToFlash == ITEM_ARMOUR && CTimer::GetFrameCounter() & 8 || m_ItemToFlash != ITEM_ARMOUR) {
+-				CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
+-				if (playerPed->m_fArmour > 1.0f) {
+-					AsciiToUnicode("<", sPrintIcon);
+-#ifdef FIX_BUGS
+-					sprintf(sTemp, "%03d", int32(playerPed->m_fArmour + 0.5f));
+-#else
+-					sprintf(sTemp, "%03d", (int32)playerPed->m_fArmour);
+-#endif
+-					AsciiToUnicode(sTemp, sPrint);
+-
+-					CFont::SetColor(ARMOUR_COLOR);
+-					if (FrontEndMenuManager.m_PrefsShowHud) {
+-
+-						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(182.0f), SCREEN_SCALE_Y(65.0f), sPrint);
+-
+-						if (!CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastArmourLoss || CTimer::GetTimeInMilliseconds() > CWorld::Players[CWorld::PlayerInFocus].m_nTimeLastArmourLoss + 2000 || CTimer::GetFrameCounter() & 4) {
+-							// CFont::SetColor(ARMOUR_COLOR);
+-							CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(182.0f + 52.0f), SCREEN_SCALE_Y(65.0f), sPrintIcon);
+-						}
+-					}
+-				}
+-			}
+-		}
+-
+-		/*
+-			DrawWantedLevel
+-		*/
+-		if (m_LastWanted == playerPed->m_pWanted->GetWantedLevel()) {
+-			alpha = DrawFadeState(HUD_WANTED_FADING, 0);
+-		} else {
+-			alpha = DrawFadeState(HUD_WANTED_FADING, 1);
+-			m_LastWanted = playerPed->m_pWanted->GetWantedLevel();
+-		}
+-
+-		if (m_WantedState != FADED_OUT) {
+-			CFont::SetBackgroundOff();
+-			CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
+-			CFont::SetJustifyOff();
+-			CFont::SetCentreOff();
+-			CFont::SetRightJustifyOn();
+-			CFont::SetPropOn();
+-			CFont::SetFontStyle(FONT_STANDARD);
+-
+-			AsciiToUnicode(">", sPrintIcon);
+-
+-			for (int i = 0; i < 6; i++) {
+-				if (FrontEndMenuManager.m_PrefsShowHud) {
+-					if (playerPed->m_pWanted->GetWantedLevel() > i
+-						&& (CTimer::GetTimeInMilliseconds() > playerPed->m_pWanted->m_nLastWantedLevelChange
+-							+ 2000 || CTimer::GetFrameCounter() & 4)) {
+-
+-						WANTED_COLOR.a = alpha;
+-						CFont::SetColor(WANTED_COLOR);
+-						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 23.0f * i), SCREEN_SCALE_Y(87.0f), sPrintIcon);
+-
+-					} else if (playerPed->m_pWanted->m_nMinWantedLevel > i && CTimer::GetFrameCounter() & 4) {
+-						WANTED_COLOR_FLASH.a = alpha;
+-						CFont::SetColor(WANTED_COLOR_FLASH);
+-						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 23.0f * i), SCREEN_SCALE_Y(87.0f), sPrintIcon);
+-
+-					} else if (playerPed->m_pWanted->GetWantedLevel() <= i) {
+-						NOTWANTED_COLOR.a = alpha;
+-						CFont::SetColor(NOTWANTED_COLOR);
+-						CFont::PrintString(SCREEN_SCALE_FROM_RIGHT(110.0f + 23.0f * i), SCREEN_SCALE_Y(87.0f), sPrintIcon);
+-					}
+-				}
+-			}
+-		}
+ 
+ 		static int32 nMediaLevelCounter = 0;
+ 		if (CStats::ShowChaseStatOnScreen != 0) {
+@@ -988,7 +1203,13 @@
+ 		/*
+ 			DrawClock
+ 		*/
+-		if (m_ClockState) {
++		if (m_ClockState
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++			// Its own switch on the headset: the one piece of the readout a
++			// player is most likely not to want floating in front of them.
++			&& androidgame::VrHudClockEnabled()
++#endif
++			) {
+ 			CFont::SetJustifyOff();
+ 			CFont::SetCentreOff();
+ 			CFont::SetBackgroundOff();
+@@ -1129,30 +1350,13 @@
+ 		*/
+ 		if (FrontEndMenuManager.m_PrefsRadarMode != 2 &&
+ 			!m_HideRadar && (m_ItemToFlash == ITEM_RADAR && CTimer::GetFrameCounter() & 8 || m_ItemToFlash != ITEM_RADAR)) {
+-
+-			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
+-			CRadar::DrawMap();
+-			// DrawRadarMap intentionally leaves its strict depth state active
+-			// for the circular mask. The disc and blips are HUD geometry and
+-			// must remain visible over a vehicle cockpit.
+-			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+-			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+-			if (FrontEndMenuManager.m_PrefsRadarMode != 1) {
+-				CRect rect(0.0f, 0.0f, SCREEN_SCALE_X(RADAR_WIDTH), SCREEN_SCALE_Y(RADAR_HEIGHT));
+-				
+-				rect.Translate(SCREEN_SCALE_X_FIX(RADAR_LEFT), SCREEN_SCALE_FROM_BOTTOM(RADAR_BOTTOM + RADAR_HEIGHT));
+-
+-#ifdef FIX_BUGS
+-				rect.Grow(SCREEN_SCALE_X(6.0f), SCREEN_SCALE_X(6.0f), SCREEN_SCALE_Y(6.0f), SCREEN_SCALE_Y(6.0f));
+-#else
+-				rect.Grow(6.0f);
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++			// Wrist mode draws no map here. It was rendered into a texture of
++			// its own before this frame opened its pass -- see
++			// VrDrawWristRadarContents -- and lands on the arm as one quad.
++			if (!DrawWristRadarQuad())
+ #endif
+-				rect.Translate(SCREEN_SCALE_X_FIX(0.0f), SCREEN_SCALE_Y_FIX(2.0f));
+-				Sprites[HUD_RADARDISC].Draw(rect, CRGBA(0, 0, 0, 255));
+-				rect.Translate(SCREEN_SCALE_X_FIX(0.0f), SCREEN_SCALE_Y_FIX(-2.0f));
+-				Sprites[HUD_RADARDISC].Draw(rect, RADARDISC_COLOR);
+-			}
+-			CRadar::DrawBlips();
++			DrawRadarContents();
+ 		}
+ 	}
+ 
 diff --git a/src/core/Frontend.cpp b/src/core/Frontend.cpp
 --- a/src/core/Frontend.cpp
 +++ b/src/core/Frontend.cpp

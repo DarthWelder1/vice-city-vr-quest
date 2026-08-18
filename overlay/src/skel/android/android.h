@@ -98,7 +98,30 @@ bool VrMenuConsumesInput(void);
 bool VrViceCityColorEnabled(void);
 bool VrFxaaEnabled(void);
 int VrSpatialAaMode(void);
+// Wrist panels: the minimap and the money/health/wanted readout, each on its
+// own arm. Index with the WRIST_PANEL_* values from librw's rwvk.h.
+bool VrWristPanelEnabled(int panel);
+bool VrWristPanelUnderside(int panel);
+// Which wrist a panel is worn on, and where exactly it sits there. Nothing
+// about a grip pose locates the wrist behind it, so this is calibrated in the
+// HUD menu. The values belong to the side of the wrist in use, not to a hand:
+// only the left hand is ever calibrated and the right one mirrors it.
+int VrWristPanelHand(int panel);
+void VrGetWristPanelCalibration(int panel, float *alongCm, float *acrossCm,
+                                float *liftCm, float *pitchDeg, float *yawDeg,
+                                float *rollDeg, float *scale);
+// The weapon icon and ammo counter in the corner of the interface, and the
+// clock above them. Both are switches of their own on the headset.
+bool VrHudWeaponPanelEnabled(void);
+bool VrHudClockEnabled(void);
 bool VrGameplayHudEnabled(void);
+// Puts the interface plane on a wrist and hands back that panel's texture to
+// bind, or null when there is nothing to show yet; End restores the
+// head-locked plane. Each call also asks the backend to render the panel at
+// the top of the next frame -- that request is one-shot on purpose.
+void *BeginVrWristPanel(int panel, float centreX, float centreY, float width,
+                        float height);
+void EndVrWristPanel(void);
 void VrGetGameplayHudSettings(int *widthPercent, int *scalePercent,
                               int *offsetXCm, int *offsetYCm);
 bool VrUsesHeadRelativeMovement(void);

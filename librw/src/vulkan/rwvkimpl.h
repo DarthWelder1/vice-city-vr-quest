@@ -230,6 +230,17 @@ struct Globals
 	float32 headPosition[3];
 	float32 headYaw;
 	float32 headQuat[4];
+	// Active Im2D plane. It lives here rather than in the once-per-frame
+	// scene block so a draw can move the interface mid-frame -- the wrist
+	// minimap swaps it around the radar and puts it back.
+	float32 im2dTransformActive[16];
+	// Wrist panels. Each draws into a private little target before the
+	// frame's own pass opens; wristPanelOffscreen tells the Im2D path that
+	// the model slot is carrying a straight screen-pixels-to-clip matrix for
+	// one of them.
+	void (*wristPanelRenderer[2])(void);
+	bool32 wristPanelWanted[2];
+	bool32 wristPanelOffscreen;
 	float32 eyePosition[2][3];
 	float32 eyeQuat[2][4];
 	bool32 eyePosesValid;

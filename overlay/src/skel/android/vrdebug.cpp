@@ -124,6 +124,58 @@ static int gQuestSgsrMode = rw::vulkan::SGSR_OFF;
 static int gQuestMsaaSamples = 1;
 static int gOcclusionCullingMode = VR_OCCLUSION_CULLING_AUTHORED;
 static bool gGameplayHudEnabled = true;
+// Wrist panels: pieces of the interface ride a controller like a watch
+// instead of sitting on the head-locked plane. The map is one, the money /
+// health / armour / wanted readout is the other.
+enum {
+	WRIST_PANEL_MAP = 0,
+	WRIST_PANEL_STATUS,
+	WRIST_PANEL_COUNT
+};
+// Where a panel actually sits. A controller grip pose says nothing about the
+// wrist behind it, and the outside and the inside of a wrist are not the same
+// place, so the two sides are calibrated separately. Only the left hand is
+// ever adjusted: the right one is the mirror image of it and is derived.
+// Distances are tenths of a centimetre, angles tenths of a degree.
+enum {
+	WRIST_SIDE_OUTER = 0,
+	WRIST_SIDE_INNER,
+	WRIST_SIDE_COUNT
+};
+// Defaults are a placement worn and tuned in the headset rather than zeroes,
+// so the calibration page is there to suit a different arm, not to make the
+// panels usable at all.
+struct WristPlacement {
+	int along, across, lift, pitch, yaw, roll, size;
+};
+static const WristPlacement kWristDefault[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT] = {
+	{	// minimap, outer then inner
+		{ -61, -28, -25,  95, -955,  1200,  55 },
+		{ -55, -33, -52,  95, -955,  -539,  55 }
+	},
+	{	// status readout
+		{ -62, -26, -16,  30, -867, -1521, 100 },
+		{ -62, -32, -16,  30, -803,  -132, 100 }
+	}
+};
+static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false };
+static bool gWristPanelUnderside[WRIST_PANEL_COUNT] = { true, true };
+// One panel per wrist: the map on the left, the readout on the right.
+static int gWristPanelHand[WRIST_PANEL_COUNT] = { 0, 1 };
+static int gWristAlong[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static int gWristAcross[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static int gWristLift[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static int gWristPitch[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static int gWristYaw[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static int gWristRoll[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static int gWristSize[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+// Settings key prefixes. The map keeps the names it shipped with so an
+// existing calibration is read back unchanged.
+static const char *const kWristPanelKey[WRIST_PANEL_COUNT] = { "", "Status" };
+// Weapon icon, ammo counter and clock. Part of the classic interface, which is
+// what a new player gets: the immersive layout is what switches them off.
+static bool gHudWeaponPanel = true;
+static bool gHudClock = true;
 static int gHudWidthPercent = 100;
 static int gHudScalePercent = 130;
 static int gHudOffsetXCm;
@@ -144,6 +196,9 @@ static int gVrMenuSelection;
 static int gVrGraphicsSelection;
 static int gVrWeaponsSelection;
 static int gVrHudSelection;
+static int gVrWristRadarSelection;
+// Which panel the calibration page is editing: the row that opened it decides.
+static int gVrWristPanelEdit;
 static int gVrTrafficSelection;
 static int gVrModelAssetsSelection;
 static int gVrCheatSelection;
@@ -176,6 +231,7 @@ enum {
 	VR_MENU_PAGE_GRAPHICS,
 	VR_MENU_PAGE_WEAPONS,
 	VR_MENU_PAGE_HUD,
+	VR_MENU_PAGE_WRIST_RADAR,
 	VR_MENU_PAGE_TRAFFIC,
 	VR_MENU_PAGE_MODEL_ASSETS,
 	VR_MENU_PAGE_VEHICLE,
@@ -200,13 +256,39 @@ enum eVrTrafficMenuItem {
 };
 
 enum eVrHudMenuItem {
-	VR_HUD_ENABLED = 0,
+	VR_HUD_PRESET = 0,
+	VR_HUD_ENABLED,
 	VR_HUD_HORIZONTAL_SCALE,
 	VR_HUD_SCALE,
 	VR_HUD_OFFSET_X,
 	VR_HUD_OFFSET_Y,
+	VR_HUD_WRIST_RADAR,
+	VR_HUD_WRIST_RADAR_SIDE,
+	VR_HUD_WRIST_RADAR_CALIBRATE,
+	VR_HUD_WRIST_STATUS,
+	VR_HUD_WRIST_STATUS_CALIBRATE,
+	VR_HUD_WEAPON_PANEL,
+	VR_HUD_CLOCK,
 	VR_HUD_BACK,
 	VR_HUD_ITEM_COUNT
+};
+
+// Placement of the wrist minimap. Outside and inside of a wrist are separate
+// sets: they are different places on the arm and do not share numbers.
+enum eVrWristRadarMenuItem {
+	VR_WRIST_SIDE = 0,
+	VR_WRIST_HAND,
+	VR_WRIST_ALONG,
+	VR_WRIST_ACROSS,
+	VR_WRIST_LIFT,
+	VR_WRIST_PITCH,
+	VR_WRIST_YAW,
+	VR_WRIST_ROLL,
+	VR_WRIST_SIZE,
+	VR_WRIST_COPY,
+	VR_WRIST_RESET,
+	VR_WRIST_BACK,
+	VR_WRIST_ITEM_COUNT
 };
 
 // Native Quest exposes only settings backed by its Vulkan/OpenXR runtime.
@@ -476,6 +558,63 @@ LoadVrSettings(void)
 	}
 	CShadows::SetRenderEnabled(GetPrivateProfileIntA("VR", "ShadowsEnabled",
 		1, ".\\vr_settings.ini") != 0);
+	gWristPanelOn[WRIST_PANEL_MAP] = GetPrivateProfileIntA("VR",
+		"WristRadar", 0, ".\\vr_settings.ini") != 0;
+	gWristPanelUnderside[WRIST_PANEL_MAP] = GetPrivateProfileIntA("VR",
+		"WristRadarUnderside", 1, ".\\vr_settings.ini") != 0;
+	gWristPanelHand[WRIST_PANEL_MAP] = GetPrivateProfileIntA("VR",
+		"WristRadarHand", 0, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gWristPanelOn[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
+		"WristStatus", 0, ".\\vr_settings.ini") != 0;
+	gWristPanelUnderside[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
+		"WristStatusUnderside", 1, ".\\vr_settings.ini") != 0;
+	gWristPanelHand[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
+		"WristStatusHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	for(int panel = 0; panel < WRIST_PANEL_COUNT; panel++)
+		for(int side = 0; side < WRIST_SIDE_COUNT; side++){
+			const WristPlacement &fallback = kWristDefault[panel][side];
+			const char *name = side == WRIST_SIDE_INNER ? "Inner" : "Outer";
+			char key[64];
+			snprintf(key, sizeof(key), "Wrist%s%sAlong",
+				kWristPanelKey[panel], name);
+			gWristAlong[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.along,
+				".\\vr_settings.ini"), -300), 300);
+			snprintf(key, sizeof(key), "Wrist%s%sAcross",
+				kWristPanelKey[panel], name);
+			gWristAcross[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.across,
+				".\\vr_settings.ini"), -300), 300);
+			snprintf(key, sizeof(key), "Wrist%s%sLift",
+				kWristPanelKey[panel], name);
+			gWristLift[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.lift,
+				".\\vr_settings.ini"), -300), 300);
+			snprintf(key, sizeof(key), "Wrist%s%sPitch",
+				kWristPanelKey[panel], name);
+			gWristPitch[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.pitch,
+				".\\vr_settings.ini"), -1800), 1800);
+			snprintf(key, sizeof(key), "Wrist%s%sYaw",
+				kWristPanelKey[panel], name);
+			gWristYaw[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.yaw,
+				".\\vr_settings.ini"), -1800), 1800);
+			snprintf(key, sizeof(key), "Wrist%s%sRoll",
+				kWristPanelKey[panel], name);
+			gWristRoll[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.roll,
+				".\\vr_settings.ini"), -1800), 1800);
+			snprintf(key, sizeof(key), "Wrist%s%sSize",
+				kWristPanelKey[panel], name);
+			gWristSize[panel][side] = Min(Max((int)(int32)
+				GetPrivateProfileIntA("VR", key, fallback.size,
+				".\\vr_settings.ini"), 40), 250);
+		}
+	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 1,
+		".\\vr_settings.ini") != 0;
+	gHudClock = GetPrivateProfileIntA("VR", "HudClock", 1,
+		".\\vr_settings.ini") != 0;
 	gGameplayHudEnabled =
 		GetPrivateProfileIntA("VR", "GameplayHud", 1,
 			".\\vr_settings.ini") != 0;
@@ -578,6 +717,82 @@ SaveGameplayHud(void)
 {
 	WritePrivateProfileStringA("VR", "GameplayHud",
 		gGameplayHudEnabled ? "1" : "0", ".\\vr_settings.ini");
+}
+
+static void
+SaveWristPanels(void)
+{
+	WritePrivateProfileStringA("VR", "WristRadar",
+		gWristPanelOn[WRIST_PANEL_MAP] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristRadarUnderside",
+		gWristPanelUnderside[WRIST_PANEL_MAP] ? "1" : "0",
+		".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristRadarHand",
+		gWristPanelHand[WRIST_PANEL_MAP] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristStatus",
+		gWristPanelOn[WRIST_PANEL_STATUS] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristStatusUnderside",
+		gWristPanelUnderside[WRIST_PANEL_STATUS] ? "1" : "0",
+		".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristStatusHand",
+		gWristPanelHand[WRIST_PANEL_STATUS] ? "1" : "0",
+		".\\vr_settings.ini");
+	static const char *const names[7] = {
+		"Along", "Across", "Lift", "Pitch", "Yaw", "Roll", "Size"
+	};
+	for(int panel = 0; panel < WRIST_PANEL_COUNT; panel++)
+		for(int side = 0; side < WRIST_SIDE_COUNT; side++){
+			const int values[7] = {
+				gWristAlong[panel][side], gWristAcross[panel][side],
+				gWristLift[panel][side], gWristPitch[panel][side],
+				gWristYaw[panel][side], gWristRoll[panel][side],
+				gWristSize[panel][side]
+			};
+			for(int item = 0; item < 7; item++){
+				char key[64], value[32];
+				snprintf(key, sizeof(key), "Wrist%s%s%s",
+					kWristPanelKey[panel],
+					side == WRIST_SIDE_INNER ? "Inner" : "Outer",
+					names[item]);
+				snprintf(value, sizeof(value), "%d", values[item]);
+				WritePrivateProfileStringA("VR", key, value,
+					".\\vr_settings.ini");
+			}
+		}
+}
+
+// IMMERSIVE puts what has to be read on the arms and drops the corner
+// clutter; CLASSIC is the desktop game's interface, all of it, in front of
+// the face. Classic is what a new player gets.
+enum {
+	VR_HUD_PRESET_IMMERSIVE = 0,
+	VR_HUD_PRESET_CLASSIC,
+	VR_HUD_PRESET_CUSTOM
+};
+
+static int
+CurrentHudPreset(void)
+{
+	if(gWristPanelOn[WRIST_PANEL_MAP] && gWristPanelOn[WRIST_PANEL_STATUS] &&
+	   !gHudWeaponPanel && !gHudClock)
+		return VR_HUD_PRESET_IMMERSIVE;
+	if(!gWristPanelOn[WRIST_PANEL_MAP] && !gWristPanelOn[WRIST_PANEL_STATUS] &&
+	   gHudWeaponPanel && gHudClock)
+		return VR_HUD_PRESET_CLASSIC;
+	return VR_HUD_PRESET_CUSTOM;
+}
+
+static void
+ApplyHudPreset(int preset)
+{
+	const bool immersive = preset == VR_HUD_PRESET_IMMERSIVE;
+	gWristPanelOn[WRIST_PANEL_MAP] = immersive;
+	gWristPanelOn[WRIST_PANEL_STATUS] = immersive;
+	gHudWeaponPanel = !immersive;
+	gHudClock = !immersive;
+	SaveWristPanels();
+	SaveVrInteger("HudWeaponPanel", gHudWeaponPanel ? 1 : 0);
+	SaveVrInteger("HudClock", gHudClock ? 1 : 0);
 }
 
 static void
@@ -720,6 +935,7 @@ CurrentMenuSelection(void)
 	case VR_MENU_PAGE_GRAPHICS: return &gVrGraphicsSelection;
 	case VR_MENU_PAGE_WEAPONS: return &gVrWeaponsSelection;
 	case VR_MENU_PAGE_HUD: return &gVrHudSelection;
+	case VR_MENU_PAGE_WRIST_RADAR: return &gVrWristRadarSelection;
 	case VR_MENU_PAGE_TRAFFIC: return &gVrTrafficSelection;
 	case VR_MENU_PAGE_MODEL_ASSETS: return &gVrModelAssetsSelection;
 	case VR_MENU_PAGE_VEHICLE: return &gVrVehicleSelection;
@@ -744,6 +960,7 @@ CurrentMenuItemCount(void)
 	case VR_MENU_PAGE_GRAPHICS: return VR_GRAPHICS_ITEM_COUNT;
 	case VR_MENU_PAGE_WEAPONS: return VR_WEAPONS_ITEM_COUNT;
 	case VR_MENU_PAGE_HUD: return VR_HUD_ITEM_COUNT;
+	case VR_MENU_PAGE_WRIST_RADAR: return VR_WRIST_ITEM_COUNT;
 	case VR_MENU_PAGE_TRAFFIC: return VR_TRAFFIC_ITEM_COUNT;
 	case VR_MENU_PAGE_MODEL_ASSETS: return VR_MODEL_ASSETS_ITEM_COUNT;
 	case VR_MENU_PAGE_VEHICLE: return VR_VEHICLE_ITEM_COUNT;
@@ -772,6 +989,9 @@ CurrentMenuValueRepeats(void)
 	if(gVrMenuPage == VR_MENU_PAGE_HUD)
 		return gVrHudSelection >= VR_HUD_HORIZONTAL_SCALE &&
 			gVrHudSelection <= VR_HUD_OFFSET_Y;
+	if(gVrMenuPage == VR_MENU_PAGE_WRIST_RADAR)
+		return gVrWristRadarSelection >= VR_WRIST_ALONG &&
+			gVrWristRadarSelection <= VR_WRIST_SIZE;
 	if(gVrMenuPage == VR_MENU_PAGE_TRAFFIC)
 		return gVrTrafficSelection == VR_TRAFFIC_PEDESTRIANS ||
 			gVrTrafficSelection == VR_TRAFFIC_VEHICLES;
@@ -807,6 +1027,10 @@ ReturnFromCurrentMenuPage(void)
 	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION){
 		OculusVR::SetQuestVehicleCalibrationPreview(false);
 		gVrMenuPage = VR_MENU_PAGE_VEHICLE;
+		return;
+	}
+	if(gVrMenuPage == VR_MENU_PAGE_WRIST_RADAR){
+		gVrMenuPage = VR_MENU_PAGE_HUD;
 		return;
 	}
 	gVrMenuPage = VR_MENU_PAGE_SETTINGS;
@@ -1243,6 +1467,13 @@ VrDebugUpdate(const PadInput &in)
 		         (positivePulse || decreasePulse)){
 			const int direction = decreasePulse ? -1 : 1;
 			switch(gVrHudSelection){
+			case VR_HUD_PRESET:
+				// From anything custom the switch lands on immersive.
+				ApplyHudPreset(
+					CurrentHudPreset() == VR_HUD_PRESET_IMMERSIVE ?
+						VR_HUD_PRESET_CLASSIC :
+						VR_HUD_PRESET_IMMERSIVE);
+				break;
 			case VR_HUD_ENABLED:
 				gGameplayHudEnabled = !gGameplayHudEnabled;
 				SaveGameplayHud();
@@ -1267,8 +1498,123 @@ VrDebugUpdate(const PadInput &in)
 					gHudOffsetYCm+direction, -100), 100);
 				SaveVrInteger("HudOffsetYCm", gHudOffsetYCm);
 				break;
+			case VR_HUD_WRIST_RADAR:
+				gWristPanelOn[WRIST_PANEL_MAP] =
+					!gWristPanelOn[WRIST_PANEL_MAP];
+				SaveWristPanels();
+				break;
+			case VR_HUD_WRIST_RADAR_SIDE:
+				gWristPanelUnderside[WRIST_PANEL_MAP] =
+					!gWristPanelUnderside[WRIST_PANEL_MAP];
+				SaveWristPanels();
+				break;
+			case VR_HUD_WRIST_RADAR_CALIBRATE:
+				gVrMenuPage = VR_MENU_PAGE_WRIST_RADAR;
+				gVrWristPanelEdit = WRIST_PANEL_MAP;
+				gVrWristRadarSelection = 0;
+				break;
+			case VR_HUD_WRIST_STATUS:
+				gWristPanelOn[WRIST_PANEL_STATUS] =
+					!gWristPanelOn[WRIST_PANEL_STATUS];
+				SaveWristPanels();
+				break;
+			case VR_HUD_WRIST_STATUS_CALIBRATE:
+				gVrMenuPage = VR_MENU_PAGE_WRIST_RADAR;
+				gVrWristPanelEdit = WRIST_PANEL_STATUS;
+				gVrWristRadarSelection = 0;
+				break;
+			case VR_HUD_WEAPON_PANEL:
+				gHudWeaponPanel = !gHudWeaponPanel;
+				SaveVrInteger("HudWeaponPanel",
+					gHudWeaponPanel ? 1 : 0);
+				break;
+			case VR_HUD_CLOCK:
+				gHudClock = !gHudClock;
+				SaveVrInteger("HudClock", gHudClock ? 1 : 0);
+				break;
 			case VR_HUD_BACK:
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+				break;
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_WRIST_RADAR &&
+		         (positivePulse || decreasePulse)){
+			const int direction = decreasePulse ? -1 : 1;
+			const int step = direction*repeatMagnitude;
+			const int panel = gVrWristPanelEdit;
+			const int side = gWristPanelUnderside[panel] ?
+				WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
+			const int other = side == WRIST_SIDE_INNER ?
+				WRIST_SIDE_OUTER : WRIST_SIDE_INNER;
+			switch(gVrWristRadarSelection){
+			case VR_WRIST_SIDE:
+				// The same setting the HUD page shows: switching it here both
+				// moves the panel and picks the values being edited.
+				gWristPanelUnderside[panel] = !gWristPanelUnderside[panel];
+				SaveWristPanels();
+				break;
+			case VR_WRIST_HAND:
+				gWristPanelHand[panel] = 1-gWristPanelHand[panel];
+				SaveWristPanels();
+				break;
+			case VR_WRIST_ALONG:
+				gWristAlong[panel][side] = Min(Max(
+					gWristAlong[panel][side]+step, -300), 300);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_ACROSS:
+				gWristAcross[panel][side] = Min(Max(
+					gWristAcross[panel][side]+step, -300), 300);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_LIFT:
+				gWristLift[panel][side] = Min(Max(
+					gWristLift[panel][side]+step, -300), 300);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_PITCH:
+				gWristPitch[panel][side] = Min(Max(
+					gWristPitch[panel][side]+step, -1800), 1800);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_YAW:
+				gWristYaw[panel][side] = Min(Max(
+					gWristYaw[panel][side]+step, -1800), 1800);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_ROLL:
+				gWristRoll[panel][side] = Min(Max(
+					gWristRoll[panel][side]+step, -1800), 1800);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_SIZE:
+				gWristSize[panel][side] = Min(Max(
+					gWristSize[panel][side]+step, 40), 250);
+				SaveWristPanels();
+				break;
+			case VR_WRIST_COPY:
+				// A starting point, not a result: the other side is
+				// usually close enough to calibrate from.
+				gWristAlong[panel][side] = gWristAlong[panel][other];
+				gWristAcross[panel][side] = gWristAcross[panel][other];
+				gWristLift[panel][side] = gWristLift[panel][other];
+				gWristPitch[panel][side] = gWristPitch[panel][other];
+				gWristYaw[panel][side] = gWristYaw[panel][other];
+				gWristRoll[panel][side] = gWristRoll[panel][other];
+				gWristSize[panel][side] = gWristSize[panel][other];
+				SaveWristPanels();
+				break;
+			case VR_WRIST_RESET:
+				gWristAlong[panel][side] = 0;
+				gWristAcross[panel][side] = 0;
+				gWristLift[panel][side] = 0;
+				gWristPitch[panel][side] = 0;
+				gWristYaw[panel][side] = 0;
+				gWristRoll[panel][side] = 0;
+				gWristSize[panel][side] = 100;
+				SaveWristPanels();
+				break;
+			case VR_WRIST_BACK:
+				gVrMenuPage = VR_MENU_PAGE_HUD;
 				break;
 			}
 		}else if(gVrMenuPage == VR_MENU_PAGE_VEHICLE &&
@@ -1869,6 +2215,12 @@ DrawQuestHudPage(void)
 	BeginFullVrMenuPage("HUD SETTINGS",
 		"HEAD-LOCKED GAMEPLAY INTERFACE");
 	char rows[VR_HUD_ITEM_COUNT][112];
+	const int preset = CurrentHudPreset();
+	snprintf(rows[VR_HUD_PRESET], sizeof(rows[0]),
+		"HUD PRESET  < %s >",
+		preset == VR_HUD_PRESET_IMMERSIVE ? "IMMERSIVE (EXPERIMENTAL)" :
+			(preset == VR_HUD_PRESET_CLASSIC ? "CLASSIC (ON SCREEN)" :
+			"CUSTOM"));
 	snprintf(rows[VR_HUD_ENABLED], sizeof(rows[0]),
 		"GAMEPLAY HUD  < %s >", gGameplayHudEnabled ? "ON" : "OFF");
 	snprintf(rows[VR_HUD_HORIZONTAL_SCALE], sizeof(rows[0]),
@@ -1879,10 +2231,91 @@ DrawQuestHudPage(void)
 		"HORIZONTAL OFFSET  < %+d CM >", gHudOffsetXCm);
 	snprintf(rows[VR_HUD_OFFSET_Y], sizeof(rows[0]),
 		"VERTICAL OFFSET  < %+d CM >", gHudOffsetYCm);
+	snprintf(rows[VR_HUD_WRIST_RADAR], sizeof(rows[0]),
+		"MINIMAP ON WRIST  < %s >",
+		gWristPanelOn[WRIST_PANEL_MAP] ? "ON" : "OFF");
+	snprintf(rows[VR_HUD_WRIST_RADAR_SIDE], sizeof(rows[0]),
+		"WRIST MINIMAP SIDE  < %s >",
+		gWristPanelUnderside[WRIST_PANEL_MAP] ?
+			"UNDER WRIST" : "TOP OF WRIST");
+	snprintf(rows[VR_HUD_WRIST_RADAR_CALIBRATE], sizeof(rows[0]),
+		"WRIST MINIMAP PLACEMENT  < %s SIDE, %s HAND >",
+		gWristPanelUnderside[WRIST_PANEL_MAP] ? "INNER" : "OUTER",
+		gWristPanelHand[WRIST_PANEL_MAP] ? "RIGHT" : "LEFT");
+	snprintf(rows[VR_HUD_WRIST_STATUS], sizeof(rows[0]),
+		"STATUS ON WRIST  < %s >",
+		gWristPanelOn[WRIST_PANEL_STATUS] ? "ON" : "OFF");
+	snprintf(rows[VR_HUD_WRIST_STATUS_CALIBRATE], sizeof(rows[0]),
+		"WRIST STATUS PLACEMENT  < %s SIDE, %s HAND >",
+		gWristPanelUnderside[WRIST_PANEL_STATUS] ? "INNER" : "OUTER",
+		gWristPanelHand[WRIST_PANEL_STATUS] ? "RIGHT" : "LEFT");
+	snprintf(rows[VR_HUD_WEAPON_PANEL], sizeof(rows[0]),
+		"WEAPON ICON AND AMMO  < %s >", gHudWeaponPanel ? "ON" : "OFF");
+	snprintf(rows[VR_HUD_CLOCK], sizeof(rows[0]),
+		"CLOCK  < %s >", gHudClock ? "ON" : "OFF");
 	strcpy(rows[VR_HUD_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_HUD_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 190+item*68, 3,
+		DrawFullVrMenuRow(rows[item], 142+item*41, 3,
 			item == gVrHudSelection);
+	if(preset != VR_HUD_PRESET_CLASSIC)
+		DrawVrMenuText(
+			"IMMERSIVE HUD IS EXPERIMENTAL - VEHICLES KEEP THE CLASSIC ONE",
+			VR_MENU_WIDTH/2, 690, 2, 245, 205, 90);
+	DrawVrMenuText(
+		"LEFT STICK SELECT   L2 MINUS   R2 OR A PLUS   B BACK",
+		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
+}
+
+static void
+DrawQuestWristRadarPage(void)
+{
+	const int panel = gVrWristPanelEdit;
+	const int side = gWristPanelUnderside[panel] ?
+		WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
+	const char *sideName = side == WRIST_SIDE_INNER ? "INNER" : "OUTER";
+	const char *otherName = side == WRIST_SIDE_INNER ? "OUTER" : "INNER";
+	const char *panelName = panel == WRIST_PANEL_STATUS ?
+		"STATUS READOUT" : "MINIMAP";
+	char heading[96];
+	snprintf(heading, sizeof(heading), "WRIST %s - %s SIDE",
+		panelName, sideName);
+	BeginFullVrMenuPage(heading,
+		"CALIBRATE THE LEFT HAND - THE RIGHT ONE MIRRORS IT");
+	char rows[VR_WRIST_ITEM_COUNT][112];
+	snprintf(rows[VR_WRIST_SIDE], sizeof(rows[0]),
+		"SIDE  < %s >", side == WRIST_SIDE_INNER ?
+			"INNER (UNDER WRIST)" : "OUTER (TOP OF WRIST)");
+	snprintf(rows[VR_WRIST_HAND], sizeof(rows[0]),
+		"WORN ON  < %s HAND >",
+		gWristPanelHand[panel] ? "RIGHT" : "LEFT");
+	snprintf(rows[VR_WRIST_ALONG], sizeof(rows[0]),
+		"ALONG THE ARM  < %+.1f CM >",
+		(float)gWristAlong[panel][side]*0.1f);
+	snprintf(rows[VR_WRIST_ACROSS], sizeof(rows[0]),
+		"ACROSS THE WRIST  < %+.1f CM >",
+		(float)gWristAcross[panel][side]*0.1f);
+	snprintf(rows[VR_WRIST_LIFT], sizeof(rows[0]),
+		"OFF THE WRIST  < %+.1f CM >", (float)gWristLift[panel][side]*0.1f);
+	snprintf(rows[VR_WRIST_PITCH], sizeof(rows[0]),
+		"TILT  < %+.1f DEG >", (float)gWristPitch[panel][side]*0.1f);
+	snprintf(rows[VR_WRIST_YAW], sizeof(rows[0]),
+		"TURN  < %+.1f DEG >", (float)gWristYaw[panel][side]*0.1f);
+	snprintf(rows[VR_WRIST_ROLL], sizeof(rows[0]),
+		"SPIN  < %+.1f DEG >", (float)gWristRoll[panel][side]*0.1f);
+	snprintf(rows[VR_WRIST_SIZE], sizeof(rows[0]),
+		"SIZE  < %d%% >", gWristSize[panel][side]);
+	snprintf(rows[VR_WRIST_COPY], sizeof(rows[0]),
+		"COPY FROM %s SIDE", otherName);
+	snprintf(rows[VR_WRIST_RESET], sizeof(rows[0]),
+		"RESET %s SIDE", sideName);
+	strcpy(rows[VR_WRIST_BACK], "BACK TO HUD SETTINGS");
+	for(int item = 0; item < VR_WRIST_ITEM_COUNT; item++)
+		DrawFullVrMenuRow(rows[item], 150+item*46, 3,
+			item == gVrWristRadarSelection,
+			item <= VR_WRIST_HAND || gWristPanelOn[panel]);
+	if(!gWristPanelOn[panel])
+		DrawVrMenuText("THIS PANEL IS OFF - TURN IT ON IN HUD SETTINGS",
+			VR_MENU_WIDTH/2, 690, 2, 245, 205, 90);
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 MINUS   R2 OR A PLUS   B BACK",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
@@ -2317,6 +2750,9 @@ VrDebugPixels(int *width, int *height)
 		case VR_MENU_PAGE_HUD:
 			DrawQuestHudPage();
 			break;
+		case VR_MENU_PAGE_WRIST_RADAR:
+			DrawQuestWristRadarPage();
+			break;
 		case VR_MENU_PAGE_TRAFFIC:
 			DrawQuestTrafficPage();
 			break;
@@ -2649,6 +3085,66 @@ VrSpatialAaMode(void)
 {
 	LoadVrSettings();
 	return gSpatialAaMode;
+}
+
+bool
+VrWristPanelEnabled(int panel)
+{
+	LoadVrSettings();
+	if(panel < 0 || panel >= WRIST_PANEL_COUNT)
+		return false;
+	return gWristPanelOn[panel];
+}
+
+bool
+VrWristPanelUnderside(int panel)
+{
+	LoadVrSettings();
+	if(panel < 0 || panel >= WRIST_PANEL_COUNT)
+		return false;
+	return gWristPanelUnderside[panel];
+}
+
+int
+VrWristPanelHand(int panel)
+{
+	LoadVrSettings();
+	if(panel < 0 || panel >= WRIST_PANEL_COUNT)
+		return 0;
+	return gWristPanelHand[panel];
+}
+
+void
+VrGetWristPanelCalibration(int panel, float *alongCm, float *acrossCm,
+                           float *liftCm, float *pitchDeg, float *yawDeg,
+                           float *rollDeg, float *scale)
+{
+	LoadVrSettings();
+	if(panel < 0 || panel >= WRIST_PANEL_COUNT)
+		panel = WRIST_PANEL_MAP;
+	const int side = gWristPanelUnderside[panel] ?
+		WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
+	if(alongCm) *alongCm = (float)gWristAlong[panel][side]*0.1f;
+	if(acrossCm) *acrossCm = (float)gWristAcross[panel][side]*0.1f;
+	if(liftCm) *liftCm = (float)gWristLift[panel][side]*0.1f;
+	if(pitchDeg) *pitchDeg = (float)gWristPitch[panel][side]*0.1f;
+	if(yawDeg) *yawDeg = (float)gWristYaw[panel][side]*0.1f;
+	if(rollDeg) *rollDeg = (float)gWristRoll[panel][side]*0.1f;
+	if(scale) *scale = (float)gWristSize[panel][side]/100.0f;
+}
+
+bool
+VrHudWeaponPanelEnabled(void)
+{
+	LoadVrSettings();
+	return gHudWeaponPanel;
+}
+
+bool
+VrHudClockEnabled(void)
+{
+	LoadVrSettings();
+	return gHudClock;
 }
 
 bool

@@ -1566,6 +1566,391 @@ prepareMotionUniform(FrameContext &frame)
 	gvk.temporalHistoryValid = gvk.firstPersonActive;
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Wrist panel targets
+//
+// Small private colour targets that pieces of the interface render into once
+// per frame, before the frame's own multiview pass opens: the minimap on one
+// arm, the money/health/armour/wanted readout on the other.
+//
+// They reuse gvk.renderPass rather than creating a plain single-view one.
+// Every cached pipeline was created against that pass and the vertex shaders
+// declare ViewIndex, so a second pass would mean a second set of pipelines and
+// a driver that has to be trusted with ViewIndex outside multiview. The cost
+// of reusing it is the second layer of a very small surface. Layer 0 is
+// blitted into the sampled raster once the pass closes.
+// ---------------------------------------------------------------------------
+static const struct {
+	int32 width, height;
+} gWristPanelSize[WRIST_PANEL_COUNT] = {
+	{ 256, 256 },	// the map is square
+	{ 512, 192 }	// the status readout is a wide strip of small text
+};
+
+static struct WristPanelTarget {
+	VkImage colour;
+	VkDeviceMemory colourMemory;
+	VkImageView colourView;
+	VkImage depth;
+	VkDeviceMemory depthMemory;
+	VkImageView depthView;
+	// Third attachment of the scene pass: the resolve target under MSAA, the
+	// motion vectors under SGSR. Only the first is ever read back.
+	VkImage extra;
+	VkDeviceMemory extraMemory;
+	VkImageView extraView;
+	VkFramebuffer framebuffer;
+	// The pass the framebuffer was built for. Render scale, MSAA and SGSR
+	// changes all rebuild it, and the targets have to follow.
+	VkRenderPass pass;
+	Raster *raster;
+	bool32 rasterFilled;
+	bool32 sourceLayoutValid;
+	bool32 failed;
+} gWristPanels[WRIST_PANEL_COUNT];
+
+static bool32
+createWristPanelImage(const WristPanelTarget &panel, int32 width, int32 height,
+                      VkFormat format, VkSampleCountFlagBits samples,
+                      VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                      VkImage *imageOut, VkDeviceMemory *memoryOut,
+                      VkImageView *viewOut)
+{
+	(void)panel;
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = format;
+	imageInfo.extent.width = (uint32)width;
+	imageInfo.extent.height = (uint32)height;
+	imageInfo.extent.depth = 1;
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = gvk.viewCount;
+	imageInfo.samples = samples;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = usage;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil, imageOut) != VK_SUCCESS)
+		return 0;
+
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, *imageOut, &requirements);
+	uint32 typeIndex = 0;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+		return 0;
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil, memoryOut) != VK_SUCCESS)
+		return 0;
+	if(vkBindImageMemory(gvk.device, *imageOut, *memoryOut, 0) != VK_SUCCESS)
+		return 0;
+
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = *imageOut;
+	viewInfo.viewType = gvk.viewCount > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY :
+	                                        VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = format;
+	viewInfo.subresourceRange.aspectMask = aspect;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = gvk.viewCount;
+	return vkCreateImageView(gvk.device, &viewInfo, nil, viewOut) == VK_SUCCESS;
+}
+
+static void
+destroyWristPanelTarget(WristPanelTarget &panel)
+{
+	if(gvk.device == VK_NULL_HANDLE)
+		return;
+	if(panel.framebuffer)
+		vkDestroyFramebuffer(gvk.device, panel.framebuffer, nil);
+	if(panel.colourView)
+		vkDestroyImageView(gvk.device, panel.colourView, nil);
+	if(panel.colour)
+		vkDestroyImage(gvk.device, panel.colour, nil);
+	if(panel.colourMemory)
+		vkFreeMemory(gvk.device, panel.colourMemory, nil);
+	if(panel.depthView)
+		vkDestroyImageView(gvk.device, panel.depthView, nil);
+	if(panel.depth)
+		vkDestroyImage(gvk.device, panel.depth, nil);
+	if(panel.depthMemory)
+		vkFreeMemory(gvk.device, panel.depthMemory, nil);
+	if(panel.extraView)
+		vkDestroyImageView(gvk.device, panel.extraView, nil);
+	if(panel.extra)
+		vkDestroyImage(gvk.device, panel.extra, nil);
+	if(panel.extraMemory)
+		vkFreeMemory(gvk.device, panel.extraMemory, nil);
+	// The raster is not tied to the render pass and outlives a rebuild.
+	Raster *raster = panel.raster;
+	const bool32 failed = panel.failed;
+	memset(&panel, 0, sizeof(panel));
+	panel.raster = raster;
+	panel.failed = failed;
+}
+
+static bool32
+ensureWristPanelTarget(int32 index)
+{
+	WristPanelTarget &panel = gWristPanels[index];
+	if(panel.pass == gvk.renderPass && panel.framebuffer != VK_NULL_HANDLE)
+		return 1;
+	if(panel.failed || gvk.renderPass == VK_NULL_HANDLE)
+		return 0;
+	destroyWristPanelTarget(panel);
+
+	const int32 width = gWristPanelSize[index].width;
+	const int32 height = gWristPanelSize[index].height;
+	const bool32 multisampled = gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT;
+	const bool32 hasThird = multisampled || gvk.sgsrMode != SGSR_OFF;
+	VkImageUsageFlags colourUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	if(!multisampled)
+		colourUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	bool32 ok = createWristPanelImage(panel, width, height, gvk.colourFormat,
+		gvk.sceneSamples, colourUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+		&panel.colour, &panel.colourMemory, &panel.colourView);
+	VkImageUsageFlags depthUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	if(gvk.sgsrMode != SGSR_OFF)
+		depthUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+	ok = ok && createWristPanelImage(panel, width, height, gvk.depthFormat,
+		gvk.sceneSamples, depthUsage, VK_IMAGE_ASPECT_DEPTH_BIT,
+		&panel.depth, &panel.depthMemory, &panel.depthView);
+	if(ok && hasThird){
+		// Under MSAA this is the resolve target, and the surface the finished
+		// panel is read back from; under SGSR it is a motion buffer nothing
+		// ever looks at.
+		VkImageUsageFlags extraUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+		if(multisampled)
+			extraUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		else
+			extraUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+		ok = createWristPanelImage(panel, width, height,
+			multisampled ? gvk.colourFormat : gvk.motionFormat,
+			VK_SAMPLE_COUNT_1_BIT, extraUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+			&panel.extra, &panel.extraMemory, &panel.extraView);
+	}
+	if(ok){
+		const VkImageView attachments[3] = {
+			panel.colourView, panel.depthView, panel.extraView
+		};
+		VkFramebufferCreateInfo info = {};
+		info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		info.renderPass = gvk.renderPass;
+		info.attachmentCount = hasThird ? 3 : 2;
+		info.pAttachments = attachments;
+		info.width = (uint32)width;
+		info.height = (uint32)height;
+		info.layers = 1;	// multiview takes the layers from the view mask
+		ok = vkCreateFramebuffer(gvk.device, &info, nil,
+			&panel.framebuffer) == VK_SUCCESS;
+	}
+	if(ok && panel.raster == nil){
+		panel.raster = Raster::create(width, height, 32,
+			Raster::C8888 | Raster::TEXTURE);
+		ok = panel.raster != nil;
+	}
+	if(!ok){
+		VKERR("wrist panel %d target could not be created", index);
+		panel.failed = 1;
+		destroyWristPanelTarget(panel);
+		return 0;
+	}
+	panel.pass = gvk.renderPass;
+	return 1;
+}
+
+// Moves the finished panel out of the pass target and into the raster the game
+// binds as a texture. A blit rather than a copy: the scene format is whatever
+// OpenXR handed out, and blit is the operation that converts between formats
+// instead of reinterpreting the bits.
+static void
+copyWristPanelToRaster(WristPanelTarget &panel, VkImage source,
+                       int32 width, int32 height)
+{
+	VulkanRaster *native = PLUGINOFFSET(VulkanRaster, panel.raster,
+	                                    nativeRasterOffset);
+	if(native->image == VK_NULL_HANDLE)
+		return;
+
+	VkImageMemoryBarrier barriers[2] = {};
+	barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	barriers[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].image = source;
+	barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barriers[0].subresourceRange.levelCount = 1;
+	barriers[0].subresourceRange.layerCount = gvk.viewCount;
+	barriers[1] = barriers[0];
+	barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barriers[1].oldLayout = panel.rasterFilled ?
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+	barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barriers[1].image = native->image;
+	barriers[1].subresourceRange.layerCount = 1;
+	vkCmdPipelineBarrier(gvk.frameCommands,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nil, 0, nil, 2, barriers);
+
+	VkImageBlit blit = {};
+	blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	blit.srcSubresource.layerCount = 1;
+	blit.srcOffsets[1].x = width;
+	blit.srcOffsets[1].y = height;
+	blit.srcOffsets[1].z = 1;
+	blit.dstSubresource = blit.srcSubresource;
+	blit.dstOffsets[1] = blit.srcOffsets[1];
+	vkCmdBlitImage(gvk.frameCommands, source,
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, native->image,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+	barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	barriers[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	barriers[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	vkCmdPipelineBarrier(gvk.frameCommands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 0, nil, 0, nil, 2, barriers);
+	native->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	panel.rasterFilled = 1;
+}
+
+static void
+renderWristPanelTarget(int32 index)
+{
+	WristPanelTarget &panel = gWristPanels[index];
+	if(!ensureWristPanelTarget(index))
+		return;
+
+	const int32 width = gWristPanelSize[index].width;
+	const int32 height = gWristPanelSize[index].height;
+	const bool32 multisampled = gvk.sceneSamples != VK_SAMPLE_COUNT_1_BIT;
+	VkImage source = multisampled ? panel.extra : panel.colour;
+	if(!panel.sourceLayoutValid){
+		// The pass expects to be handed back the layout it left behind, so the
+		// blit source starts out where the pass will want it.
+		VkImageMemoryBarrier barrier = {};
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		barrier.image = source;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.layerCount = gvk.viewCount;
+		vkCmdPipelineBarrier(gvk.frameCommands,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			0, 0, nil, 0, nil, 1, &barrier);
+		panel.sourceLayoutValid = 1;
+	}
+
+	// Cleared to nothing, alpha included: the interface writes its own alpha
+	// where it draws, so what it does not cover stays transparent.
+	VkClearValue clears[3];
+	memset(clears, 0, sizeof(clears));
+	clears[1].depthStencil.depth = 1.0f;
+	VkRenderPassBeginInfo passInfo = {};
+	passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	passInfo.renderPass = gvk.renderPass;
+	passInfo.framebuffer = panel.framebuffer;
+	passInfo.renderArea.extent.width = (uint32)width;
+	passInfo.renderArea.extent.height = (uint32)height;
+	passInfo.clearValueCount =
+		(multisampled || gvk.sgsrMode != SGSR_OFF) ? 3 : 2;
+	passInfo.pClearValues = clears;
+	vkCmdBeginRenderPass(gvk.frameCommands, &passInfo,
+	                     VK_SUBPASS_CONTENTS_INLINE);
+
+	VkDescriptorSet sceneSet = getSceneDescriptor();
+	vkCmdBindDescriptorSets(gvk.frameCommands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                        getPipelineLayout(), 0, 1, &sceneSet, 0, nil);
+	VkViewport viewport = {};
+	viewport.width = (float32)width;
+	viewport.height = (float32)height;
+	viewport.maxDepth = 1.0f;
+	VkRect2D scissor = {};
+	scissor.extent.width = (uint32)width;
+	scissor.extent.height = (uint32)height;
+	vkCmdSetViewport(gvk.frameCommands, 0, 1, &viewport);
+	vkCmdSetScissor(gvk.frameCommands, 0, 1, &scissor);
+
+	gvk.wristPanelOffscreen = 1;
+	gvk.wristPanelRenderer[index]();
+	gvk.wristPanelOffscreen = 0;
+	vkCmdEndRenderPass(gvk.frameCommands);
+	copyWristPanelToRaster(panel, source, width, height);
+}
+
+// Called from beginFrame with the command buffer recording and no render pass
+// open yet. Everything the callbacks draw lands in their own texture.
+static void
+renderWristPanels(void)
+{
+	bool32 any = 0;
+	for(int32 index = 0; index < WRIST_PANEL_COUNT; index++)
+		if(gvk.wristPanelWanted[index] && gvk.wristPanelRenderer[index])
+			any = 1;
+	if(!any){
+		for(int32 index = 0; index < WRIST_PANEL_COUNT; index++)
+			gvk.wristPanelWanted[index] = 0;
+		return;
+	}
+
+	// The draw paths refuse to record outside a frame, and a pipeline miss has
+	// to defer rather than compile -- this driver does not return from a
+	// compile while a pass is open. Both are keyed off inFrame, and from here
+	// on both are true.
+	gvk.inFrame = 1;
+	for(int32 index = 0; index < WRIST_PANEL_COUNT; index++){
+		const bool32 wanted = gvk.wristPanelWanted[index];
+		// One-shot: the game arms this every frame the panel is on screen, so
+		// a menu or loading frame stops feeding it without extra bookkeeping.
+		gvk.wristPanelWanted[index] = 0;
+		if(wanted && gvk.wristPanelRenderer[index])
+			renderWristPanelTarget(index);
+	}
+}
+
+void
+setWristPanelRenderer(int32 panel, void (*renderer)(void))
+{
+	if(panel >= 0 && panel < WRIST_PANEL_COUNT)
+		gvk.wristPanelRenderer[panel] = renderer;
+}
+
+void
+setWristPanelWanted(int32 panel, bool32 wanted)
+{
+	if(panel >= 0 && panel < WRIST_PANEL_COUNT)
+		gvk.wristPanelWanted[panel] = wanted;
+}
+
+Raster*
+getWristPanelRaster(int32 panel)
+{
+	if(panel < 0 || panel >= WRIST_PANEL_COUNT)
+		return nil;
+	return gWristPanels[panel].rasterFilled ? gWristPanels[panel].raster : nil;
+}
+
 bool32
 beginFrame(VkImage colourImage, VkImageView colourView)
 {
@@ -1717,6 +2102,11 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 		       gvk.stereoViewProjectionUnjittered[eye], sizeof(float32)*16);
 	}
 	uploadSceneData();
+
+	// The wrist panels render into their own targets here, while the frame is
+	// recording but no pass is open yet. It cannot be done later: the frame
+	// opens exactly one pass and runs every game draw inside it.
+	renderWristPanels();
 
 	// Open the multiview pass for the whole frame. Every draw the game issues
 	// has to land inside a render pass; without this they are recorded outside
@@ -2202,6 +2592,7 @@ setIm2DTransform(const float32 transform[16], float32 planeDistance,
 {
 	SceneData *scene = getSceneData();
 	memcpy(scene->im2dTransform, transform, sizeof(float32)*16);
+	memcpy(gvk.im2dTransformActive, transform, sizeof(gvk.im2dTransformActive));
 	scene->im2dParams[0] = planeDistance;
 	scene->im2dParams[1] = eye[0];
 	scene->im2dParams[2] = eye[1];
@@ -3078,6 +3469,13 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 			if(gvk.postFxDescriptorPool) vkDestroyDescriptorPool(gvk.device, gvk.postFxDescriptorPool, nil);
 			if(gvk.postFxDescriptorLayout) vkDestroyDescriptorSetLayout(gvk.device, gvk.postFxDescriptorLayout, nil);
 			if(gvk.postFxSampler) vkDestroySampler(gvk.device, gvk.postFxSampler, nil);
+			for(int32 panel = 0; panel < WRIST_PANEL_COUNT; panel++){
+				destroyWristPanelTarget(gWristPanels[panel]);
+				if(gWristPanels[panel].raster){
+					gWristPanels[panel].raster->destroy();
+					gWristPanels[panel].raster = nil;
+				}
+			}
 			if(gvk.postFxRenderPass) vkDestroyRenderPass(gvk.device, gvk.postFxRenderPass, nil);
 			if(gvk.motionRenderPass) vkDestroyRenderPass(gvk.device, gvk.motionRenderPass, nil);
 			if(gvk.sgsrConvertRenderPass)

@@ -77,7 +77,7 @@ android {
 		minSdk = 32
 		targetSdk = 35
 		versionCode = 502
-		versionName = "0.5.2-rc3-quest-alpha"
+		versionName = "0.5.2-rc4-quest-alpha"
 
 		ndk {
 			abiFilters += "arm64-v8a"

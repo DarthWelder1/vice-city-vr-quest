@@ -271,6 +271,29 @@ traceMenuTransition(bool theaterBefore, bool theaterAfter,
 
 // Installed as the OpenXR layer's frame renderer once the game is up. Opens
 // librw's multiview render pass against the swapchain image the runtime just
+
+// ---------------------------------------------------------------------------
+// Wrist minimap
+// ---------------------------------------------------------------------------
+// The 2D interface reaches the eyes through one matrix that maps screen pixels
+// onto a plane in the world (see rw_im2d.vert). Swapping that matrix for the
+// duration of the radar draw therefore moves the whole minimap -- disc, map
+// tiles and blips alike -- onto a small panel carried by the left controller,
+// without touching a single drawing call.
+static float gHudIm2D[16];
+static float gHudIm2DDistance = 2.0f;
+static float gHudIm2DEye[3];
+static bool gHudIm2DValid;
+
+static void
+StoreHudIm2D(const float transform[16], float distance, const float eye[3])
+{
+	memcpy(gHudIm2D, transform, sizeof(gHudIm2D));
+	gHudIm2DDistance = distance;
+	memcpy(gHudIm2DEye, eye, sizeof(gHudIm2DEye));
+	gHudIm2DValid = true;
+}
+
 // handed over, steps the game inside it, and submits.
 void
 renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
@@ -344,6 +367,7 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 		rw::vulkan::setStereoViewProjection(viewProj[0], viewProj[1]);
 		rw::vulkan::setSgsrHorizontalFovDegrees(eyeFovDeg);
 		rw::vulkan::setIm2DTransform(im2dWorld, im2dDistance, headPos);
+		StoreHudIm2D(im2dWorld, im2dDistance, headPos);
 		rw::vulkan::setHeadPose(headPos, headYaw, headQuat);
 		rw::vulkan::setFirstPersonEyePoses(eyePos, eyeQuat);
 	}
@@ -589,6 +613,220 @@ gameThreadMain(android_app *app, AppState *state)
 }
 
 } // namespace
+
+// Defined by the HUD. Each draws one panel's contents in screen coordinates,
+// and each is called back here with that panel's texture open rather than from
+// CHud::Draw.
+void VrDrawWristRadarContents(void);
+void VrDrawWristStatusContents(void);
+
+namespace androidgame {
+
+// Screen rect each panel occupies, as the HUD lays it out. The panels are
+// rendered at the top of the *next* frame, before any game code runs, so the
+// rects have to be remembered rather than passed down.
+static float gWristPanelCentre[rw::vulkan::WRIST_PANEL_COUNT][2];
+static float gWristPanelExtent[rw::vulkan::WRIST_PANEL_COUNT][2];
+// How wide each panel ends up on the arm. Height follows from the rect, so
+// nothing is stretched.
+static const float kWristPanelMetres[rw::vulkan::WRIST_PANEL_COUNT] = {
+	0.115f, 0.130f
+};
+// Where they sit relative to the grip pose: back along the arm from the hand,
+// and off the wrist by roughly the thickness of one.
+static const float kWristPanelBack = 0.07f;
+static const float kWristPanelLift = 0.035f;
+
+// Draws one panel into its texture. Called by the Vulkan backend from inside
+// beginFrame, with that target open and nothing else drawn yet.
+static void
+RenderWristPanel(int panel)
+{
+	if(!gHudIm2DValid || gWristPanelExtent[panel][0] < 1.0f ||
+	   gWristPanelExtent[panel][1] < 1.0f)
+		return;
+
+	// Screen pixels straight to the little target's clip space. The interface
+	// draws in screen coordinates exactly as it always has; this is what lands
+	// it in the texture instead of on the plane in front of the face.
+	float projection[16] = {};
+	projection[0] = 2.0f/gWristPanelExtent[panel][0];
+	projection[5] = 2.0f/gWristPanelExtent[panel][1];
+	projection[10] = 1.0f;
+	projection[12] = -2.0f*gWristPanelCentre[panel][0]/
+		gWristPanelExtent[panel][0];
+	projection[13] = -2.0f*gWristPanelCentre[panel][1]/
+		gWristPanelExtent[panel][1];
+	projection[15] = 1.0f;
+	rw::vulkan::setIm2DTransform(projection, gHudIm2DDistance, gHudIm2DEye);
+	if(panel == rw::vulkan::WRIST_PANEL_STATUS)
+		VrDrawWristStatusContents();
+	else
+		VrDrawWristRadarContents();
+	rw::vulkan::setIm2DTransform(gHudIm2D, gHudIm2DDistance, gHudIm2DEye);
+}
+
+// The backend takes plain function pointers, one per panel.
+static void
+RenderWristPanelMap(void)
+{
+	RenderWristPanel(rw::vulkan::WRIST_PANEL_MAP);
+}
+
+static void
+RenderWristPanelStatus(void)
+{
+	RenderWristPanel(rw::vulkan::WRIST_PANEL_STATUS);
+}
+
+// Rotates an orthonormal pair in its own plane. Used to swing a panel's frame
+// around each of its own axes in turn.
+static void
+RotateWristAxes(float *first, float *second, float radians)
+{
+	const float c = cosf(radians), s = sinf(radians);
+	for(int axis = 0; axis < 3; axis++){
+		const float a = first[axis], b = second[axis];
+		first[axis] = a*c+b*s;
+		second[axis] = b*c-a*s;
+	}
+}
+
+// The plane a wrist quad lives on: screen pixels to metres, centred on the
+// panel's rect and lying on the wrist, plus whatever the player calibrated.
+static bool
+BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
+                     float widthPixels)
+{
+	if(widthPixels < 1.0f)
+		return false;
+	const int hand = VrWristPanelHand(panel) ? 1 : 0;
+	xrvk::ControllerInput input;
+	xrvk::getInput(&input);
+	const xrvk::TrackedPose &grip = input.gripPose[hand];
+	if(!grip.valid)
+		return false;
+
+	// Controller axes: the OpenXR grip pose looks along -Z out of the hand, so
+	// +Z runs back towards the wrist and +Y stands away from the palm.
+	//
+	// Only the left hand is calibrated. OpenXR defines the grip X axis as the
+	// palm normal and mirrors it between hands, which mirrors the Y axis built
+	// from it as well, so the right hand is the left one with both of those
+	// flipped: two flips keep the frame right-handed -- the panel is not drawn
+	// backwards -- while putting it on the outside of that arm instead of
+	// inside it.
+	const float *q = grip.orientation;
+	const float handSign = hand ? -1.0f : 1.0f;
+	const float side[3] = {
+		(1.0f-2.0f*(q[1]*q[1]+q[2]*q[2]))*handSign,
+		(2.0f*(q[0]*q[1]+q[2]*q[3]))*handSign,
+		(2.0f*(q[0]*q[2]-q[1]*q[3]))*handSign
+	};
+	const float palmUp[3] = {
+		(2.0f*(q[0]*q[1]-q[2]*q[3]))*handSign,
+		(1.0f-2.0f*(q[0]*q[0]+q[2]*q[2]))*handSign,
+		(2.0f*(q[1]*q[2]+q[0]*q[3]))*handSign
+	};
+	const float backward[3] = {
+		2.0f*(q[0]*q[2]+q[1]*q[3]),
+		2.0f*(q[1]*q[2]-q[0]*q[3]),
+		1.0f-2.0f*(q[0]*q[0]+q[1]*q[1])
+	};
+
+	float alongCm = 0.0f, acrossCm = 0.0f, liftCm = 0.0f;
+	float pitchDeg = 0.0f, yawDeg = 0.0f, rollDeg = 0.0f, sizeScale = 1.0f;
+	VrGetWristPanelCalibration(panel, &alongCm, &acrossCm, &liftCm,
+		&pitchDeg, &yawDeg, &rollDeg, &sizeScale);
+
+	// The face lies on the wrist looking away from the arm, twelve o'clock
+	// towards the fingers, and is not turned towards the head: it is an object
+	// on the arm and reads when the arm is turned to look at it. Normal, up and
+	// right form a right-handed frame so nothing is mirrored -- with
+	// up = -backward and normal = +/-palmUp, the third axis works out as the
+	// controller's own side axis.
+	const float faceSign = VrWristPanelUnderside(panel) ? -1.0f : 1.0f;
+	float centre[3], normal[3], up[3], right[3];
+	for(int axis = 0; axis < 3; axis++){
+		normal[axis] = palmUp[axis]*faceSign;
+		up[axis] = -backward[axis];
+		right[axis] = side[axis]*faceSign;
+		// Calibration offsets ride the wrist's own axes, before any of the
+		// rotations below, so moving and turning a panel stay independent.
+		centre[axis] = grip.position[axis]+
+			backward[axis]*(kWristPanelBack+alongCm*0.01f)+
+			palmUp[axis]*faceSign*(kWristPanelLift+liftCm*0.01f)+
+			right[axis]*acrossCm*0.01f;
+	}
+
+	static const float kToRadians = 3.14159265f/180.0f;
+	if(yawDeg != 0.0f)
+		RotateWristAxes(normal, right, yawDeg*kToRadians);
+	if(pitchDeg != 0.0f)
+		RotateWristAxes(up, normal, pitchDeg*kToRadians);
+	if(rollDeg != 0.0f)
+		RotateWristAxes(right, up, rollDeg*kToRadians);
+
+	const float scale = kWristPanelMetres[panel]*sizeScale/widthPixels;
+	memset(plane, 0, sizeof(float)*16);
+	for(int axis = 0; axis < 3; axis++){
+		plane[axis] = right[axis]*scale;
+		plane[4+axis] = -up[axis]*scale;	// screen Y runs downwards
+		plane[8+axis] = normal[axis];
+		plane[12+axis] = centre[axis]-
+			right[axis]*scale*centreX+
+			up[axis]*scale*centreY;
+	}
+	plane[15] = 1.0f;
+	return true;
+}
+
+// Puts the interface plane on the wrist and hands back the finished panel to
+// bind, or null when there is nothing to draw yet. Every call also asks the
+// backend for the next frame's render: the request is one-shot, so a paused or
+// menu frame stops feeding it by simply not asking.
+void *
+BeginVrWristPanel(int panel, float centreX, float centreY, float width,
+                  float height)
+{
+	if(panel < 0 || panel >= rw::vulkan::WRIST_PANEL_COUNT)
+		return nil;
+	gWristPanelCentre[panel][0] = centreX;
+	gWristPanelCentre[panel][1] = centreY;
+	gWristPanelExtent[panel][0] = width;
+	gWristPanelExtent[panel][1] = height;
+	static bool registered = false;
+	if(!registered){
+		rw::vulkan::setWristPanelRenderer(rw::vulkan::WRIST_PANEL_MAP,
+			&RenderWristPanelMap);
+		rw::vulkan::setWristPanelRenderer(rw::vulkan::WRIST_PANEL_STATUS,
+			&RenderWristPanelStatus);
+		registered = true;
+	}
+	rw::vulkan::setWristPanelWanted(panel, true);
+
+	// Null on the first frame a panel is switched on: its texture only exists
+	// once a render has been through it.
+	rw::Raster *texture = rw::vulkan::getWristPanelRaster(panel);
+	float plane[16];
+	if(texture == nil || !gHudIm2DValid ||
+	   !BuildWristPanelPlane(panel, plane, centreX, centreY, width))
+		return nil;
+	rw::vulkan::setIm2DTransform(plane, gHudIm2DDistance, gHudIm2DEye);
+	rw::vulkan::setIm2DSafeAreaSuspended(true);
+	return texture;
+}
+
+void
+EndVrWristPanel(void)
+{
+	rw::vulkan::setIm2DSafeAreaSuspended(false);
+	if(gHudIm2DValid)
+		rw::vulkan::setIm2DTransform(gHudIm2D, gHudIm2DDistance,
+			gHudIm2DEye);
+}
+
+}  // namespace androidgame
 
 void
 android_main(android_app *app)

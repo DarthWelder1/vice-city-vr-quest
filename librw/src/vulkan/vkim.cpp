@@ -114,17 +114,26 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 	// world pipeline does. Im2D is not: it anchors its panel in play space
 	// through scene.im2dTransform and must stay clear of the game camera.
 	if(shader == SHADER_IM2D)
-		memcpy(push.model, model, sizeof(push.model));
+		// The plane the interface lands on travels per draw, so the radar
+		// can be moved onto the wrist without disturbing the rest of it.
+		memcpy(push.model, gvk.im2dTransformActive, sizeof(push.model));
 	else
 		multiplyMatrix(push.model, gvk.worldToPlay, model);
-	if(gvk.sgsrMode != SGSR_OFF){
+	if(gvk.sgsrMode != SGSR_OFF && shader != SHADER_IM2D){
 		// Immediate geometry has no persistent object identity/history. Keep its
 		// packed root vector at zero so the post pass uses depth reconstruction.
+		// Im2D is exempt: its model slot now carries the interface plane, and
+		// clearing that column would flatten the matrix.
 		push.model[3] = push.model[7] = push.model[11] = push.model[15] = 0.0f;
 	}
 	push.materialColour[0] = push.materialColour[1] =
 	push.materialColour[2] = push.materialColour[3] = 1.0f;
-	push.surfaceProps[0] = 1.0f;
+	// Doubles as the Im2D target select. The wrist minimap renders in a pass
+	// of its own, where the model slot carries a straight screen-pixels-to-
+	// clip matrix rather than a plane in the world; nothing else in the
+	// immediate shaders reads this field.
+	push.surfaceProps[0] =
+		shader == SHADER_IM2D && gvk.wristPanelOffscreen ? 2.0f : 1.0f;
 	push.surfaceProps[1] = 0.0f;	// immediate geometry is never lit
 	// The strict radar pass is pinned to the near depth plane. This keeps the
 	// map visible through a vehicle cockpit while preserving the original
@@ -217,6 +226,7 @@ static float32 gIm2DSafeAreaScaleX = 1.0f;
 static float32 gIm2DSafeAreaScaleY = 1.0f;
 static float32 gIm2DSafeAreaOffsetX;
 static float32 gIm2DSafeAreaOffsetY;
+static bool32 gIm2DSafeAreaSuspended;
 
 bool32
 uploadIm2DVertices(const Im2DVertex *source, int32 count,
@@ -227,10 +237,14 @@ uploadIm2DVertices(const Im2DVertex *source, int32 count,
 	if(!allocateDynamic(size, 16, bufferOut, offsetOut, &mapped))
 		return 0;
 
-	if(fabsf(gIm2DSafeAreaScaleX-1.0f) < 0.0001f &&
-	   fabsf(gIm2DSafeAreaScaleY-1.0f) < 0.0001f &&
-	   fabsf(gIm2DSafeAreaOffsetX) < 0.0001f &&
-	   fabsf(gIm2DSafeAreaOffsetY) < 0.0001f){
+	// The wrist minimap is exempt in both directions: its own target has no
+	// safe area, and the quad on the arm carries a transform of its own that
+	// a remap around the panel centre would drag off the wrist.
+	if(gvk.wristPanelOffscreen || gIm2DSafeAreaSuspended ||
+	   (fabsf(gIm2DSafeAreaScaleX-1.0f) < 0.0001f &&
+	    fabsf(gIm2DSafeAreaScaleY-1.0f) < 0.0001f &&
+	    fabsf(gIm2DSafeAreaOffsetX) < 0.0001f &&
+	    fabsf(gIm2DSafeAreaOffsetY) < 0.0001f)){
 		memcpy(mapped, source, (size_t)size);
 		return 1;
 	}
@@ -364,6 +378,12 @@ setIm2DSafeAreaTransform(float32 scaleX, float32 scaleY,
 		(scaleY > 2.0f ? 2.0f : scaleY);
 	gIm2DSafeAreaOffsetX = offsetX;
 	gIm2DSafeAreaOffsetY = offsetY;
+}
+
+void
+setIm2DSafeAreaSuspended(bool32 suspended)
+{
+	gIm2DSafeAreaSuspended = suspended;
 }
 
 void
