@@ -480,11 +480,10 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	CPlayerPed *player = FindPlayerPed();
 	const bool remoteMode =
 		CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode();
-	// Entry and exit animations: the desktop build puts the reference frame
-	// back on the PED for their whole duration, so the view turns with Tommy
-	// as he swings in or out. The third-person camera is excluded for the
-	// same window -- riding the chase camera while the game slides it between
-	// its vehicle and on-foot positions is what threw the view down from
+	// Entry and exit animations keep the reference frame on the ped, as the
+	// desktop build does, so the view turns with Tommy. Third person is off
+	// for the same window: riding the chase camera while the game slides it
+	// between its vehicle and on-foot positions threw the view down from
 	// above on every exit.
 	const PedState playerVehicleState =
 		player != nil ? player->GetPedState() : PED_NONE;
@@ -552,19 +551,10 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	   !player->DyingOrDead() && player->m_pFrames[PED_HEAD] != nil){
 		CVector forward = player->GetForward();
 		forward.Normalise();
-		// PC parity (main.cpp headModeOnFoot): in the head-driven modes the
-		// hidden ped continuously turns into the commanded movement
-		// direction. Anchoring the VR frame on his body then rotates the
-		// world a second time on every step, the physical head offset is
-		// re-applied against the new heading, and walking while looking
-		// sideways curves away. Keep the reference frame on the gameplay
-		// camera there, exactly as the desktop build does.
-		// PC parity: during the entry and exit animations the desktop build
-		// overrides the camera frame with the PED forward, so the view turns
-		// with Tommy as he swings into the seat and the seated re-latch onto
-		// the vehicle nose is then continuous. Holding the camera frame
-		// through the animation fights that rotation and lands the player
-		// facing the wrong way.
+		// Head modes turn the hidden ped into the movement direction, so
+		// anchoring the VR frame on his body would rotate the world a second
+		// time and curve the walk away. Use the gameplay camera, as the
+		// desktop build does.
 		const bool headModeOnFoot = !gVrInVehicle && !thirdPersonVehicle &&
 			!vehicleTransition &&
 			(androidgame::VrUsesHeadRelativeMovement() ||

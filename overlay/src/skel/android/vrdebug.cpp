@@ -2684,6 +2684,14 @@ VrUsesHeadRelativeMovement(void)
 }
 
 bool
+VrUsesHeadDirectedMovement(void)
+{
+	LoadVrSettings();
+	return gQuestMovementOrientation ==
+		QUEST_MOVEMENT_ORIENTATION_HEAD;
+}
+
+bool
 VrUsesExperimentalHeadTurning(void)
 {
 	LoadVrSettings();

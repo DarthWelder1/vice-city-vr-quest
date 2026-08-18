@@ -102,6 +102,8 @@ bool VrGameplayHudEnabled(void);
 void VrGetGameplayHudSettings(int *widthPercent, int *scalePercent,
                               int *offsetXCm, int *offsetYCm);
 bool VrUsesHeadRelativeMovement(void);
+// HEAD DIRECTED only: Tommy is reoriented onto the movement direction.
+bool VrUsesHeadDirectedMovement(void);
 bool VrHeadBobbingEnabled(void);
 bool VrUsesExperimentalHeadTurning(void);
 float VrHeadTurnScale(void);
