@@ -22,6 +22,13 @@
 > errors and writes `%TEMP%\ViceCityVR-Build-And-Install.log`; send that log
 > when asking for help.
 
+
+> [!TIP]
+> **Join the Flat2VR Discord!** Development updates, player feedback, testing,
+> and discussion of the mod take place in the
+> [Vice City VR discussion channel](https://discord.com/channels/747967102895390741/1529621098751197365).
+> Join the Flat2VR server first if the channel link does not open for you.
+
 This repository contains the original Quest/OpenXR port layer, Vulkan backend
 changes, build scripts and reVC patch files needed to build Vice City VR for a
 Meta Quest headset.
