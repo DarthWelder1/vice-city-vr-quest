@@ -97,7 +97,6 @@ static uint8 gVrMenuPixels[VR_MENU_WIDTH*VR_MENU_HEIGHT*4];
 static int gDebugFps;
 static double gDebugPreviousFrameMs;
 static float gDebugSmoothedFrameMs;
-static bool gTouchProfilerShortcutDown;
 static bool gTouchRecenterShortcutDown;
 static bool gVrMenuVisible;
 static bool gVrMenuShortcutDown;
@@ -130,6 +129,7 @@ static bool gGameplayHudEnabled = true;
 enum {
 	WRIST_PANEL_MAP = 0,
 	WRIST_PANEL_STATUS,
+	WRIST_PANEL_CLOCK,
 	WRIST_PANEL_COUNT
 };
 // Where a panel actually sits. A controller grip pose says nothing about the
@@ -141,6 +141,25 @@ enum {
 	WRIST_SIDE_OUTER = 0,
 	WRIST_SIDE_INNER,
 	WRIST_SIDE_COUNT
+};
+// A panel worn for walking is in the wrong place for a wheel or a set of
+// handlebars: the arms are held differently and the panel has to follow. Each
+// context carries a full placement of its own. A vehicle one starts out
+// inheriting whatever the default is and only becomes its own once the player
+// edits it, so nobody has to calibrate three times to change one thing.
+enum {
+	WRIST_CONTEXT_DEFAULT = 0,
+	WRIST_CONTEXT_CAR,
+	WRIST_CONTEXT_BIKE,
+	WRIST_CONTEXT_COUNT
+};
+enum { WRIST_SLOT_COUNT = WRIST_CONTEXT_COUNT*WRIST_SIDE_COUNT };
+#define WRIST_SLOT(context, side) ((context)*WRIST_SIDE_COUNT+(side))
+static const char *const kWristContextKey[WRIST_CONTEXT_COUNT] = {
+	"", "Car", "Bike"
+};
+static const char *const kWristContextName[WRIST_CONTEXT_COUNT] = {
+	"ON FOOT", "IN A CAR", "ON A BIKE"
 };
 // Defaults are a placement worn and tuned in the headset rather than zeroes,
 // so the calibration page is there to suit a different arm, not to make the
@@ -156,22 +175,37 @@ static const WristPlacement kWristDefault[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT] =
 	{	// status readout
 		{ -62, -26, -16,  30, -867, -1521, 100 },
 		{ -62, -32, -16,  30, -803,  -132, 100 }
+	},
+	{	// watch, worn on the outside of the wrist
+		{ -63, -28, -62, -100, -968, -1632, 100 },
+		{ -55, -33, -52,  95, -955,  -539, 100 }
 	}
 };
-static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false };
-static bool gWristPanelUnderside[WRIST_PANEL_COUNT] = { true, true };
-// One panel per wrist: the map on the left, the readout on the right.
-static int gWristPanelHand[WRIST_PANEL_COUNT] = { 0, 1 };
-static int gWristAlong[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
-static int gWristAcross[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
-static int gWristLift[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
-static int gWristPitch[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
-static int gWristYaw[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
-static int gWristRoll[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
-static int gWristSize[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT];
+static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false, false };
+// The watch is the odd one out: both wrists already have a panel underneath,
+// so it is worn where a watch is worn, on the outside of the right one.
+static bool gWristPanelUnderside[WRIST_PANEL_COUNT] = { true, true, false };
+// The map on the left, the readout and the watch on the right.
+static int gWristPanelHand[WRIST_PANEL_COUNT] = { 0, 1, 1 };
+// Driving normally hands the interface back to the head-locked plane. Immersive
+// driving keeps the arms on the wheel, so the panels can stay on them there.
+static bool gWristPanelsInVehicle;
+static int gWristAlong[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+static int gWristAcross[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+static int gWristLift[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+static int gWristPitch[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+static int gWristYaw[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+static int gWristRoll[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+static int gWristSize[WRIST_PANEL_COUNT][WRIST_SLOT_COUNT];
+// False while a vehicle context is still inheriting the default one.
+static bool gWristContextOwned[WRIST_PANEL_COUNT][WRIST_CONTEXT_COUNT];
+// Which context the calibration page is editing.
+static int gVrWristContextEdit;
 // Settings key prefixes. The map keeps the names it shipped with so an
 // existing calibration is read back unchanged.
-static const char *const kWristPanelKey[WRIST_PANEL_COUNT] = { "", "Status" };
+static const char *const kWristPanelKey[WRIST_PANEL_COUNT] = {
+	"", "Status", "Clock"
+};
 // Weapon icon, ammo counter and clock. Part of the classic interface, which is
 // what a new player gets: the immersive layout is what switches them off.
 static bool gHudWeaponPanel = true;
@@ -191,6 +225,30 @@ static int gQuestTurnMode;
 static int gQuestTurnSensitivityPercent = 100;
 static int gQuestHeadSteeringSensitivityPercent = 50;
 static int gQuestSnapTurnAngleDegrees = 30;
+// Button assignment, one entry per physical input, filled in by LoadVrSettings
+// and read through androidgame::VrPadBinding. The defaults reproduce the layout
+// the port shipped with. The triggers are in the table because the pad assembly
+// walks all of it, not because the CONTROLS page offers them: they are the
+// accelerator and the brake, and the weapon trigger on foot.
+static const int kVrPadBindingDefault[androidgame::VR_PAD_SOURCE_COUNT] = {
+	androidgame::VR_PAD_TARGET_CROSS,     // A
+	androidgame::VR_PAD_TARGET_CIRCLE,    // B
+	androidgame::VR_PAD_TARGET_SQUARE,    // X
+	androidgame::VR_PAD_TARGET_TRIANGLE,  // Y
+	androidgame::VR_PAD_TARGET_SQUARE,    // left trigger
+	androidgame::VR_PAD_TARGET_CROSS,     // right trigger
+	androidgame::VR_PAD_TARGET_L1,        // left grip
+	androidgame::VR_PAD_TARGET_R1,        // right grip
+	androidgame::VR_PAD_TARGET_L3,        // left stick click
+	androidgame::VR_PAD_TARGET_R3         // right stick click
+};
+static const char *const kVrPadBindingKey[androidgame::VR_PAD_SOURCE_COUNT] = {
+	"BindA", "BindB", "BindX", "BindY",
+	"BindLeftTrigger", "BindRightTrigger",
+	"BindLeftGrip", "BindRightGrip",
+	"BindLeftStickClick", "BindRightStickClick"
+};
+static int gVrPadBinding[androidgame::VR_PAD_SOURCE_COUNT];
 static int gVrMenuPage;
 static int gVrMenuSelection;
 static int gVrGraphicsSelection;
@@ -206,6 +264,7 @@ static int gVrVehicleSelection;
 static int gVrVehicleCalibrationSelection;
 static int gVrVehicleCalibrationHand;
 static int gVrLocomotionSelection;
+static int gVrControlsSelection;
 static int gVrCalibrationSelection;
 static int gVrCalibrationHand = 1;
 static int gVrHolsterSelection;
@@ -237,6 +296,7 @@ enum {
 	VR_MENU_PAGE_VEHICLE,
 	VR_MENU_PAGE_VEHICLE_CALIBRATION,
 	VR_MENU_PAGE_LOCOMOTION,
+	VR_MENU_PAGE_CONTROLS,
 	VR_MENU_PAGE_CALIBRATION,
 	VR_MENU_PAGE_HOLSTERS,
 	VR_MENU_PAGE_CHEATS,
@@ -267,6 +327,9 @@ enum eVrHudMenuItem {
 	VR_HUD_WRIST_RADAR_CALIBRATE,
 	VR_HUD_WRIST_STATUS,
 	VR_HUD_WRIST_STATUS_CALIBRATE,
+	VR_HUD_WRIST_CLOCK,
+	VR_HUD_WRIST_CLOCK_CALIBRATE,
+	VR_HUD_WRIST_IN_VEHICLE,
 	VR_HUD_WEAPON_PANEL,
 	VR_HUD_CLOCK,
 	VR_HUD_BACK,
@@ -276,7 +339,8 @@ enum eVrHudMenuItem {
 // Placement of the wrist minimap. Outside and inside of a wrist are separate
 // sets: they are different places on the arm and do not share numbers.
 enum eVrWristRadarMenuItem {
-	VR_WRIST_SIDE = 0,
+	VR_WRIST_CONTEXT = 0,
+	VR_WRIST_SIDE,
 	VR_WRIST_HAND,
 	VR_WRIST_ALONG,
 	VR_WRIST_ACROSS,
@@ -301,6 +365,7 @@ enum eVrMainMenuItem {
 	VR_MAIN_MODEL_ASSETS,
 	VR_MAIN_VEHICLE_SETTINGS,
 	VR_MAIN_LOCOMOTION_SETTINGS,
+	VR_MAIN_CONTROLS,
 	VR_MAIN_WEAPONS,
 	VR_MAIN_HOLSTERS,
 	VR_MAIN_CHEATS,
@@ -368,6 +433,7 @@ enum eVrVehicleMenuItem {
 	VR_VEHICLE_MOTION_HAND,
 	VR_VEHICLE_WHEEL_VISIBLE,
 	VR_VEHICLE_MODEL_WHEEL_VISIBLE,
+	VR_VEHICLE_WHEEL_HAND_PULL_BACK,
 	VR_VEHICLE_HANDLE_HIGHLIGHTS,
 	VR_VEHICLE_BIKE_LOCK_HORIZON,
 	VR_VEHICLE_CALIBRATION,
@@ -384,6 +450,33 @@ enum eVrLocomotionMenuItem {
 	VR_LOCOMOTION_REFRESH_RATE,
 	VR_LOCOMOTION_BACK,
 	VR_LOCOMOTION_ITEM_COUNT
+};
+
+// Which physical input each row of the CONTROLS page edits; the triggers are
+// deliberately absent. VrControlsRowSource maps a row back to its input.
+enum eVrControlsMenuItem {
+	VR_CONTROLS_LAYOUT = 0,
+	VR_CONTROLS_A,
+	VR_CONTROLS_B,
+	VR_CONTROLS_X,
+	VR_CONTROLS_Y,
+	VR_CONTROLS_LEFT_GRIP,
+	VR_CONTROLS_RIGHT_GRIP,
+	VR_CONTROLS_LEFT_STICK_CLICK,
+	VR_CONTROLS_RIGHT_STICK_CLICK,
+	VR_CONTROLS_RESET,
+	VR_CONTROLS_BACK,
+	VR_CONTROLS_ITEM_COUNT
+};
+
+// SWAPPED HANDS is the reason the page exists: it moves jump and enter/exit to
+// the right controller and attack and sprint to the left, for players who read
+// the shipped layout as inverted.
+enum eVrControlsLayout {
+	VR_CONTROLS_LAYOUT_DEFAULT = 0,
+	VR_CONTROLS_LAYOUT_SWAPPED_HANDS,
+	VR_CONTROLS_LAYOUT_CUSTOM,
+	VR_CONTROLS_LAYOUT_COUNT
 };
 
 enum eQuestMovementOrientation {
@@ -495,6 +588,59 @@ namespace androidgame {
 
 static void SaveVrInteger(const char *key, int value);
 
+// Marks a vehicle context as carrying its own values rather than the on-foot
+// ones. Kept out of the placement keys so an older settings file still reads
+// back as plain inheritance.
+static const char *
+WristContextKey(int panel, int context)
+{
+	static char key[64];
+	snprintf(key, sizeof(key), "Wrist%s%sCustom",
+		kWristPanelKey[panel], kWristContextKey[context]);
+	return key;
+}
+
+// Where the player is right now, which decides the placement in use.
+static int
+ActiveWristContext(void)
+{
+	CVehicle *vehicle = FindPlayerVehicle();
+	if(vehicle == nil)
+		return WRIST_CONTEXT_DEFAULT;
+	return vehicle->IsBike() ? WRIST_CONTEXT_BIKE : WRIST_CONTEXT_CAR;
+}
+
+// ...and the one whose values actually apply, following inheritance.
+static int
+ResolvedWristContext(int panel)
+{
+	const int context = ActiveWristContext();
+	return gWristContextOwned[panel][context] ?
+		context : WRIST_CONTEXT_DEFAULT;
+}
+
+// Editing a vehicle context for the first time takes the on-foot values with
+// it, so the panel does not jump the moment the first value is nudged.
+static void
+OwnWristContext(int panel, int context)
+{
+	if(context == WRIST_CONTEXT_DEFAULT ||
+	   gWristContextOwned[panel][context])
+		return;
+	for(int side = 0; side < WRIST_SIDE_COUNT; side++){
+		const int from = WRIST_SLOT(WRIST_CONTEXT_DEFAULT, side);
+		const int to = WRIST_SLOT(context, side);
+		gWristAlong[panel][to] = gWristAlong[panel][from];
+		gWristAcross[panel][to] = gWristAcross[panel][from];
+		gWristLift[panel][to] = gWristLift[panel][from];
+		gWristPitch[panel][to] = gWristPitch[panel][from];
+		gWristYaw[panel][to] = gWristYaw[panel][from];
+		gWristRoll[panel][to] = gWristRoll[panel][from];
+		gWristSize[panel][to] = gWristSize[panel][from];
+	}
+	gWristContextOwned[panel][context] = true;
+}
+
 static void
 ApplyTrafficSettings(void)
 {
@@ -570,46 +716,70 @@ LoadVrSettings(void)
 		"WristStatusUnderside", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelHand[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
 		"WristStatusHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gWristPanelOn[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
+		"WristClock", 0, ".\\vr_settings.ini") != 0;
+	gWristPanelUnderside[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
+		"WristClockUnderside", 0, ".\\vr_settings.ini") != 0;
+	gWristPanelHand[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
+		"WristClockHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gWristPanelsInVehicle = GetPrivateProfileIntA("VR",
+		"WristPanelsInVehicle", 0, ".\\vr_settings.ini") != 0;
+	static const char *const fieldNames[7] = {
+		"Along", "Across", "Lift", "Pitch", "Yaw", "Roll", "Size"
+	};
+	static const int fieldLimit[7][2] = {
+		{ -300, 300 }, { -300, 300 }, { -300, 300 },
+		{ -1800, 1800 }, { -1800, 1800 }, { -1800, 1800 }, { 40, 250 }
+	};
 	for(int panel = 0; panel < WRIST_PANEL_COUNT; panel++)
-		for(int side = 0; side < WRIST_SIDE_COUNT; side++){
-			const WristPlacement &fallback = kWristDefault[panel][side];
-			const char *name = side == WRIST_SIDE_INNER ? "Inner" : "Outer";
-			char key[64];
-			snprintf(key, sizeof(key), "Wrist%s%sAlong",
-				kWristPanelKey[panel], name);
-			gWristAlong[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.along,
-				".\\vr_settings.ini"), -300), 300);
-			snprintf(key, sizeof(key), "Wrist%s%sAcross",
-				kWristPanelKey[panel], name);
-			gWristAcross[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.across,
-				".\\vr_settings.ini"), -300), 300);
-			snprintf(key, sizeof(key), "Wrist%s%sLift",
-				kWristPanelKey[panel], name);
-			gWristLift[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.lift,
-				".\\vr_settings.ini"), -300), 300);
-			snprintf(key, sizeof(key), "Wrist%s%sPitch",
-				kWristPanelKey[panel], name);
-			gWristPitch[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.pitch,
-				".\\vr_settings.ini"), -1800), 1800);
-			snprintf(key, sizeof(key), "Wrist%s%sYaw",
-				kWristPanelKey[panel], name);
-			gWristYaw[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.yaw,
-				".\\vr_settings.ini"), -1800), 1800);
-			snprintf(key, sizeof(key), "Wrist%s%sRoll",
-				kWristPanelKey[panel], name);
-			gWristRoll[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.roll,
-				".\\vr_settings.ini"), -1800), 1800);
-			snprintf(key, sizeof(key), "Wrist%s%sSize",
-				kWristPanelKey[panel], name);
-			gWristSize[panel][side] = Min(Max((int)(int32)
-				GetPrivateProfileIntA("VR", key, fallback.size,
-				".\\vr_settings.ini"), 40), 250);
+		for(int context = 0; context < WRIST_CONTEXT_COUNT; context++){
+			gWristContextOwned[panel][context] =
+				context == WRIST_CONTEXT_DEFAULT ||
+				GetPrivateProfileIntA("VR",
+					WristContextKey(panel, context),
+					0, ".\\vr_settings.ini") != 0;
+			for(int side = 0; side < WRIST_SIDE_COUNT; side++){
+				const WristPlacement &shipped = kWristDefault[panel][side];
+				const int slot = WRIST_SLOT(context, side);
+				// A vehicle context that has never been edited reads back the
+				// on-foot values, so switching to it shows what is on screen.
+				const int inherited = WRIST_SLOT(
+					WRIST_CONTEXT_DEFAULT, side);
+				int *field[7] = {
+					&gWristAlong[panel][slot], &gWristAcross[panel][slot],
+					&gWristLift[panel][slot], &gWristPitch[panel][slot],
+					&gWristYaw[panel][slot], &gWristRoll[panel][slot],
+					&gWristSize[panel][slot]
+				};
+				const int shippedValue[7] = {
+					shipped.along, shipped.across, shipped.lift,
+					shipped.pitch, shipped.yaw, shipped.roll, shipped.size
+				};
+				const int inheritedValue[7] = {
+					gWristAlong[panel][inherited],
+					gWristAcross[panel][inherited],
+					gWristLift[panel][inherited],
+					gWristPitch[panel][inherited],
+					gWristYaw[panel][inherited],
+					gWristRoll[panel][inherited],
+					gWristSize[panel][inherited]
+				};
+				for(int item = 0; item < 7; item++){
+					char key[64];
+					snprintf(key, sizeof(key), "Wrist%s%s%s%s",
+						kWristPanelKey[panel],
+						kWristContextKey[context],
+						side == WRIST_SIDE_INNER ? "Inner" : "Outer",
+						fieldNames[item]);
+					const int fallback =
+						context == WRIST_CONTEXT_DEFAULT ?
+							shippedValue[item] : inheritedValue[item];
+					*field[item] = Min(Max((int)(int32)
+						GetPrivateProfileIntA("VR", key, fallback,
+						".\\vr_settings.ini"),
+						fieldLimit[item][0]), fieldLimit[item][1]);
+				}
+			}
 		}
 	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 1,
 		".\\vr_settings.ini") != 0;
@@ -692,6 +862,16 @@ LoadVrSettings(void)
 	gVrWelcomePending = GetPrivateProfileIntA("VR", "WelcomeShown", 0,
 		".\\vr_settings.ini") == 0;
 	gVrWelcomeFirstRun = gVrWelcomePending;
+	// A binding out of range is an INI written by a different build; fall back
+	// to the shipped assignment for that input rather than to no button at all.
+	for(int source = 0; source < VR_PAD_SOURCE_COUNT; source++){
+		const int target = GetPrivateProfileIntA("VR",
+			kVrPadBindingKey[source], kVrPadBindingDefault[source],
+			".\\vr_settings.ini");
+		gVrPadBinding[source] =
+			target >= VR_PAD_TARGET_NONE && target < VR_PAD_TARGET_COUNT ?
+				target : kVrPadBindingDefault[source];
+	}
 	ApplyTrafficSettings();
 	gVrSettingsLoaded = true;
 }
@@ -737,26 +917,44 @@ SaveWristPanels(void)
 	WritePrivateProfileStringA("VR", "WristStatusHand",
 		gWristPanelHand[WRIST_PANEL_STATUS] ? "1" : "0",
 		".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristClock",
+		gWristPanelOn[WRIST_PANEL_CLOCK] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristClockUnderside",
+		gWristPanelUnderside[WRIST_PANEL_CLOCK] ? "1" : "0",
+		".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristClockHand",
+		gWristPanelHand[WRIST_PANEL_CLOCK] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristPanelsInVehicle",
+		gWristPanelsInVehicle ? "1" : "0", ".\\vr_settings.ini");
 	static const char *const names[7] = {
 		"Along", "Across", "Lift", "Pitch", "Yaw", "Roll", "Size"
 	};
 	for(int panel = 0; panel < WRIST_PANEL_COUNT; panel++)
-		for(int side = 0; side < WRIST_SIDE_COUNT; side++){
-			const int values[7] = {
-				gWristAlong[panel][side], gWristAcross[panel][side],
-				gWristLift[panel][side], gWristPitch[panel][side],
-				gWristYaw[panel][side], gWristRoll[panel][side],
-				gWristSize[panel][side]
-			};
-			for(int item = 0; item < 7; item++){
-				char key[64], value[32];
-				snprintf(key, sizeof(key), "Wrist%s%s%s",
-					kWristPanelKey[panel],
-					side == WRIST_SIDE_INNER ? "Inner" : "Outer",
-					names[item]);
-				snprintf(value, sizeof(value), "%d", values[item]);
-				WritePrivateProfileStringA("VR", key, value,
+		for(int context = 0; context < WRIST_CONTEXT_COUNT; context++){
+			if(context != WRIST_CONTEXT_DEFAULT)
+				WritePrivateProfileStringA("VR",
+					WristContextKey(panel, context),
+					gWristContextOwned[panel][context] ? "1" : "0",
 					".\\vr_settings.ini");
+			for(int side = 0; side < WRIST_SIDE_COUNT; side++){
+				const int slot = WRIST_SLOT(context, side);
+				const int values[7] = {
+					gWristAlong[panel][slot], gWristAcross[panel][slot],
+					gWristLift[panel][slot], gWristPitch[panel][slot],
+					gWristYaw[panel][slot], gWristRoll[panel][slot],
+					gWristSize[panel][slot]
+				};
+				for(int item = 0; item < 7; item++){
+					char key[64], value[32];
+					snprintf(key, sizeof(key), "Wrist%s%s%s%s",
+						kWristPanelKey[panel],
+						kWristContextKey[context],
+						side == WRIST_SIDE_INNER ? "Inner" : "Outer",
+						names[item]);
+					snprintf(value, sizeof(value), "%d", values[item]);
+					WritePrivateProfileStringA("VR", key, value,
+						".\\vr_settings.ini");
+				}
 			}
 		}
 }
@@ -774,9 +972,11 @@ static int
 CurrentHudPreset(void)
 {
 	if(gWristPanelOn[WRIST_PANEL_MAP] && gWristPanelOn[WRIST_PANEL_STATUS] &&
+	   gWristPanelOn[WRIST_PANEL_CLOCK] && gWristPanelsInVehicle &&
 	   !gHudWeaponPanel && !gHudClock)
 		return VR_HUD_PRESET_IMMERSIVE;
 	if(!gWristPanelOn[WRIST_PANEL_MAP] && !gWristPanelOn[WRIST_PANEL_STATUS] &&
+	   !gWristPanelOn[WRIST_PANEL_CLOCK] && !gWristPanelsInVehicle &&
 	   gHudWeaponPanel && gHudClock)
 		return VR_HUD_PRESET_CLASSIC;
 	return VR_HUD_PRESET_CUSTOM;
@@ -788,6 +988,8 @@ ApplyHudPreset(int preset)
 	const bool immersive = preset == VR_HUD_PRESET_IMMERSIVE;
 	gWristPanelOn[WRIST_PANEL_MAP] = immersive;
 	gWristPanelOn[WRIST_PANEL_STATUS] = immersive;
+	gWristPanelOn[WRIST_PANEL_CLOCK] = immersive;
+	gWristPanelsInVehicle = immersive;
 	gHudWeaponPanel = !immersive;
 	gHudClock = !immersive;
 	SaveWristPanels();
@@ -801,6 +1003,109 @@ SaveVrInteger(const char *key, int value)
 	char text[16];
 	snprintf(text, sizeof(text), "%d", value);
 	WritePrivateProfileStringA("VR", key, text, ".\\vr_settings.ini");
+}
+
+static int
+VrControlsRowSource(int item)
+{
+	switch(item){
+	case VR_CONTROLS_A: return androidgame::VR_PAD_SOURCE_A;
+	case VR_CONTROLS_B: return androidgame::VR_PAD_SOURCE_B;
+	case VR_CONTROLS_X: return androidgame::VR_PAD_SOURCE_X;
+	case VR_CONTROLS_Y: return androidgame::VR_PAD_SOURCE_Y;
+	case VR_CONTROLS_LEFT_GRIP: return androidgame::VR_PAD_SOURCE_LEFT_GRIP;
+	case VR_CONTROLS_RIGHT_GRIP: return androidgame::VR_PAD_SOURCE_RIGHT_GRIP;
+	case VR_CONTROLS_LEFT_STICK_CLICK:
+		return androidgame::VR_PAD_SOURCE_LEFT_STICK_CLICK;
+	case VR_CONTROLS_RIGHT_STICK_CLICK:
+		return androidgame::VR_PAD_SOURCE_RIGHT_STICK_CLICK;
+	}
+	return -1;
+}
+
+static const char *
+VrPadSourceName(int source)
+{
+	switch(source){
+	case androidgame::VR_PAD_SOURCE_A: return "A BUTTON";
+	case androidgame::VR_PAD_SOURCE_B: return "B BUTTON";
+	case androidgame::VR_PAD_SOURCE_X: return "X BUTTON";
+	case androidgame::VR_PAD_SOURCE_Y: return "Y BUTTON";
+	case androidgame::VR_PAD_SOURCE_LEFT_GRIP: return "LEFT GRIP";
+	case androidgame::VR_PAD_SOURCE_RIGHT_GRIP: return "RIGHT GRIP";
+	case androidgame::VR_PAD_SOURCE_LEFT_STICK_CLICK: return "LEFT STICK CLICK";
+	case androidgame::VR_PAD_SOURCE_RIGHT_STICK_CLICK:
+		return "RIGHT STICK CLICK";
+	}
+	return "UNKNOWN";
+}
+
+// The action is what the default controller setup does with that pad button on
+// foot; the pad button itself is spelled out beside it because the frontend can
+// still change what it means.
+static const char *
+VrPadTargetName(int target)
+{
+	switch(target){
+	case androidgame::VR_PAD_TARGET_SQUARE: return "JUMP [SQUARE]";
+	case androidgame::VR_PAD_TARGET_CROSS: return "SPRINT [CROSS]";
+	case androidgame::VR_PAD_TARGET_CIRCLE: return "ATTACK [CIRCLE]";
+	case androidgame::VR_PAD_TARGET_TRIANGLE: return "ENTER / EXIT [TRIANGLE]";
+	case androidgame::VR_PAD_TARGET_L1: return "PICK UP / RADIO [L1]";
+	case androidgame::VR_PAD_TARGET_R1: return "TARGET [R1]";
+	case androidgame::VR_PAD_TARGET_L2: return "PREVIOUS WEAPON [L2]";
+	case androidgame::VR_PAD_TARGET_R2: return "NEXT WEAPON [R2]";
+	case androidgame::VR_PAD_TARGET_L3: return "CROUCH / HORN [L3]";
+	case androidgame::VR_PAD_TARGET_R3: return "LOOK BEHIND [R3]";
+	}
+	return "UNUSED";
+}
+
+static void
+SavePadBinding(int source)
+{
+	SaveVrInteger(kVrPadBindingKey[source], gVrPadBinding[source]);
+}
+
+static const int kVrSwappedHandsBinding[androidgame::VR_PAD_SOURCE_COUNT] = {
+	androidgame::VR_PAD_TARGET_SQUARE,    // A
+	androidgame::VR_PAD_TARGET_TRIANGLE,  // B
+	androidgame::VR_PAD_TARGET_CROSS,     // X
+	androidgame::VR_PAD_TARGET_CIRCLE,    // Y
+	androidgame::VR_PAD_TARGET_SQUARE,    // left trigger
+	androidgame::VR_PAD_TARGET_CROSS,     // right trigger
+	androidgame::VR_PAD_TARGET_L1,        // left grip
+	androidgame::VR_PAD_TARGET_R1,        // right grip
+	androidgame::VR_PAD_TARGET_L3,        // left stick click
+	androidgame::VR_PAD_TARGET_R3         // right stick click
+};
+
+static bool
+PadBindingsMatch(const int *layout)
+{
+	for(int source = 0; source < androidgame::VR_PAD_SOURCE_COUNT; source++)
+		if(gVrPadBinding[source] != layout[source])
+			return false;
+	return true;
+}
+
+static int
+CurrentControlsLayout(void)
+{
+	if(PadBindingsMatch(kVrPadBindingDefault))
+		return VR_CONTROLS_LAYOUT_DEFAULT;
+	if(PadBindingsMatch(kVrSwappedHandsBinding))
+		return VR_CONTROLS_LAYOUT_SWAPPED_HANDS;
+	return VR_CONTROLS_LAYOUT_CUSTOM;
+}
+
+static void
+ApplyControlsLayout(const int *layout)
+{
+	for(int source = 0; source < androidgame::VR_PAD_SOURCE_COUNT; source++){
+		gVrPadBinding[source] = layout[source];
+		SavePadBinding(source);
+	}
 }
 
 static void
@@ -942,6 +1247,7 @@ CurrentMenuSelection(void)
 	case VR_MENU_PAGE_VEHICLE_CALIBRATION:
 		return &gVrVehicleCalibrationSelection;
 	case VR_MENU_PAGE_LOCOMOTION: return &gVrLocomotionSelection;
+	case VR_MENU_PAGE_CONTROLS: return &gVrControlsSelection;
 	case VR_MENU_PAGE_CALIBRATION: return &gVrCalibrationSelection;
 	case VR_MENU_PAGE_HOLSTERS: return &gVrHolsterSelection;
 	case VR_MENU_PAGE_CHEATS: return &gVrCheatSelection;
@@ -968,6 +1274,7 @@ CurrentMenuItemCount(void)
 		return Max(1,
 			OculusVR::GetQuestVehicleCalibrationItemCount()+1);
 	case VR_MENU_PAGE_LOCOMOTION: return VR_LOCOMOTION_ITEM_COUNT;
+	case VR_MENU_PAGE_CONTROLS: return VR_CONTROLS_ITEM_COUNT;
 	case VR_MENU_PAGE_CALIBRATION: return 21;
 	case VR_MENU_PAGE_HOLSTERS:
 		return OculusVR::GetQuestHolsterPointCount()+1;
@@ -1187,14 +1494,10 @@ VrDebugUpdate(const PadInput &in)
 	}
 	gTouchRecenterShortcutDown = recenterShortcut;
 
-	// Performance profiling is separate from the lightweight debug/FPS
-	// overlay. BOTH GRIPS + Y enables the runtime META counters and Vulkan
-	// timestamp pair together, then exposes both values for comparison.
-	const bool profilerShortcut =
-		modifier && !gVrMenuVisible && in.y;
-	if(profilerShortcut && !gTouchProfilerShortcutDown)
-		QuestProfilerSetEnabled(!QuestProfilerIsEnabled());
-	gTouchProfilerShortcutDown = profilerShortcut;
+	// The profiler had a chord of its own, both grips and Y. Both grips are
+	// how a weapon is picked up, so players kept summoning the counters by
+	// accident and could not read the game through them. It is a developer
+	// tool with a row on the GRAPHICS page; that is route enough.
 
 	if(gVrMenuVisible){
 		if(gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION &&
@@ -1259,6 +1562,9 @@ VrDebugUpdate(const PadInput &in)
 			}else if(gVrMenuSelection == VR_MAIN_LOCOMOTION_SETTINGS){
 				gVrMenuPage = VR_MENU_PAGE_LOCOMOTION;
 				gVrLocomotionSelection = 0;
+			}else if(gVrMenuSelection == VR_MAIN_CONTROLS){
+				gVrMenuPage = VR_MENU_PAGE_CONTROLS;
+				gVrControlsSelection = 0;
 			}else if(gVrMenuSelection == VR_MAIN_WEAPONS){
 				gVrMenuPage = VR_MENU_PAGE_WEAPONS;
 				gVrWeaponsSelection = 0;
@@ -1523,6 +1829,20 @@ VrDebugUpdate(const PadInput &in)
 				gVrWristPanelEdit = WRIST_PANEL_STATUS;
 				gVrWristRadarSelection = 0;
 				break;
+			case VR_HUD_WRIST_CLOCK:
+				gWristPanelOn[WRIST_PANEL_CLOCK] =
+					!gWristPanelOn[WRIST_PANEL_CLOCK];
+				SaveWristPanels();
+				break;
+			case VR_HUD_WRIST_CLOCK_CALIBRATE:
+				gVrMenuPage = VR_MENU_PAGE_WRIST_RADAR;
+				gVrWristPanelEdit = WRIST_PANEL_CLOCK;
+				gVrWristRadarSelection = 0;
+				break;
+			case VR_HUD_WRIST_IN_VEHICLE:
+				gWristPanelsInVehicle = !gWristPanelsInVehicle;
+				SaveWristPanels();
+				break;
 			case VR_HUD_WEAPON_PANEL:
 				gHudWeaponPanel = !gHudWeaponPanel;
 				SaveVrInteger("HudWeaponPanel",
@@ -1545,7 +1865,20 @@ VrDebugUpdate(const PadInput &in)
 				WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
 			const int other = side == WRIST_SIDE_INNER ?
 				WRIST_SIDE_OUTER : WRIST_SIDE_INNER;
+			const int context = gVrWristContextEdit;
+			const int slot = WRIST_SLOT(context, side);
+			const int otherSlot = WRIST_SLOT(context, other);
+			// Any placement change claims the context being edited; the two
+			// rows above it belong to the panel itself and do not.
+			if(gVrWristRadarSelection > VR_WRIST_HAND &&
+			   gVrWristRadarSelection < VR_WRIST_BACK)
+				OwnWristContext(panel, context);
 			switch(gVrWristRadarSelection){
+			case VR_WRIST_CONTEXT:
+				gVrWristContextEdit =
+					(gVrWristContextEdit+WRIST_CONTEXT_COUNT+
+					 (step > 0 ? 1 : -1)) % WRIST_CONTEXT_COUNT;
+				break;
 			case VR_WRIST_SIDE:
 				// The same setting the HUD page shows: switching it here both
 				// moves the panel and picks the values being edited.
@@ -1557,60 +1890,67 @@ VrDebugUpdate(const PadInput &in)
 				SaveWristPanels();
 				break;
 			case VR_WRIST_ALONG:
-				gWristAlong[panel][side] = Min(Max(
-					gWristAlong[panel][side]+step, -300), 300);
+				gWristAlong[panel][slot] = Min(Max(
+					gWristAlong[panel][slot]+step, -300), 300);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_ACROSS:
-				gWristAcross[panel][side] = Min(Max(
-					gWristAcross[panel][side]+step, -300), 300);
+				gWristAcross[panel][slot] = Min(Max(
+					gWristAcross[panel][slot]+step, -300), 300);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_LIFT:
-				gWristLift[panel][side] = Min(Max(
-					gWristLift[panel][side]+step, -300), 300);
+				gWristLift[panel][slot] = Min(Max(
+					gWristLift[panel][slot]+step, -300), 300);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_PITCH:
-				gWristPitch[panel][side] = Min(Max(
-					gWristPitch[panel][side]+step, -1800), 1800);
+				gWristPitch[panel][slot] = Min(Max(
+					gWristPitch[panel][slot]+step, -1800), 1800);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_YAW:
-				gWristYaw[panel][side] = Min(Max(
-					gWristYaw[panel][side]+step, -1800), 1800);
+				gWristYaw[panel][slot] = Min(Max(
+					gWristYaw[panel][slot]+step, -1800), 1800);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_ROLL:
-				gWristRoll[panel][side] = Min(Max(
-					gWristRoll[panel][side]+step, -1800), 1800);
+				gWristRoll[panel][slot] = Min(Max(
+					gWristRoll[panel][slot]+step, -1800), 1800);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_SIZE:
-				gWristSize[panel][side] = Min(Max(
-					gWristSize[panel][side]+step, 40), 250);
+				gWristSize[panel][slot] = Min(Max(
+					gWristSize[panel][slot]+step, 40), 250);
 				SaveWristPanels();
 				break;
 			case VR_WRIST_COPY:
 				// A starting point, not a result: the other side is
 				// usually close enough to calibrate from.
-				gWristAlong[panel][side] = gWristAlong[panel][other];
-				gWristAcross[panel][side] = gWristAcross[panel][other];
-				gWristLift[panel][side] = gWristLift[panel][other];
-				gWristPitch[panel][side] = gWristPitch[panel][other];
-				gWristYaw[panel][side] = gWristYaw[panel][other];
-				gWristRoll[panel][side] = gWristRoll[panel][other];
-				gWristSize[panel][side] = gWristSize[panel][other];
+				gWristAlong[panel][slot] = gWristAlong[panel][otherSlot];
+				gWristAcross[panel][slot] = gWristAcross[panel][otherSlot];
+				gWristLift[panel][slot] = gWristLift[panel][otherSlot];
+				gWristPitch[panel][slot] = gWristPitch[panel][otherSlot];
+				gWristYaw[panel][slot] = gWristYaw[panel][otherSlot];
+				gWristRoll[panel][slot] = gWristRoll[panel][otherSlot];
+				gWristSize[panel][slot] = gWristSize[panel][otherSlot];
 				SaveWristPanels();
 				break;
 			case VR_WRIST_RESET:
-				gWristAlong[panel][side] = 0;
-				gWristAcross[panel][side] = 0;
-				gWristLift[panel][side] = 0;
-				gWristPitch[panel][side] = 0;
-				gWristYaw[panel][side] = 0;
-				gWristRoll[panel][side] = 0;
-				gWristSize[panel][side] = 100;
+				// A vehicle context resets by going back to inheriting the
+				// on-foot placement, which is more useful than zeroes.
+				if(context != WRIST_CONTEXT_DEFAULT){
+					gWristContextOwned[panel][context] = false;
+					SaveWristPanels();
+					break;
+				}
+				gWristAlong[panel][slot] = 0;
+				gWristAcross[panel][slot] = 0;
+				gWristLift[panel][slot] = 0;
+				gWristPitch[panel][slot] = 0;
+				gWristYaw[panel][slot] = 0;
+				gWristRoll[panel][slot] = 0;
+				gWristSize[panel][slot] = 100;
 				SaveWristPanels();
 				break;
 			case VR_WRIST_BACK:
@@ -1677,6 +2017,9 @@ VrDebugUpdate(const PadInput &in)
 			case VR_VEHICLE_MODEL_WHEEL_VISIBLE:
 				OculusVR::ToggleQuestVehicleModelWheelVisibility();
 				break;
+			case VR_VEHICLE_WHEEL_HAND_PULL_BACK:
+				OculusVR::AdjustQuestWheelHandPullBackMm(direction);
+				break;
 			case VR_VEHICLE_HANDLE_HIGHLIGHTS:
 				OculusVR::ToggleQuestVehicleHandleHighlights();
 				break;
@@ -1723,10 +2066,25 @@ VrDebugUpdate(const PadInput &in)
 			const int direction = decreasePulse ? -1 : 1;
 			switch(gVrLocomotionSelection){
 			case VR_LOCOMOTION_MOVEMENT_ORIENTATION:
-				gQuestMovementOrientation =
-					(gQuestMovementOrientation+
-					 QUEST_MOVEMENT_ORIENTATION_COUNT+direction) %
-					QUEST_MOVEMENT_ORIENTATION_COUNT;
+				// BODY ignores physical rotation: a standing player who turns
+				// around and pushes forward walks the way they used to face.
+				// It stays on the page for anyone who wants it, but a brushed
+				// stick or trigger steps over it -- only a deliberate press
+				// selects it. Leaving BODY works either way.
+				if(selectPulse)
+					gQuestMovementOrientation =
+						(gQuestMovementOrientation+1) %
+						QUEST_MOVEMENT_ORIENTATION_COUNT;
+				else{
+					int next = gQuestMovementOrientation;
+					do
+						next = (next+
+							QUEST_MOVEMENT_ORIENTATION_COUNT+
+							direction) %
+							QUEST_MOVEMENT_ORIENTATION_COUNT;
+					while(next == QUEST_MOVEMENT_ORIENTATION_BODY);
+					gQuestMovementOrientation = next;
+				}
 				SaveVrInteger("MovementOrientation",
 					gQuestMovementOrientation);
 				break;
@@ -1783,6 +2141,33 @@ VrDebugUpdate(const PadInput &in)
 			case VR_LOCOMOTION_BACK:
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
 				break;
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_CONTROLS &&
+		         (positivePulse || decreasePulse)){
+			const int direction = decreasePulse ? -1 : 1;
+			const int source = VrControlsRowSource(gVrControlsSelection);
+			if(source >= 0){
+				// NONE is a real choice here: it is how a player switches an
+				// input off, and the row it belongs to says UNUSED.
+				int target = gVrPadBinding[source]+direction;
+				if(target < VR_PAD_TARGET_NONE)
+					target = VR_PAD_TARGET_COUNT-1;
+				if(target >= VR_PAD_TARGET_COUNT)
+					target = VR_PAD_TARGET_NONE;
+				gVrPadBinding[source] = target;
+				SavePadBinding(source);
+			}else if(gVrControlsSelection == VR_CONTROLS_LAYOUT){
+				// CUSTOM describes an assignment, it is not one to step into:
+				// the row cycles between the two layouts that are.
+				ApplyControlsLayout(
+					CurrentControlsLayout() ==
+						VR_CONTROLS_LAYOUT_DEFAULT ?
+						kVrSwappedHandsBinding :
+						kVrPadBindingDefault);
+			}else if(gVrControlsSelection == VR_CONTROLS_RESET){
+				ApplyControlsLayout(kVrPadBindingDefault);
+			}else if(gVrControlsSelection == VR_CONTROLS_BACK){
+				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
 			}
 		}else if(gVrMenuPage == VR_MENU_PAGE_CALIBRATION){
 			if(gVrCalibrationSelection == 0 &&
@@ -1911,8 +2296,8 @@ QuestMainCategoryColour(int item, uint8 *red, uint8 *green, uint8 *blue)
 	static const uint8 colours[VR_MAIN_ITEM_COUNT][3] = {
 		{100,225,255}, {125,255,145}, {255,205,90},
 		{190,145,255}, {255,155,90}, {90,220,210},
-		{255,120,205}, {240,180,105}, {255,105,105},
-		{170,190,210}
+		{145,200,255}, {255,120,205}, {240,180,105},
+		{255,105,105}, {170,190,210}
 	};
 	*red = colours[item][0]; *green = colours[item][1];
 	*blue = colours[item][2];
@@ -1936,6 +2321,7 @@ DrawQuestSettingsPage(void)
 		"VEHICLE  < OPEN >");
 	strcpy(rows[VR_MAIN_LOCOMOTION_SETTINGS],
 		"LOCOMOTION  < OPEN >");
+	strcpy(rows[VR_MAIN_CONTROLS], "CONTROLS  < OPEN >");
 	strcpy(rows[VR_MAIN_WEAPONS], "WEAPONS  < OPEN >");
 	strcpy(rows[VR_MAIN_HOLSTERS], "HOLSTER LOADOUT  < OPEN >");
 	strcpy(rows[VR_MAIN_CHEATS], "CHEAT MENU  < OPEN >");
@@ -2249,18 +2635,24 @@ DrawQuestHudPage(void)
 		"WRIST STATUS PLACEMENT  < %s SIDE, %s HAND >",
 		gWristPanelUnderside[WRIST_PANEL_STATUS] ? "INNER" : "OUTER",
 		gWristPanelHand[WRIST_PANEL_STATUS] ? "RIGHT" : "LEFT");
+	snprintf(rows[VR_HUD_WRIST_CLOCK], sizeof(rows[0]),
+		"CLOCK ON WRIST  < %s >",
+		gWristPanelOn[WRIST_PANEL_CLOCK] ? "ON" : "OFF");
+	snprintf(rows[VR_HUD_WRIST_CLOCK_CALIBRATE], sizeof(rows[0]),
+		"WRIST CLOCK PLACEMENT  < %s SIDE, %s HAND >",
+		gWristPanelUnderside[WRIST_PANEL_CLOCK] ? "INNER" : "OUTER",
+		gWristPanelHand[WRIST_PANEL_CLOCK] ? "RIGHT" : "LEFT");
+	snprintf(rows[VR_HUD_WRIST_IN_VEHICLE], sizeof(rows[0]),
+		"WRIST PANELS WHILE DRIVING  < %s >",
+		gWristPanelsInVehicle ? "IMMERSIVE ONLY" : "OFF");
 	snprintf(rows[VR_HUD_WEAPON_PANEL], sizeof(rows[0]),
 		"WEAPON ICON AND AMMO  < %s >", gHudWeaponPanel ? "ON" : "OFF");
 	snprintf(rows[VR_HUD_CLOCK], sizeof(rows[0]),
 		"CLOCK  < %s >", gHudClock ? "ON" : "OFF");
 	strcpy(rows[VR_HUD_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_HUD_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 142+item*41, 3,
+		DrawFullVrMenuRow(rows[item], 146+item*33, 3,
 			item == gVrHudSelection);
-	if(preset != VR_HUD_PRESET_CLASSIC)
-		DrawVrMenuText(
-			"IMMERSIVE HUD IS EXPERIMENTAL - VEHICLES KEEP THE CLASSIC ONE",
-			VR_MENU_WIDTH/2, 690, 2, 245, 205, 90);
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 MINUS   R2 OR A PLUS   B BACK",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
@@ -2274,14 +2666,21 @@ DrawQuestWristRadarPage(void)
 		WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
 	const char *sideName = side == WRIST_SIDE_INNER ? "INNER" : "OUTER";
 	const char *otherName = side == WRIST_SIDE_INNER ? "OUTER" : "INNER";
-	const char *panelName = panel == WRIST_PANEL_STATUS ?
-		"STATUS READOUT" : "MINIMAP";
+	const char *panelName = panel == WRIST_PANEL_STATUS ? "STATUS READOUT" :
+		(panel == WRIST_PANEL_CLOCK ? "CLOCK" : "MINIMAP");
+	const int context = gVrWristContextEdit;
+	const int slot = WRIST_SLOT(context, side);
 	char heading[96];
-	snprintf(heading, sizeof(heading), "WRIST %s - %s SIDE",
-		panelName, sideName);
+	snprintf(heading, sizeof(heading), "WRIST %s - %s SIDE - %s",
+		panelName, sideName, kWristContextName[context]);
 	BeginFullVrMenuPage(heading,
 		"CALIBRATE THE LEFT HAND - THE RIGHT ONE MIRRORS IT");
 	char rows[VR_WRIST_ITEM_COUNT][112];
+	snprintf(rows[VR_WRIST_CONTEXT], sizeof(rows[0]),
+		"CALIBRATING FOR  < %s%s >", kWristContextName[context],
+		context == WRIST_CONTEXT_DEFAULT ? "" :
+			(gWristContextOwned[panel][context] ? "" :
+				" - SAME AS ON FOOT"));
 	snprintf(rows[VR_WRIST_SIDE], sizeof(rows[0]),
 		"SIDE  < %s >", side == WRIST_SIDE_INNER ?
 			"INNER (UNDER WRIST)" : "OUTER (TOP OF WRIST)");
@@ -2290,27 +2689,30 @@ DrawQuestWristRadarPage(void)
 		gWristPanelHand[panel] ? "RIGHT" : "LEFT");
 	snprintf(rows[VR_WRIST_ALONG], sizeof(rows[0]),
 		"ALONG THE ARM  < %+.1f CM >",
-		(float)gWristAlong[panel][side]*0.1f);
+		(float)gWristAlong[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_ACROSS], sizeof(rows[0]),
 		"ACROSS THE WRIST  < %+.1f CM >",
-		(float)gWristAcross[panel][side]*0.1f);
+		(float)gWristAcross[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_LIFT], sizeof(rows[0]),
-		"OFF THE WRIST  < %+.1f CM >", (float)gWristLift[panel][side]*0.1f);
+		"OFF THE WRIST  < %+.1f CM >", (float)gWristLift[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_PITCH], sizeof(rows[0]),
-		"TILT  < %+.1f DEG >", (float)gWristPitch[panel][side]*0.1f);
+		"TILT  < %+.1f DEG >", (float)gWristPitch[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_YAW], sizeof(rows[0]),
-		"TURN  < %+.1f DEG >", (float)gWristYaw[panel][side]*0.1f);
+		"TURN  < %+.1f DEG >", (float)gWristYaw[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_ROLL], sizeof(rows[0]),
-		"SPIN  < %+.1f DEG >", (float)gWristRoll[panel][side]*0.1f);
+		"SPIN  < %+.1f DEG >", (float)gWristRoll[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_SIZE], sizeof(rows[0]),
-		"SIZE  < %d%% >", gWristSize[panel][side]);
+		"SIZE  < %d%% >", gWristSize[panel][slot]);
 	snprintf(rows[VR_WRIST_COPY], sizeof(rows[0]),
 		"COPY FROM %s SIDE", otherName);
-	snprintf(rows[VR_WRIST_RESET], sizeof(rows[0]),
-		"RESET %s SIDE", sideName);
+	if(context == WRIST_CONTEXT_DEFAULT)
+		snprintf(rows[VR_WRIST_RESET], sizeof(rows[0]),
+			"RESET %s SIDE", sideName);
+	else
+		strcpy(rows[VR_WRIST_RESET], "GO BACK TO THE ON FOOT PLACEMENT");
 	strcpy(rows[VR_WRIST_BACK], "BACK TO HUD SETTINGS");
 	for(int item = 0; item < VR_WRIST_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 150+item*46, 3,
+		DrawFullVrMenuRow(rows[item], 148+item*42, 3,
 			item == gVrWristRadarSelection,
 			item <= VR_WRIST_HAND || gWristPanelOn[panel]);
 	if(!gWristPanelOn[panel])
@@ -2392,6 +2794,9 @@ DrawQuestVehiclePage(void)
 	snprintf(rows[VR_VEHICLE_MODEL_WHEEL_VISIBLE], sizeof(rows[0]),
 		"THIS MODEL VIRTUAL WHEEL  < %s >",
 		OculusVR::GetQuestVehicleModelWheelVisibilityName());
+	snprintf(rows[VR_VEHICLE_WHEEL_HAND_PULL_BACK], sizeof(rows[0]),
+		"WHEEL HAND PULL BACK  < %+d MM >",
+		OculusVR::GetQuestWheelHandPullBackMm());
 	snprintf(rows[VR_VEHICLE_HANDLE_HIGHLIGHTS], sizeof(rows[0]),
 		"VEHICLE GRIP HIGHLIGHTS  < %s >",
 		OculusVR::AreQuestVehicleHandleHighlightsEnabled() ?
@@ -2419,11 +2824,11 @@ DrawQuestVehiclePage(void)
 		        item <= VR_VEHICLE_MODEL_SEAT_FORWARD)
 			available = OculusVR::HasQuestVehicleSeatCalibrationTarget() &&
 				!OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
-		DrawFullVrMenuRow(rows[item], 166+item*34, 2,
+		DrawFullVrMenuRow(rows[item], 158+item*32, 2,
 			item == gVrVehicleSelection, available);
 	}
 	DrawVrMenuText("VALUES ARE SAVED IN VR SETTINGS",
-		VR_MENU_WIDTH/2, 675, 2, 125, 255, 145);
+		VR_MENU_WIDTH/2, 694, 2, 125, 255, 145);
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 PREVIOUS   R2 OR A NEXT   B BACK",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
@@ -2508,6 +2913,39 @@ DrawQuestLocomotionPage(void)
 	for(int item = 0; item < VR_LOCOMOTION_ITEM_COUNT; item++)
 		DrawFullVrMenuRow(rows[item], 190+item*68, 3,
 			item == gVrLocomotionSelection);
+	// The one setting a standing player can be hurt by without knowing why.
+	if(gVrLocomotionSelection == VR_LOCOMOTION_MOVEMENT_ORIENTATION)
+		DrawVrMenuText(
+			"BODY IGNORES PHYSICAL TURNS - PRESS A TO REACH IT",
+			VR_MENU_WIDTH/2, 668, 2, 255, 205, 90);
+	DrawVrMenuText(
+		"LEFT STICK SELECT   L2 PREVIOUS   R2 OR A NEXT   B BACK",
+		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
+}
+
+static void
+DrawQuestControlsPage(void)
+{
+	static const char *const layoutNames[VR_CONTROLS_LAYOUT_COUNT] = {
+		"DEFAULT", "SWAPPED HANDS", "CUSTOM"
+	};
+	BeginFullVrMenuPage("CONTROLS",
+		"ON FOOT BUTTONS - DRIVING AND WEAPON GESTURES ARE FIXED");
+	char rows[VR_CONTROLS_ITEM_COUNT][112];
+	snprintf(rows[VR_CONTROLS_LAYOUT], sizeof(rows[0]),
+		"LAYOUT  < %s >", layoutNames[CurrentControlsLayout()]);
+	for(int item = VR_CONTROLS_A; item <= VR_CONTROLS_RIGHT_STICK_CLICK;
+	    item++){
+		const int source = VrControlsRowSource(item);
+		snprintf(rows[item], sizeof(rows[0]), "%s  < %s >",
+			VrPadSourceName(source),
+			VrPadTargetName(gVrPadBinding[source]));
+	}
+	strcpy(rows[VR_CONTROLS_RESET], "RESET TO DEFAULTS");
+	strcpy(rows[VR_CONTROLS_BACK], "BACK TO SETTINGS");
+	for(int item = 0; item < VR_CONTROLS_ITEM_COUNT; item++)
+		DrawFullVrMenuRow(rows[item], 185+item*46, 3,
+			item == gVrControlsSelection);
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 PREVIOUS   R2 OR A NEXT   B BACK",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
@@ -2767,6 +3205,9 @@ VrDebugPixels(int *width, int *height)
 			break;
 		case VR_MENU_PAGE_LOCOMOTION:
 			DrawQuestLocomotionPage();
+			break;
+		case VR_MENU_PAGE_CONTROLS:
+			DrawQuestControlsPage();
 			break;
 		case VR_MENU_PAGE_CALIBRATION:
 			DrawQuestWeaponCalibrationPage();
@@ -3124,13 +3565,21 @@ VrGetWristPanelCalibration(int panel, float *alongCm, float *acrossCm,
 		panel = WRIST_PANEL_MAP;
 	const int side = gWristPanelUnderside[panel] ?
 		WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
-	if(alongCm) *alongCm = (float)gWristAlong[panel][side]*0.1f;
-	if(acrossCm) *acrossCm = (float)gWristAcross[panel][side]*0.1f;
-	if(liftCm) *liftCm = (float)gWristLift[panel][side]*0.1f;
-	if(pitchDeg) *pitchDeg = (float)gWristPitch[panel][side]*0.1f;
-	if(yawDeg) *yawDeg = (float)gWristYaw[panel][side]*0.1f;
-	if(rollDeg) *rollDeg = (float)gWristRoll[panel][side]*0.1f;
-	if(scale) *scale = (float)gWristSize[panel][side]/100.0f;
+	const int slot = WRIST_SLOT(ResolvedWristContext(panel), side);
+	if(alongCm) *alongCm = (float)gWristAlong[panel][slot]*0.1f;
+	if(acrossCm) *acrossCm = (float)gWristAcross[panel][slot]*0.1f;
+	if(liftCm) *liftCm = (float)gWristLift[panel][slot]*0.1f;
+	if(pitchDeg) *pitchDeg = (float)gWristPitch[panel][slot]*0.1f;
+	if(yawDeg) *yawDeg = (float)gWristYaw[panel][slot]*0.1f;
+	if(rollDeg) *rollDeg = (float)gWristRoll[panel][slot]*0.1f;
+	if(scale) *scale = (float)gWristSize[panel][slot]/100.0f;
+}
+
+bool
+VrWristPanelsInVehicle(void)
+{
+	LoadVrSettings();
+	return gWristPanelsInVehicle;
 }
 
 bool
@@ -3221,6 +3670,23 @@ VrSnapTurnAngleDegrees(void)
 {
 	LoadVrSettings();
 	return gQuestSnapTurnAngleDegrees;
+}
+
+int
+VrPadBinding(int source)
+{
+	LoadVrSettings();
+	if(source < 0 || source >= VR_PAD_SOURCE_COUNT)
+		return VR_PAD_TARGET_NONE;
+	return gVrPadBinding[source];
+}
+
+int
+VrPadBindingDefault(int source)
+{
+	if(source < 0 || source >= VR_PAD_SOURCE_COUNT)
+		return VR_PAD_TARGET_NONE;
+	return kVrPadBindingDefault[source];
 }
 
 float

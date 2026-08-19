@@ -7,6 +7,9 @@
 #include "PlayerPed.h"
 #include "VRHandModel.h"
 #include "vulkan/rwvk.h"
+#ifdef GTA_VR_WEAPONS
+#include "OculusVR.h"
+#endif
 
 #include <android/log.h>
 
@@ -107,6 +110,35 @@ RenderTrackedHands(void)
 	}
 	RenderHand(0, input);
 	RenderHand(1, input);
+}
+
+// With no weapon in the hand the visual matrix is the plain grip pose taken to
+// the world and back, so an existing panel calibration is unaffected.
+bool
+VrGetWristAnchorPose(int hand, float position[3], float side[3],
+                     float palmUp[3], float backward[3])
+{
+	if(hand < 0 || hand > 1 || !position || !side || !palmUp || !backward)
+		return false;
+#ifdef GTA_VR_WEAPONS
+	CMatrix matrix;
+	if(!::gVrFirstPersonActive ||
+	   !OculusVR::GetTrackedVisualHandMatrix(hand, &matrix))
+		return false;
+	// PoseToMatrix builds Right/Up/Forward from the grip quaternion's local
+	// +X/+Y/-Z, so the panel's "backward" is the negated forward axis.
+	const CVector worldBackward = matrix.GetForward()*-1.0f;
+	const CVector &worldPosition = matrix.GetPosition();
+	if(!rw::vulkan::firstPersonWorldPositionToPlay(&worldPosition.x, position) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(&matrix.GetRight().x, side) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(&matrix.GetUp().x, palmUp) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(&worldBackward.x, backward))
+		return false;
+	return true;
+#else
+	(void)position; (void)side; (void)palmUp; (void)backward;
+	return false;
+#endif
 }
 
 } // namespace androidgame

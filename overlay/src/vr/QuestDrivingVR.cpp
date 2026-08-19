@@ -133,6 +133,9 @@ static bool gSettingsLoaded;
 static int gCarDrivingType;
 static int gBikeDrivingType;
 static int gMotionSteeringHand = 1;
+// How far the gripping hand is pulled off the wheel plane, towards the
+// driver, so the rim does not end up inside its wrist.
+static int gWheelHandPullBackMm;
 static bool gHandleHighlightsEnabled = true;
 static bool gBikeHorizonLocked = true;
 // Third-person vehicle view: the ordinary chase camera in stereo, with the
@@ -284,6 +287,8 @@ LoadDrivingSettings()
 				VR_DRIVING_IMMERSIVE : VR_DRIVING_DEFAULT;
 	legacyDrivingType = clamp(legacyDrivingType, (int)VR_DRIVING_DEFAULT,
 		(int)VR_DRIVING_TYPE_COUNT-1);
+	gWheelHandPullBackMm = clamp((int)(int32)GetPrivateProfileIntA(
+		"VR", "WheelHandPullBackMm", 50, kSettingsPath), -80, 80);
 	gCarDrivingType = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "CarDrivingType", legacyDrivingType, kSettingsPath),
 		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
@@ -294,7 +299,7 @@ LoadDrivingSettings()
 		"VR", "MotionSteeringHand", 1, kSettingsPath), 0,
 		VR_HAND_COUNT-1);
 	gHandleHighlightsEnabled = GetPrivateProfileIntA(
-		"VR", "BikeHandleHighlights", 1, kSettingsPath) != 0;
+		"VR", "BikeHandleHighlights", 0, kSettingsPath) != 0;
 	gBikeHorizonLocked = GetPrivateProfileIntA(
 		"VR", "BikeLockHorizon", 1, kSettingsPath) != 0;
 	gVehicleThirdPerson = GetPrivateProfileIntA(
@@ -455,31 +460,44 @@ GetDefaultBikeHandleOffsetX(int bikeIndex, int hand)
 struct BuiltInBikeHandleDefaults
 {
 	int model;
+	ModelSets::eModelSet modelSet;
 	int hand[VR_HAND_COUNT][6];
 };
 
-// Absolute v0.3.1 release baselines from the desktop calibration profile.
 // Hand order is LEFT, RIGHT; fields are offset XYZ then rotation XYZ, all in
-// the existing half-centimetre / half-degree Quest calibration scale.
+// the existing half-centimetre / half-degree Quest calibration scale. The
+// classic rows are the absolute v0.3.1 release baselines from the desktop
+// calibration profile. A modern bike is a different mesh with the bars in a
+// different place, so those that have been ridden and measured carry their own
+// row; the rest still fall back to the classic figure.
 static const BuiltInBikeHandleDefaults gBuiltInBikeHandleDefaults[] = {
-	{ MI_ANGEL, {
+	{ MI_ANGEL, ModelSets::MODEL_SET_CLASSIC, {
 		{ -61,-83,82, 137,0,0 },
 		{ 61,-82,84, 138,0,0 } } },
-	{ MI_FREEWAY, {
+	{ MI_FREEWAY, ModelSets::MODEL_SET_CLASSIC, {
 		{ -64,-82,85, 135,0,0 },
 		{ 64,-82,85, 133,0,0 } } },
-	{ MI_PCJ600, {
+	{ MI_PCJ600, ModelSets::MODEL_SET_CLASSIC, {
 		{ -66,-27,81, -193,1,-15 },
 		{ 66,-27,83, -192,0,0 } } },
-	{ MI_FAGGIO, {
+	{ MI_FAGGIO, ModelSets::MODEL_SET_CLASSIC, {
 		{ -65,-35,84, 156,0,0 },
 		{ 66,-33,84, 156,15,0 } } },
-	{ MI_PIZZABOY, {
+	{ MI_PIZZABOY, ModelSets::MODEL_SET_CLASSIC, {
 		{ -68,-34,83, -202,0,0 },
 		{ 68,-34,83, 164,0,0 } } },
-	{ MI_SANCHEZ, {
+	{ MI_SANCHEZ, ModelSets::MODEL_SET_CLASSIC, {
 		{ -64,-23,46, -222,5,0 },
 		{ 65,-24,46, 149,0,0 } } },
+	{ MI_FREEWAY, ModelSets::MODEL_SET_MODERN, {
+		{ -61,-21,-8, 135,0,0 },
+		{ 61,-21,-8, 133,0,0 } } },
+	{ MI_FAGGIO, ModelSets::MODEL_SET_MODERN, {
+		{ -55,-65,80, 121,0,0 },
+		{ 56,-63,80, 134,-10,0 } } },
+	{ MI_PIZZABOY, ModelSets::MODEL_SET_MODERN, {
+		{ -55,-63,80, -232,-13,-1 },
+		{ 55,-63,83, 126,0,0 } } },
 };
 
 static bool
@@ -488,21 +506,30 @@ GetBuiltInBikeHandleCalibration(int model, int hand,
 {
 	if(!calibration || hand < 0 || hand >= VR_HAND_COUNT)
 		return false;
-	for(int index = 0;
-	    index < (int)ARRAY_SIZE(gBuiltInBikeHandleDefaults); index++){
-		const BuiltInBikeHandleDefaults &defaults =
-			gBuiltInBikeHandleDefaults[index];
-		if(defaults.model != model)
-			continue;
-		const int *value = defaults.hand[hand];
-		calibration->offsetX = value[0];
-		calibration->offsetY = value[1];
-		calibration->offsetZ = value[2];
-		calibration->rotationX = value[3];
-		calibration->rotationY = value[4];
-		calibration->rotationZ = value[5];
-		calibration->valid = true;
-		return true;
+	// Prefer the row measured for the set in use, then the classic baseline.
+	const ModelSets::eModelSet active = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_VEHICLES);
+	for(int pass = 0; pass < 2; pass++){
+		const ModelSets::eModelSet wanted = pass == 0 ? active :
+			ModelSets::MODEL_SET_CLASSIC;
+		for(int index = 0;
+		    index < (int)ARRAY_SIZE(gBuiltInBikeHandleDefaults); index++){
+			const BuiltInBikeHandleDefaults &defaults =
+				gBuiltInBikeHandleDefaults[index];
+			if(defaults.model != model || defaults.modelSet != wanted)
+				continue;
+			const int *value = defaults.hand[hand];
+			calibration->offsetX = value[0];
+			calibration->offsetY = value[1];
+			calibration->offsetZ = value[2];
+			calibration->rotationX = value[3];
+			calibration->rotationY = value[4];
+			calibration->rotationZ = value[5];
+			calibration->valid = true;
+			return true;
+		}
+		if(active == ModelSets::MODEL_SET_CLASSIC)
+			break;
 	}
 	return false;
 }
@@ -710,7 +737,8 @@ static void
 ReloadVehicleCalibration()
 {
 	int legacyHeight = 15;
-	ReadProfileInt("VR", "DrivingYOffsetCm", &legacyHeight);
+	const bool hasLegacyHeight =
+		ReadProfileInt("VR", "DrivingYOffsetCm", &legacyHeight);
 	legacyHeight = clamp(legacyHeight, -100, 150);
 	static const char *heightKeys[VR_DEFAULT_VIEW_COUNT] = {
 		"DefaultCarSeatHeightCm", "DefaultBikeSeatHeightCm"
@@ -735,8 +763,11 @@ ReloadVehicleCalibration()
 			gVehicleCategoryCalibration[category];
 		calibration.seatDistanceCm = ReadCategoryValue(category,
 			"SeatDistanceCm", defaults.seatDistanceCm, -100, 100);
+		// Only a genuine old settings file overrides the table.
 		calibration.seatHeightCm = ReadCategoryValue(category,
-			"SeatHeightCm", legacyHeight, -100, 150);
+			"SeatHeightCm",
+			hasLegacyHeight ? legacyHeight : defaults.seatHeightCm,
+			-100, 150);
 		calibration.wheelCenterXCm = ReadCategoryValue(category,
 			"WheelCenterXCm", defaults.wheelCenterXCm, -100, 100);
 		calibration.wheelCenterYCm = ReadCategoryValue(category,
@@ -795,17 +826,21 @@ static const BuiltInVehicleViewDefaults gBuiltInVehicleViewDefaults[] = {
 	{ MI_SANCHEZ, ModelSets::MODEL_SET_CLASSIC,
 		{ -15,-15, 0,0,0, 0,0, 0,0,0, -1 } },
 	{ MI_STINGER, ModelSets::MODEL_SET_MODERN,
-		{ 0,0, 0,13,12, 21,0, -60,0,0, 0 } },
+		{ 8,5, 0,19,9, 21,0, -42,0,0, 0 } },
 	{ MI_INFERNUS, ModelSets::MODEL_SET_MODERN,
-		{ 0,0, 2,-6,4, 0,0, 0,0,0, -1 } },
+		{ 0,0, 1,-5,4, 0,0, -36,0,0, 0 } },
 	{ MI_BANSHEE, ModelSets::MODEL_SET_MODERN,
 		{ 0,6, 0,2,12, 18,0, -50,0,0, 0 } },
 	{ MI_ADMIRAL, ModelSets::MODEL_SET_MODERN,
-		{ 0,8, 3,6,7, 26,0, 0,0,0, 0 } },
+		{ 0,0, 2,7,7, 25,0, -57,0,0, 0 } },
 	{ MI_PIZZABOY, ModelSets::MODEL_SET_MODERN,
 		{ 0,-33, 0,0,0, 0,0, 0,0,0, -1 } },
 	{ MI_FAGGIO, ModelSets::MODEL_SET_MODERN,
 		{ 0,-38, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_PCJ600, ModelSets::MODEL_SET_MODERN,
+		{ -19,-16, 0,0,0, 0,0, 0,0,0, -1 } },
+	{ MI_SANCHEZ, ModelSets::MODEL_SET_MODERN,
+		{ -22,-27, 0,0,0, 0,0, 0,0,0, -1 } },
 };
 
 static VehicleViewCalibration
@@ -2705,6 +2740,40 @@ AreQuestVehicleHandleHighlightsEnabled()
 {
 	LoadDrivingSettings();
 	return gHandleHighlightsEnabled;
+}
+
+int
+GetQuestWheelHandPullBackMm()
+{
+	LoadDrivingSettings();
+	return gWheelHandPullBackMm;
+}
+
+void
+AdjustQuestWheelHandPullBackMm(int direction)
+{
+	LoadDrivingSettings();
+	gWheelHandPullBackMm = clamp(gWheelHandPullBackMm+direction*5, -80, 80);
+	SaveSetting("WheelHandPullBackMm", gWheelHandPullBackMm);
+}
+
+void
+ApplyQuestWheelHandPullBack(int hand, CMatrix *matrix)
+{
+	LoadDrivingSettings();
+	if(!matrix || hand < 0 || hand >= VR_HAND_COUNT)
+		return;
+	if(!IsVrCarActive() || !gCarWheelGrabbed[hand] ||
+	   gWheelHandPullBackMm == 0)
+		return;
+	CMatrix wheel;
+	if(!BuildCarWheelMatrix(hand, &wheel, true))
+		return;
+	// Forward is the wheel's own axis and points down the car, so the
+	// negative is towards the driver. Moving within the wheel plane can
+	// never separate the rim from a wrist; only leaving the plane can.
+	matrix->GetPosition() -= wheel.GetForward()*
+		(gWheelHandPullBackMm*0.001f);
 }
 
 void

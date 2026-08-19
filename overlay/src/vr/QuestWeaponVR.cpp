@@ -2413,17 +2413,16 @@ ApplyTouchInput(CControllerState *state)
 	// do not also pass it into the legacy vehicle action.
 	if(vehicleWeaponButtonConsumed)
 		state->Circle = 0;
-	if(gameplay && !FindPlayerVehicle()){
+	if(gameplay && !menu && !FindPlayerVehicle()){
 		const int padMode = CPad::GetPad(0)->GetMode();
-		state->Square = input.x ? 255 : 0;
+		// Rebuild the mapped buttons from the CONTROLS assignment without the
+		// triggers. The attack button of the current pad mode then belongs to
+		// the physically aimed weapon, whichever input reaches it.
+		androidgame::VrApplyPadBindings(state, input, false);
 		if(padMode == 2)
 			state->Cross = 0;
-		else
-			state->Cross = input.a ? 255 : 0;
 		if(padMode == 0 || padMode == 1)
 			state->Circle = 0;
-		else
-			state->Circle = input.b ? 255 : 0;
 		if(gHeldSlot[0] >= 0 || IsSupportHand(0) ||
 		   IsAuxiliaryHandReserved(0))
 			state->LeftShoulder1 = 0;
@@ -2673,6 +2672,7 @@ bool IsPhysicalMeleeType(int weaponType) { return IsPhysicalMelee(weaponType); }
 bool IsPhysicalThrowableType(int weaponType) { return IsPhysicalThrowable(weaponType); }
 bool IsPhysicalWeaponType(int weaponType) { return IsPhysicalGun(weaponType) || IsPhysicalMelee(weaponType) || IsPhysicalThrowable(weaponType); }
 bool IsPhysicalWeaponInteractionActive() { return AreTrackedHandsEnabled() && IsGameplayAvailable() && !FindPlayerVehicle(); }
+bool IsQuestFirstPersonOnFoot() { return gVrFirstPersonActive && !FindPlayerVehicle(); }
 bool IsTrackedWeaponHeld(int hand)
 {
 	return hand >= 0 && hand < VR_HAND_COUNT &&
@@ -3251,6 +3251,9 @@ GetTrackedVisualHandMatrix(int hand, CMatrix *matrix, float *grip,
 	if(IsImmersiveBikeHandleGrabbed(hand))
 		ApplyBikeVisualGripAlignment(hand, matrix);
 	ApplyTwoHandVisualHandLock(hand, matrix, nil, nil, grip, trigger);
+	// Last, over whatever produced the pose: the rendered hand only, never
+	// the anchor the wheel maths and the grab test run against.
+	ApplyQuestWheelHandPullBack(hand, matrix);
 	return true;
 }
 

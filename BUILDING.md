@@ -180,6 +180,22 @@ they may be created with `adb shell mkdir -p`. Push each top-level folder into
 `gamedata`, not into another folder of the same name. Detailed examples are in
 [overlay/docs/QUEST_PORT.md](overlay/docs/QUEST_PORT.md).
 
+Retail data alone is not enough. reVC replaces several stock assets and its
+frontend reads strings and button icons that a 2002 installation never shipped;
+without them the OPTIONS menus print `FET_GFX missing`, `FED_AAS missing` and
+the like where the labels belong. The wizard copies them automatically. Doing
+it by hand, from the assembled tree:
+
+```powershell
+$data = "/sdcard/Android/data/com.miamivr.quest/files/gamedata"
+adb push C:\src\vice-city-vr-build\gamefiles\TEXT $data
+adb push C:\src\vice-city-vr-build\gamefiles\models $data
+```
+
+An installation made before the wizard did this can be repaired without
+rebuilding: double-click `REPAIR_GAME_FILES.bat`. It copies only those files and
+leaves saves, settings and models alone.
+
 The VR hand meshes are original MIT-licensed port assets, not GTA data and not
 part of the APK. Copy them once from the assembled tree:
 

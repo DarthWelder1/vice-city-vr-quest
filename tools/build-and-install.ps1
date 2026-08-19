@@ -551,6 +551,39 @@ try {
         Write-Host "Game-data copy skipped by -SkipGameData."
     }
 
+    # reVC does not run on retail data alone: it replaces several stock assets
+    # and its frontend reads strings and button icons that a 2002 installation
+    # never had. Without them the OPTIONS menus print "FET_GFX missing" and the
+    # like where the labels belong. These are part of the port, not the player's
+    # game data, so they are copied after it and also when -SkipGameData left
+    # the data alone.
+    $portAssets = @(
+        @{ Folder = "TEXT"; Files = @(
+            "american.gxt", "french.gxt", "german.gxt",
+            "italian.gxt", "russian.gxt", "spanish.gxt") },
+        @{ Folder = "models"; Files = @(
+            "fonts_r.txd", "frontend_ds2.txd", "frontend_ds3.txd",
+            "frontend_ds4.txd", "frontend_x360.txd", "frontend_xone.txd",
+            "generic.txd", "particle.txd", "ps3btns.txd", "x360btns.txd") }
+    )
+    Write-Host "Copying the port's replacement text and frontend assets..." -ForegroundColor Cyan
+    foreach ($asset in $portAssets) {
+        $localFolder = Join-Path $assembledDir "gamefiles\$($asset.Folder)"
+        $remoteFolder = "$remoteGameData/$($asset.Folder)"
+        foreach ($name in $asset.Files) {
+            if (-not (Test-Path -LiteralPath (Join-Path $localFolder $name) -PathType Leaf)) {
+                throw "Required port asset is missing from the assembled tree: gamefiles\$($asset.Folder)\$name"
+            }
+        }
+        Invoke-AdbChecked -Arguments @("shell", "mkdir", "-p", $remoteFolder) `
+            -FailureMessage "Could not create $remoteFolder on the headset"
+        foreach ($name in $asset.Files) {
+            Invoke-AdbChecked -Arguments @(
+                "push", (Join-Path $localFolder $name), "$remoteFolder/$name"
+            ) -FailureMessage "Failed to copy port asset $($asset.Folder)/$name"
+        }
+    }
+
     $handsSource = Join-Path $assembledDir "gamefiles\models\vrhands"
     $handsRemote = "$remoteGameData/models/vrhands"
     $handFiles = @("BigHandLeft.uxrh", "BigHandRight.uxrh", "BigHandsAlbedo.png")

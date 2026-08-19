@@ -71,6 +71,12 @@ For most Windows users, the recommended route is the guided
 [`BUILD_AND_INSTALL.bat`](BUILD_AND_INSTALL.bat) wizard instead of entering
 those commands manually.
 
+If the OPTIONS menus show entries like `FET_GFX missing` or `FED_AAS missing`
+instead of labels, the installation predates the wizard copying the port's
+replacement text and frontend files.
+[`REPAIR_GAME_FILES.bat`](REPAIR_GAME_FILES.bat) installs just those onto an
+existing headset; saves, settings and models are left alone.
+
 The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
 
 ## Current Quest build
@@ -79,6 +85,9 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
 - Physical VR weapons, two-hand support, holsters and scoped aiming.
 - Physical steering for cars and motorcycles, including model steering wheels.
 - In-headset VR, calibration, cheats, traffic, graphics and model-set menus.
+- Remappable controller buttons under `VR MENU > CONTROLS`: the face buttons,
+  the grips and the stick clicks each pick the game action they trigger, with a
+  SWAPPED HANDS layout that moves jump and enter/exit to the right controller.
 - Stereo-safe building culling with an exact OFF fallback.
 - Physics Director V2 is enabled by default for CPU headroom, remains
   experimental, and has an exact ORIGINAL/OFF fallback in the Traffic menu.

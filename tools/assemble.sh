@@ -63,6 +63,10 @@ git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v7.patch" || {
     echo "The runtime v7 patch did not apply after the runtime v6 patch."
     exit 1
 }
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v8.patch" || {
+    echo "The runtime v8 patch did not apply after the runtime v7 patch."
+    exit 1
+}
 rm -rf "$OUT/.git"
 
 echo "[3/4] Copying the port sources..."

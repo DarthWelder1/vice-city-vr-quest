@@ -17,6 +17,8 @@ struct VulkanRaster
 {
 	VkImage image;
 	VkDeviceMemory memory;
+	// What that allocation cost; getTextureMemoryUsed sums these.
+	VkDeviceSize memoryBytes;
 	VkImageView view;
 	VkFormat format;
 	VkImageLayout layout;
@@ -238,8 +240,8 @@ struct Globals
 	// frame's own pass opens; wristPanelOffscreen tells the Im2D path that
 	// the model slot is carrying a straight screen-pixels-to-clip matrix for
 	// one of them.
-	void (*wristPanelRenderer[2])(void);
-	bool32 wristPanelWanted[2];
+	void (*wristPanelRenderer[WRIST_PANEL_COUNT])(void);
+	bool32 wristPanelWanted[WRIST_PANEL_COUNT];
 	bool32 wristPanelOffscreen;
 	float32 eyePosition[2][3];
 	float32 eyeQuat[2][4];

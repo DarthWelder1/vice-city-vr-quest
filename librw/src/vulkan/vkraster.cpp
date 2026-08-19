@@ -37,6 +37,15 @@ int32 nativeRasterOffset;
 // Vulkan the way it is on D3D12; see allocateCompressed.
 // ---------------------------------------------------------------------------
 
+// Live texture memory. See VulkanRaster::memoryBytes.
+static size_t gTextureMemoryUsed;
+
+size_t
+getTextureMemoryUsed(void)
+{
+	return gTextureMemoryUsed;
+}
+
 static VkFormat
 vulkanFormatFromRasterFormat(int32 format, int32 *bytesPerPixelOut)
 {
@@ -125,8 +134,11 @@ destroyNativeRaster(void *object, int32 offset, int32)
 			vkDestroyBuffer(gvk.device, native->stagingBuffer, nil);
 		if(native->stagingMemory)
 			vkFreeMemory(gvk.device, native->stagingMemory, nil);
-		if(native->view || native->image || native->memory)
+		if(native->view || native->image || native->memory){
 			retireImage(native->view, native->image, native->memory);
+			gTextureMemoryUsed -= gTextureMemoryUsed < native->memoryBytes ?
+				gTextureMemoryUsed : (size_t)native->memoryBytes;
+		}
 		retireTextureDescriptorSets(native->descriptorSet,
 			NUM_FRAME_CONTEXTS);
 	}
@@ -259,6 +271,8 @@ rasterCreate(Raster *raster)
 		raster->flags |= Raster::DONTALLOCATE;
 		return raster;
 	}
+	native->memoryBytes = requirements.size;
+	gTextureMemoryUsed += (size_t)requirements.size;
 	vkBindImageMemory(gvk.device, native->image, native->memory, 0);
 
 	VkImageViewCreateInfo viewInfo = {};
@@ -391,6 +405,8 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		raster->destroy();
 		return nil;
 	}
+	native->memoryBytes = requirements.size;
+	gTextureMemoryUsed += (size_t)requirements.size;
 	vkBindImageMemory(gvk.device, native->image, native->memory, 0);
 
 	VkImageViewCreateInfo viewInfo = {};

@@ -73,6 +73,9 @@ bool32 allocateCompressed(Raster *raster, int32 dxt, int32 numLevels,
                           bool32 hasAlpha);
 bool32 deviceSupportsBC(void);
 
+// Bytes currently held by texture images.
+size_t getTextureMemoryUsed(void);
+
 void *destroyNativeData(void *object, int32 offset, int32 size);
 
 // ---------------------------------------------------------------------------
@@ -260,6 +263,7 @@ void setIm2DSafeAreaScale(float32 scale);
 enum {
 	WRIST_PANEL_MAP = 0,
 	WRIST_PANEL_STATUS,
+	WRIST_PANEL_CLOCK,
 	WRIST_PANEL_COUNT
 };
 void setWristPanelRenderer(int32 panel, void (*renderer)(void));
@@ -322,6 +326,11 @@ bool32 playPoseToFirstPersonWorld(const float32 playPosition[3],
 // animated vehicle or first-person anchor later in the grab.
 bool32 firstPersonWorldVectorToPlay(const float32 worldVector[3],
                                     float32 playVector[3]);
+
+// The exact inverse of playPoseToFirstPersonWorld's position mapping: hands a
+// world position the game produced back to the OpenXR-space layers.
+bool32 firstPersonWorldPositionToPlay(const float32 worldPosition[3],
+                                      float32 playPosition[3]);
 
 // Tests a game-world bounding sphere against the exact asymmetric OpenXR
 // projection of both eyes. Returns true when either eye can see any part of

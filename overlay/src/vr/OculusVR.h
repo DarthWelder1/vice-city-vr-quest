@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.2 RC5"
+#define MIAMIVR_VERSION_TEXT "0.5.2 RC6"
 
 namespace OculusVR
 {
@@ -94,6 +94,8 @@ bool IsPhysicalMeleeType(int weaponType);
 bool IsPhysicalThrowableType(int weaponType);
 bool IsPhysicalWeaponType(int weaponType);
 bool IsPhysicalWeaponInteractionActive();
+// True while the world is rendered around the player's own head on foot.
+bool IsQuestFirstPersonOnFoot();
 bool IsTrackedWeaponHeld(int hand);
 int GetHeldWeaponSlot(int hand);
 bool IsRunWithoutLimitsEnabled();
@@ -230,6 +232,14 @@ void ToggleQuestImmersiveCarWheelVisible();
 const char *GetQuestVehicleModelWheelVisibilityName();
 void ToggleQuestVehicleModelWheelVisibility();
 bool AreQuestVehicleHandleHighlightsEnabled();
+// How far a hand gripping the virtual wheel is pulled off the wheel plane
+// towards the driver, millimetres; negative pushes it away. Only the
+// immersive car wheel uses it; nothing else places a hand on a rim.
+int GetQuestWheelHandPullBackMm();
+void AdjustQuestWheelHandPullBackMm(int direction);
+// Applied to the rendered hand after every other visual adjustment, so it
+// cannot disturb the anchor the wheel maths and the grab test use.
+void ApplyQuestWheelHandPullBack(int hand, CMatrix *matrix);
 void ToggleQuestVehicleHandleHighlights();
 bool IsQuestBikeHorizonLocked();
 // Third-person vehicle view: the stock chase camera in stereo with default

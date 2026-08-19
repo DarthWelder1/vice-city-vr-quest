@@ -1,0 +1,220 @@
+diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
+--- a/src/core/Pad.cpp
++++ b/src/core/Pad.cpp
+@@ -3903,6 +3903,17 @@
+ 	if ( ArePlayerControlsDisabled() )
+ 		return false;
+ 
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++	// On foot in VR the view is the player's head, not this camera. Swinging
++	// the follow camera behind the character adds its rotation on top of the
++	// physical head yaw, so for a standing player the whole world turns around
++	// them. The same grip still collects pickups, which is what it is actually
++	// reached for. Vehicles keep the stock behaviour: there the chase camera
++	// really is the view.
++	if ( OculusVR::IsQuestFirstPersonOnFoot() )
++		return false;
++#endif
++
+ 	switch (CURMODE)
+ 	{
+ 		case 0:
+diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
+--- a/src/peds/Ped.cpp
++++ b/src/peds/Ped.cpp
+@@ -4850,6 +4850,28 @@
+ 		RwMatrixScale(head, &zero, rwCOMBINEPRECONCAT);
+ 	}
+ 
++#ifdef RW_VULKAN
++	// Default driving keeps the animated occupant -- players want to see
++	// themselves at the wheel -- but the VR camera sits inside that head, so
++	// drop it the same way a shot-off one is dropped. Third person and
++	// immersive driving never get here: one views the body from outside, the
++	// other replaces it with tracked hands.
++	{
++		extern bool gVrFirstPersonActive;
++		extern bool gVrInVehicle;
++		extern bool gVrHidePlayerBody;
++		extern CEntity *gVrPlayerEntity;
++		if (gVrFirstPersonActive && gVrInVehicle && !gVrHidePlayerBody &&
++		    (CEntity*)this == gVrPlayerEntity) {
++			RpHAnimHierarchy* hier = GetAnimHierarchyFromSkinClump(GetClump());
++			int32 idx = RpHAnimIDGetIndex(hier, ConvertPedNode2BoneTag(PED_HEAD));
++			RwMatrix* head = &RpHAnimHierarchyGetMatrixArray(hier)[idx];
++			RwV3d zero = { 0.0f, 0.0f, 0.0f };
++			RwMatrixScale(head, &zero, rwCOMBINEPRECONCAT);
++		}
++	}
++#endif
++
+ 	if (IsPlayer() && gfTommyFatness != 1.0f) {
+ 		RpHAnimHierarchy* hier = GetAnimHierarchyFromSkinClump(GetClump());
+ 		int32 idx;
+diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
+--- a/src/render/Hud.cpp
++++ b/src/render/Hud.cpp
+@@ -34,6 +34,7 @@
+ bool VrGameplayHudEnabled(void);
+ bool VrShouldUseTheaterMode(void);
+ bool VrWristPanelEnabled(int panel);
++bool VrWristPanelsInVehicle(void);
+ bool VrHudWeaponPanelEnabled(void);
+ bool VrHudClockEnabled(void);
+ void *BeginVrWristPanel(int panel, float centreX, float centreY, float width,
+@@ -44,7 +45,15 @@
+ // backend header into the HUD.
+ enum {
+ 	VR_WRIST_PANEL_MAP = 0,
+-	VR_WRIST_PANEL_STATUS = 1
++	VR_WRIST_PANEL_STATUS = 1,
++	VR_WRIST_PANEL_CLOCK = 2
++};
++// The clock panel has no screen rect to inherit, so it gets one of its own:
++// a small strip just big enough for HH:MM at the interface font size.
++enum {
++	VR_WRIST_CLOCK_WIDTH = 120,
++	VR_WRIST_CLOCK_HEIGHT = 40,
++	VR_WRIST_CLOCK_MARGIN = 4
+ };
+ #endif
+ 
+@@ -475,6 +484,17 @@
+ 	DrawRadarContents();
+ }
+ 
++// A vehicle normally hands the interface back to the head-locked plane: the
++// arms are down by the seat and nothing worn on them can be read. Immersive
++// driving is the exception -- the hands are up on the wheel and in view -- so
++// the panels may follow them there when the player asks for it.
++static bool
++VrWristPanelsRideAlong(void)
++{
++	return androidgame::VrWristPanelsInVehicle() &&
++		OculusVR::IsImmersiveDrivingActive();
++}
++
+ // The finished map on the player's arm: one textured quad, depth tested like
+ // anything else out there. False when the panel is off, so the flat interface
+ // draws the radar as it always did.
+@@ -483,9 +503,7 @@
+ {
+ 	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_MAP))
+ 		return false;
+-	// A vehicle either hides the arms or puts them somewhere a panel cannot be
+-	// read, so the classic interface comes back for the drive.
+-	if (FindPlayerVehicle() != nil)
++	if (FindPlayerVehicle() != nil && !VrWristPanelsRideAlong())
+ 		return false;
+ 
+ 	const float width = SCREEN_SCALE_X(RADAR_WIDTH)+SCREEN_SCALE_X(12.0f);
+@@ -539,13 +557,49 @@
+ 	CFont::DrawFonts();
+ }
+ 
++// The hours and minutes, drawn into the clock panel's own target with the
++// same font work the corner clock uses. Centred in the panel rect rather than
++// right-justified against a screen edge that does not exist here.
++void
++VrDrawWristClockContents(void)
++{
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	CFont::SetJustifyOff();
++	CFont::SetBackgroundOff();
++	CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
++	CFont::SetBackGroundOnlyTextOff();
++	CFont::SetPropOff();
++	CFont::SetFontStyle(FONT_HEADING);
++	CFont::SetRightJustifyOff();
++	CFont::SetCentreOn();
++	CFont::SetCentreSize(SCREEN_SCALE_X(VR_WRIST_CLOCK_WIDTH));
++	CFont::SetDropShadowPosition(2);
++	CFont::SetDropColor(CRGBA(0, 0, 0, 255));
++	CFont::SetColor(CLOCK_COLOR);
++	char text[16];
++	wchar wide[16];
++	sprintf(text, "%02d:%02d", CClock::GetHours(), CClock::GetMinutes());
++	AsciiToUnicode(text, wide);
++	CFont::PrintString(SCREEN_SCALE_X(VR_WRIST_CLOCK_WIDTH)*0.5f,
++		SCREEN_SCALE_Y(VR_WRIST_CLOCK_MARGIN), wide);
++	CFont::DrawFonts();
++	CFont::SetCentreOff();
++}
++
+ // The finished readout on the player's other arm. False when the panel is
+ // off, so the flat interface draws it as it always did.
+ static bool
+ DrawWristStatusQuad(void)
+ {
+-	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_STATUS) ||
+-		FindPlayerVehicle() != nil)
++	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_STATUS))
++		return false;
++	if (FindPlayerVehicle() != nil && !VrWristPanelsRideAlong())
+ 		return false;
+ 
+ 	// The block the money, health, armour and wanted rows occupy, with a
+@@ -579,6 +633,38 @@
+ 	androidgame::EndVrWristPanel();
+ 	return true;
+ }
++
++// The watch. False when the panel is off, so the corner clock prints as usual.
++static bool
++DrawWristClockQuad(void)
++{
++	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_CLOCK))
++		return false;
++	if (FindPlayerVehicle() != nil && !VrWristPanelsRideAlong())
++		return false;
++
++	const float width = SCREEN_SCALE_X(VR_WRIST_CLOCK_WIDTH);
++	const float height = SCREEN_SCALE_Y(VR_WRIST_CLOCK_HEIGHT);
++	RwRaster *panel = (RwRaster*)androidgame::BeginVrWristPanel(
++		VR_WRIST_PANEL_CLOCK, width*0.5f, height*0.5f, width, height);
++	if (panel == nil)
++		return true;
++
++	CRect rect(0.0f, 0.0f, width, height);
++	const CRGBA white(255, 255, 255, 255);
++	CSprite2d::SetVertices(rect, white, white, white, white);
++	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, panel);
++	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	GameRender::SubmitImmediate2D(rwPRIMTYPETRIFAN, CSprite2d::GetVertices(), 4);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	androidgame::EndVrWristPanel();
++	return true;
++}
+ #endif
+ 
+ 
+@@ -1203,11 +1289,17 @@
+ 		/*
+ 			DrawClock
+ 		*/
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		// The watch has its own switch and is armed from here every frame it is
++		// worn, whatever the corner clock is set to. When it draws, the corner
++		// one stands down: nobody wants the time in two places.
++		const bool wristClock = m_ClockState && DrawWristClockQuad();
++#endif
+ 		if (m_ClockState
+ #if defined(RW_VULKAN) && defined(__ANDROID__)
+ 			// Its own switch on the headset: the one piece of the readout a
+ 			// player is most likely not to want floating in front of them.
+-			&& androidgame::VrHudClockEnabled()
++			&& androidgame::VrHudClockEnabled() && !wristClock
+ #endif
+ 			) {
+ 			CFont::SetJustifyOff();

@@ -33,6 +33,7 @@
 #include "World.h"
 #include "Draw.h"
 #include "Renderer.h"
+#include "Streaming.h"
 #include "vulkan/rwvk.h"
 #ifdef GTA_VR_WEAPONS
 #include "OculusVR.h"
@@ -357,6 +358,75 @@ GetPadInput(void)
 	return gPadInput;
 }
 
+// The pad button a binding target names. Anything the remapping page cannot
+// reach -- the sticks, Start, the D-pad -- has no entry and is never touched by
+// VrApplyPadBindings.
+static int16 *
+PadTargetField(CControllerState *state, int target)
+{
+	switch(target){
+	case VR_PAD_TARGET_SQUARE:   return &state->Square;
+	case VR_PAD_TARGET_CROSS:    return &state->Cross;
+	case VR_PAD_TARGET_CIRCLE:   return &state->Circle;
+	case VR_PAD_TARGET_TRIANGLE: return &state->Triangle;
+	case VR_PAD_TARGET_L1:       return &state->LeftShoulder1;
+	case VR_PAD_TARGET_R1:       return &state->RightShoulder1;
+	case VR_PAD_TARGET_L2:       return &state->LeftShoulder2;
+	case VR_PAD_TARGET_R2:       return &state->RightShoulder2;
+	case VR_PAD_TARGET_L3:       return &state->LeftShock;
+	case VR_PAD_TARGET_R3:       return &state->RightShock;
+	}
+	return nil;
+}
+
+void
+VrApplyPadBindings(CControllerState *state, const PadInput &input,
+                   bool includeTriggers)
+{
+	if(!state)
+		return;
+	// Grips and triggers keep their analogue value: the game reads the
+	// shoulder buttons as a 0..255 scale, the same way the desktop VR layer
+	// hands them over.
+	const int16 leftTrigger =
+		(int16)(clamp(input.leftTrigger, 0.0f, 1.0f)*255.0f);
+	const int16 rightTrigger =
+		(int16)(clamp(input.rightTrigger, 0.0f, 1.0f)*255.0f);
+	const int16 values[VR_PAD_SOURCE_COUNT] = {
+		(int16)(input.a ? 255 : 0),
+		(int16)(input.b ? 255 : 0),
+		(int16)(input.x ? 255 : 0),
+		(int16)(input.y ? 255 : 0),
+		includeTriggers ? leftTrigger : (int16)0,
+		includeTriggers ? rightTrigger : (int16)0,
+		(int16)(clamp(input.leftGrip,  0.0f, 1.0f)*255.0f),
+		(int16)(clamp(input.rightGrip, 0.0f, 1.0f)*255.0f),
+		(int16)(input.leftStickClick  ? 255 : 0),
+		(int16)(input.rightStickClick ? 255 : 0)
+	};
+
+	// Remapping is an on-foot feature; see the enum in android.h for why a
+	// vehicle keeps the shipped assignment.
+	const bool onFoot = FindPlayerVehicle() == nil &&
+		!CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode();
+
+	for(int target = VR_PAD_TARGET_NONE+1; target < VR_PAD_TARGET_COUNT;
+	    target++){
+		int16 *field = PadTargetField(state, target);
+		if(field)
+			*field = 0;
+	}
+	// Two sources may share a button; the stronger press wins rather than the
+	// later one in the table.
+	for(int source = 0; source < VR_PAD_SOURCE_COUNT; source++){
+		const int target = onFoot ?
+			VrPadBinding(source) : VrPadBindingDefault(source);
+		int16 *field = PadTargetField(state, target);
+		if(field)
+			*field = Max(*field, values[source]);
+	}
+}
+
 void
 TriggerWeaponHaptic(int hand, float strength)
 {
@@ -440,7 +510,9 @@ VrRestoreFov(void)
 // Set every frame below, next to the pad capture, which runs before rendering.
 bool gVrFirstPersonActive;
 CEntity *gVrPlayerEntity;
-static bool gVrInVehicle;
+// First-person in a vehicle, third-person chase excluded. CPed::PreRender
+// reads it to drop the occupant head the camera is sitting inside.
+bool gVrInVehicle;
 bool gVrHidePlayerBody = true;
 
 bool
@@ -906,35 +978,24 @@ CapturePad(RwInt32 padID)
 	const int padMode = CPad::GetPad(0)->GetMode();
 	// Remote-control missions keep A for the stock vehicle-fire action (the
 	// demolition helicopter drops its bomb through that path). The accelerator
-	// remains on R2 below, so A must not also leak into Cross in remote mode.
-	state.Cross    = !remoteMode && in.a ? 255 : 0;
-	state.Circle   = in.b ? 255 : 0;
-	state.Square   = in.x ? 255 : 0;
-	state.Triangle = in.y ? 255 : 0;
-	state.Start    = in.menu ? 255 : 0;
-
-	// Trigger and grip routing copied from the desktop VR layer's pad
-	// assembly: the right trigger is the accelerator (Cross), the left is
-	// brake/reverse (Square), and the grips are analogue shoulder buttons.
-	// TriggerValue there is a 0..255 scale of the analogue value.
-	const int16 leftTriggerValue =
-		(int16)(clamp(in.leftTrigger,  0.0f, 1.0f)*255.0f);
-	const int16 rightTriggerValue =
-		(int16)(clamp(in.rightTrigger, 0.0f, 1.0f)*255.0f);
-	state.Square = Max(state.Square, leftTriggerValue);
-	state.Cross  = Max(state.Cross,  rightTriggerValue);
-	state.LeftShoulder1  =
-		(int16)(clamp(in.leftGrip,  0.0f, 1.0f)*255.0f);
-	state.RightShoulder1 =
-		(int16)(clamp(in.rightGrip, 0.0f, 1.0f)*255.0f);
+	// stays on R2, so A must not also reach its own binding here.
+	androidgame::PadInput bound = in;
+	if(remoteMode)
+		bound.a = false;
+	// Every mapped button goes through the binding table, so the CONTROLS page
+	// can move it on foot. Trigger and grip routing is the desktop VR layer's
+	// default: the right trigger is the accelerator (Cross), the left is
+	// brake/reverse (Square), and the grips are analogue shoulder buttons on a
+	// 0..255 scale. QuestWeaponVR rebuilds the same buttons on foot without the
+	// triggers, which belong to the weapon there.
+	androidgame::VrApplyPadBindings(&state, bound, true);
+	state.Start = in.menu ? 255 : 0;
 	if(remoteMode && in.a){
 		if(padMode == 3)
 			state.RightShoulder1 = 255;
 		else
 			state.Circle = 255;
 	}
-	state.LeftShock  = in.leftStickClick  ? 255 : 0;
-	state.RightShock = in.rightStickClick ? 255 : 0;
 
 	// The frontend walks its menus on the D-pad. Use hysteresis there so small
 	// controller noise cannot release and re-press the same direction. Gameplay
@@ -951,11 +1012,27 @@ CapturePad(RwInt32 padID)
 	}else{
 		gQuestFrontendHorizontalDirection = 0;
 		gQuestFrontendVerticalDirection = 0;
-		const float deadzone = 0.5f;
-		state.DPadLeft  = in.leftStickX < -deadzone ? 255 : 0;
-		state.DPadRight = in.leftStickX >  deadzone ? 255 : 0;
-		state.DPadUp    = in.leftStickY >  deadzone ? 255 : 0;
-		state.DPadDown  = in.leftStickY < -deadzone ? 255 : 0;
+		// Mirror the same vector the analogue axes carry, not the raw stick.
+		// GetPedWalkLeftRight/UpDown take the larger of the analogue axis and
+		// the D-pad per axis, so a D-pad built from the physical stick while
+		// the axes are built from the head-rotated one hands the game a
+		// direction neither of them asked for. Facing forward the two are the
+		// same vector and nothing changes; after a physical quarter turn the
+		// raw mirror was still reporting "up" while the axes had moved the
+		// motion onto X.
+		//
+		// That same comparison is why the mirror only fires at the rim. A
+		// pressed D-pad direction counts as 127 out of the 128 a fully
+		// deflected axis is worth, so any lower threshold replaced the
+		// analogue value with a full press: half a stick forward walked at
+		// running speed and there was no speed control left between the
+		// deadzone and the rim. Scripts and the in-car camera still see the
+		// D-pad, they now need the stick pushed all the way to get it.
+		const float mirror = 127.0f/128.0f;
+		state.DPadLeft  = moveStickX <= -mirror ? 255 : 0;
+		state.DPadRight = moveStickX >=  mirror ? 255 : 0;
+		state.DPadUp    = moveStickY >=  mirror ? 255 : 0;
+		state.DPadDown  = moveStickY <= -mirror ? 255 : 0;
 	}
 }
 
@@ -1173,11 +1250,50 @@ PrepareFrontendBeforeFrames(void)
 	return gGameState == GS_FRONTEND;
 }
 
+// The streamer measures its budget in archive bytes, but this device cannot
+// sample DXT, so every texture is resident as full RGBA and costs four to eight
+// times what it was billed. Its eviction threshold therefore sits at a figure
+// the process cannot reach alive, and memory climbs until Android kills it --
+// the crash reported after a few minutes at a high render scale with the larger
+// model sets.
+//
+// Until textures reach the GPU in a format it can sample, this is the floor
+// under that: watch what the rasters hold and give the streamer's own recycler
+// enough work to stay under a real ceiling. Below the limit it does nothing.
+static void
+EnforceQuestTextureBudget(void)
+{
+	static size_t budget;
+	if(budget == 0){
+		const int megabytes = Max(256, GetPrivateProfileIntA("VR",
+			"TextureMemoryBudgetMB", 1024, ".\\vr_settings.ini"));
+		budget = (size_t)megabytes*1024*1024;
+		ALOG("texture memory ceiling %d MB", megabytes);
+	}
+	if(rw::vulkan::getTextureMemoryUsed() <= budget)
+		return;
+
+	// Bounded per frame: releasing a whole overshoot in one step costs a
+	// visible hitch, and the ceiling is not a cliff.
+	int removed = 0;
+	while(removed < 8 && rw::vulkan::getTextureMemoryUsed() > budget &&
+	      CStreaming::RemoveLeastUsedModel(0))
+		removed++;
+	static uint32 reportAt;
+	if(CTimer::GetTimeInMilliseconds() >= reportAt){
+		reportAt = CTimer::GetTimeInMilliseconds()+5000;
+		ALOG("texture memory %zu MB over the %zu MB ceiling, released %d",
+		     rw::vulkan::getTextureMemoryUsed()/(1024*1024),
+		     budget/(1024*1024), removed);
+	}
+}
+
 void
 Step(void)
 {
 	if(!gForegroundApp || !gRwInitialised)
 		return;
+	EnforceQuestTextureBudget();
 
 	static RwUInt32 reportedState = 0xFFFFFFFF;
 	if(gGameState != reportedState){

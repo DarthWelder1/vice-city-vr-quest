@@ -619,6 +619,7 @@ gameThreadMain(android_app *app, AppState *state)
 // CHud::Draw.
 void VrDrawWristRadarContents(void);
 void VrDrawWristStatusContents(void);
+void VrDrawWristClockContents(void);
 
 namespace androidgame {
 
@@ -630,7 +631,7 @@ static float gWristPanelExtent[rw::vulkan::WRIST_PANEL_COUNT][2];
 // How wide each panel ends up on the arm. Height follows from the rect, so
 // nothing is stretched.
 static const float kWristPanelMetres[rw::vulkan::WRIST_PANEL_COUNT] = {
-	0.115f, 0.130f
+	0.115f, 0.130f, 0.055f
 };
 // Where they sit relative to the grip pose: back along the arm from the hand,
 // and off the wrist by roughly the thickness of one.
@@ -661,6 +662,8 @@ RenderWristPanel(int panel)
 	rw::vulkan::setIm2DTransform(projection, gHudIm2DDistance, gHudIm2DEye);
 	if(panel == rw::vulkan::WRIST_PANEL_STATUS)
 		VrDrawWristStatusContents();
+	else if(panel == rw::vulkan::WRIST_PANEL_CLOCK)
+		VrDrawWristClockContents();
 	else
 		VrDrawWristRadarContents();
 	rw::vulkan::setIm2DTransform(gHudIm2D, gHudIm2DDistance, gHudIm2DEye);
@@ -677,6 +680,12 @@ static void
 RenderWristPanelStatus(void)
 {
 	RenderWristPanel(rw::vulkan::WRIST_PANEL_STATUS);
+}
+
+static void
+RenderWristPanelClock(void)
+{
+	RenderWristPanel(rw::vulkan::WRIST_PANEL_CLOCK);
 }
 
 // Rotates an orthonormal pair in its own plane. Used to swing a panel's frame
@@ -701,11 +710,6 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 	if(widthPixels < 1.0f)
 		return false;
 	const int hand = VrWristPanelHand(panel) ? 1 : 0;
-	xrvk::ControllerInput input;
-	xrvk::getInput(&input);
-	const xrvk::TrackedPose &grip = input.gripPose[hand];
-	if(!grip.valid)
-		return false;
 
 	// Controller axes: the OpenXR grip pose looks along -Z out of the hand, so
 	// +Z runs back towards the wrist and +Y stands away from the palm.
@@ -716,23 +720,34 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 	// flipped: two flips keep the frame right-handed -- the panel is not drawn
 	// backwards -- while putting it on the outside of that arm instead of
 	// inside it.
-	const float *q = grip.orientation;
 	const float handSign = hand ? -1.0f : 1.0f;
-	const float side[3] = {
-		(1.0f-2.0f*(q[1]*q[1]+q[2]*q[2]))*handSign,
-		(2.0f*(q[0]*q[1]+q[2]*q[3]))*handSign,
-		(2.0f*(q[0]*q[2]-q[1]*q[3]))*handSign
-	};
-	const float palmUp[3] = {
-		(2.0f*(q[0]*q[1]-q[2]*q[3]))*handSign,
-		(1.0f-2.0f*(q[0]*q[0]+q[2]*q[2]))*handSign,
-		(2.0f*(q[1]*q[2]+q[0]*q[3]))*handSign
-	};
-	const float backward[3] = {
-		2.0f*(q[0]*q[2]+q[1]*q[3]),
-		2.0f*(q[1]*q[2]-q[0]*q[3]),
-		1.0f-2.0f*(q[0]*q[0]+q[1]*q[1])
-	};
+	float origin[3], side[3], palmUp[3], backward[3];
+	// The panel is worn on the arm, so it follows the hand the player can see:
+	// a hand moved onto a weapon socket or a steering handle takes it along.
+	if(!VrGetWristAnchorPose(hand, origin, side, palmUp, backward)){
+		xrvk::ControllerInput input;
+		xrvk::getInput(&input);
+		const xrvk::TrackedPose &grip = input.gripPose[hand];
+		if(!grip.valid)
+			return false;
+		const float *q = grip.orientation;
+		origin[0] = grip.position[0];
+		origin[1] = grip.position[1];
+		origin[2] = grip.position[2];
+		side[0] = 1.0f-2.0f*(q[1]*q[1]+q[2]*q[2]);
+		side[1] = 2.0f*(q[0]*q[1]+q[2]*q[3]);
+		side[2] = 2.0f*(q[0]*q[2]-q[1]*q[3]);
+		palmUp[0] = 2.0f*(q[0]*q[1]-q[2]*q[3]);
+		palmUp[1] = 1.0f-2.0f*(q[0]*q[0]+q[2]*q[2]);
+		palmUp[2] = 2.0f*(q[1]*q[2]+q[0]*q[3]);
+		backward[0] = 2.0f*(q[0]*q[2]+q[1]*q[3]);
+		backward[1] = 2.0f*(q[1]*q[2]-q[0]*q[3]);
+		backward[2] = 1.0f-2.0f*(q[0]*q[0]+q[1]*q[1]);
+	}
+	for(int axis = 0; axis < 3; axis++){
+		side[axis] *= handSign;
+		palmUp[axis] *= handSign;
+	}
 
 	float alongCm = 0.0f, acrossCm = 0.0f, liftCm = 0.0f;
 	float pitchDeg = 0.0f, yawDeg = 0.0f, rollDeg = 0.0f, sizeScale = 1.0f;
@@ -753,7 +768,7 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 		right[axis] = side[axis]*faceSign;
 		// Calibration offsets ride the wrist's own axes, before any of the
 		// rotations below, so moving and turning a panel stay independent.
-		centre[axis] = grip.position[axis]+
+		centre[axis] = origin[axis]+
 			backward[axis]*(kWristPanelBack+alongCm*0.01f)+
 			palmUp[axis]*faceSign*(kWristPanelLift+liftCm*0.01f)+
 			right[axis]*acrossCm*0.01f;
@@ -801,6 +816,8 @@ BeginVrWristPanel(int panel, float centreX, float centreY, float width,
 			&RenderWristPanelMap);
 		rw::vulkan::setWristPanelRenderer(rw::vulkan::WRIST_PANEL_STATUS,
 			&RenderWristPanelStatus);
+		rw::vulkan::setWristPanelRenderer(rw::vulkan::WRIST_PANEL_CLOCK,
+			&RenderWristPanelClock);
 		registered = true;
 	}
 	rw::vulkan::setWristPanelWanted(panel, true);

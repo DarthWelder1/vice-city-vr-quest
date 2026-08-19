@@ -1585,7 +1585,8 @@ static const struct {
 	int32 width, height;
 } gWristPanelSize[WRIST_PANEL_COUNT] = {
 	{ 256, 256 },	// the map is square
-	{ 512, 192 }	// the status readout is a wide strip of small text
+	{ 512, 192 },	// the status readout is a wide strip of small text
+	{ 256, 128 }	// the clock is four digits and a colon
 };
 
 static struct WristPanelTarget {
@@ -2755,6 +2756,30 @@ firstPersonWorldVectorToPlay(const float32 worldVector[3],
 	playVector[0] = worldVector[0]*px[0]+worldVector[1]*px[1]+worldVector[2]*px[2];
 	playVector[1] = worldVector[0]*py[0]+worldVector[1]*py[1]+worldVector[2]*py[2];
 	playVector[2] = worldVector[0]*pz[0]+worldVector[1]*pz[1]+worldVector[2]*pz[2];
+	return 1;
+}
+
+bool32
+firstPersonWorldPositionToPlay(const float32 worldPosition[3],
+                               float32 playPosition[3])
+{
+	if(!gvk.firstPersonActive || !worldPosition || !playPosition)
+		return 0;
+	float32 px[3], py[3], pz[3];
+	getFirstPersonPlayBasis(px, py, pz);
+	// Undo playPoseToFirstPersonWorld: it measures from the LATCHED head in
+	// play space and lands on the anchor in the world, so the return trip
+	// starts at the anchor and ends back on that same latched origin.
+	const float32 relative[3] = {
+		worldPosition[0] - gvk.fpHeadWorld[0],
+		worldPosition[1] - gvk.fpHeadWorld[1],
+		worldPosition[2] - gvk.fpHeadWorld[2] };
+	playPosition[0] = gvk.fpLatchedHeadPos[0] +
+		relative[0]*px[0]+relative[1]*px[1]+relative[2]*px[2];
+	playPosition[1] = gvk.fpLatchedHeadPos[1] +
+		relative[0]*py[0]+relative[1]*py[1]+relative[2]*py[2];
+	playPosition[2] = gvk.fpLatchedHeadPos[2] +
+		relative[0]*pz[0]+relative[1]*pz[1]+relative[2]*pz[2];
 	return 1;
 }
 
