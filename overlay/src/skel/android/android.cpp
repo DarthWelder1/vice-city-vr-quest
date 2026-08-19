@@ -882,17 +882,21 @@ CapturePad(RwInt32 padID)
 	// frontend is open, give it only the debounced D-pad path below.
 	const bool frontendConsumesStick = FrontEndMenuManager.m_bMenuActive ||
 		FrontEndMenuManager.m_bGameNotLoaded;
-	const float sticks[4] = {
-		frontendConsumesStick ? 0.0f : moveStickX,
-		frontendConsumesStick ? 0.0f : -moveStickY,
+	const float moveMagnitude =
+		sqrtf(moveStickX*moveStickX+moveStickY*moveStickY);
+	if(!frontendConsumesStick && moveMagnitude > stickDeadzone){
+		state.LeftStickX = (int16)(moveStickX*128.0f);
+		state.LeftStickY = (int16)(-moveStickY*128.0f);
+	}
+
+	const float sticks[2] = {
 		rightStickX,
 		clamp(-in.rightStickY, -1.0f, 1.0f)
 	};
-	int16 *const axes[4] = {
-		&state.LeftStickX, &state.LeftStickY,
+	int16 *const axes[2] = {
 		&state.RightStickX, &state.RightStickY
 	};
-	for(int i = 0; i < 4; i++)
+	for(int i = 0; i < 2; i++)
 		if(Abs(sticks[i]) > stickDeadzone)
 			*axes[i] = (int16)(sticks[i] * 128.0f);
 
