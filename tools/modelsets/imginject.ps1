@@ -18,8 +18,10 @@ $dirPath = [System.IO.Path]::ChangeExtension($Img, ".dir")
 # collect replacements, later sources win
 $repl = @{}
 foreach ($src in $From) {
-    if (-not (Test-Path $src)) { Write-Output "  missing source: $src"; continue }
-    foreach ($f in Get-ChildItem $src -File) {
+    # -LiteralPath throughout: a game folder named like "GTA Vice City [Rus]"
+    # is a wildcard to these cmdlets, and they quietly match nothing.
+    if (-not (Test-Path -LiteralPath $src)) { Write-Output "  missing source: $src"; continue }
+    foreach ($f in Get-ChildItem -LiteralPath $src -File) {
         if ($f.Extension -notmatch '^\.(dff|txd)$') { continue }
         $repl[$f.Name.ToLower()] = $f.FullName
     }
@@ -56,7 +58,6 @@ if ($excludeSet.Count -gt 0) {
     })
     Write-Output ("archive entries excluded: {0}" -f ($beforeExclude - $entries.Count))
 }
-
 
 $outImg = "$Img.new"
 
@@ -142,13 +143,37 @@ if ($failure) {
 
 [System.IO.File]::WriteAllBytes("$dirPath.new", $newDir)
 
-# The originals go only once their replacements are on disk.
-if (-not (Test-Path -LiteralPath $outImg) -or
-    (Get-Item -LiteralPath $outImg).Length -lt $SECTOR) {
-    throw "The rebuilt archive '$outImg' is missing or empty; the original was left untouched."
+
+# The swap goes through a backup, and through .NET rather than Remove-Item and
+# Rename-Item. Two reasons, both seen in the wild: those cmdlets treat a path
+# as a wildcard, so a folder named like "C:\Users\Bob [PC]" makes them report a
+# file that plainly exists as missing; and deleting the original first means
+# that if anything removes the rebuilt file between writing it and moving it --
+# security software scanning a fresh multi-gigabyte archive is the usual
+# suspect -- the archive that was there is gone too, and a 3.5 GB copy has to
+# be redone. Here nothing is deleted until its replacement is in place.
+function Swap-InPlace([string]$New, [string]$Target) {
+    if (-not [System.IO.File]::Exists($New)) {
+        throw ("'{0}' was written but is no longer there. Antivirus or a folder-sync client is the usual cause; build outside Downloads and Documents, or exclude the build folder from real-time scanning." -f $New)
+    }
+    $backup = "$Target.old"
+    if ([System.IO.File]::Exists($backup)) { [System.IO.File]::Delete($backup) }
+    [System.IO.File]::Move($Target, $backup)
+    try {
+        [System.IO.File]::Move($New, $Target)
+    } catch {
+        [System.IO.File]::Move($backup, $Target)
+        throw ("Could not put the rebuilt '{0}' in place, the original is back: {1}" -f
+            $Target, $_.Exception.Message)
+    }
+    [System.IO.File]::Delete($backup)
 }
-Remove-Item $Img -Force; Rename-Item $outImg $Img
-Remove-Item $dirPath -Force; Rename-Item "$dirPath.new" $dirPath
+
+if ((Get-Item -LiteralPath $outImg).Length -lt $SECTOR) {
+    throw "The rebuilt archive '$outImg' is empty; the original was left untouched."
+}
+Swap-InPlace $outImg $Img
+Swap-InPlace "$dirPath.new" $dirPath
 
 Write-Output ("entries replaced in archive: {0}" -f $replaced)
 # @() so that zero or one leftover name still yields an array: the caller may
