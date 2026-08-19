@@ -7,6 +7,11 @@ param(
     [string[]]$Exclude = @()
 )
 
+# A .NET method that throws -- a full disk, a file the antivirus is holding --
+# otherwise ends only its own statement, and the run limps on to the archive
+# swap and reports a missing .new file instead of the real cause.
+$ErrorActionPreference = "Stop"
+
 $SECTOR = 2048
 $dirPath = [System.IO.Path]::ChangeExtension($Img, ".dir")
 
@@ -52,54 +57,96 @@ if ($excludeSet.Count -gt 0) {
     Write-Output ("archive entries excluded: {0}" -f ($beforeExclude - $entries.Count))
 }
 
+
 $outImg = "$Img.new"
-$in  = [System.IO.File]::OpenRead($Img)
-$out = [System.IO.File]::Create($outImg)
-$newDir = New-Object byte[] ($entries.Count * 32)
-$buf = New-Object byte[] (8*1024*1024)
-$pad = New-Object byte[] $SECTOR
-$nextSector = [int64]0
-$replaced = 0
-$used = @{}
 
-for ($i = 0; $i -lt $entries.Count; $i++) {
-    $e = $entries[$i]
-    $key = $e.Name.ToLower()
-    $written = [int64]0
-
-    if ($repl.ContainsKey($key)) {
-        $bytes = [System.IO.File]::ReadAllBytes($repl[$key])
-        $out.Write($bytes, 0, $bytes.Length)
-        $written = $bytes.Length
-        $replaced++
-        $used[$key] = $true
-    } else {
-        $in.Position = $e.Offset
-        $left = $e.Size
-        while ($left -gt 0) {
-            $take = [int][math]::Min($buf.Length, $left)
-            $got = $in.Read($buf, 0, $take)
-            if ($got -le 0) { break }
-            $out.Write($buf, 0, $got)
-            $written += $got
-            $left -= $got
-        }
-    }
-
-    $tail = $written % $SECTOR
-    if ($tail -ne 0) { $out.Write($pad, 0, $SECTOR - $tail); $written += ($SECTOR - $tail) }
-    $sizeSectors = [uint32]($written / $SECTOR)
-
-    $b = $i*32
-    [BitConverter]::GetBytes([uint32]$nextSector).CopyTo($newDir, $b)
-    [BitConverter]::GetBytes($sizeSectors).CopyTo($newDir, $b+4)
-    [System.Text.Encoding]::ASCII.GetBytes($e.Name).CopyTo($newDir, $b+8)
-    $nextSector += $sizeSectors
+# The rebuild writes a full second copy of the archive beside the original, so
+# the drive has to have room for it. Running out halfway is what turns into an
+# unhelpful "gta3.img.new does not exist" three statements later.
+$needBytes = (Get-Item -LiteralPath $Img).Length
+$freeBytes = $null
+try {
+    $root = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $Img).ProviderPath)
+    $freeBytes = (New-Object System.IO.DriveInfo($root)).AvailableFreeSpace
+} catch {
+    $freeBytes = $null
+}
+if ($freeBytes -ne $null -and $freeBytes -lt $needBytes) {
+    throw ("Rebuilding '{0}' needs {1:N1} GB free on that drive; {2:N1} GB is available." -f
+        $Img, ($needBytes / 1GB), ($freeBytes / 1GB))
 }
 
-$in.Close(); $out.Close()
+$in = $null
+$out = $null
+$newDir = New-Object byte[] ($entries.Count * 32)
+$replaced = 0
+$used = @{}
+$failure = $null
+try {
+    $in  = [System.IO.File]::OpenRead($Img)
+    $out = [System.IO.File]::Create($outImg)
+    $buf = New-Object byte[] (8*1024*1024)
+    $pad = New-Object byte[] $SECTOR
+    $nextSector = [int64]0
+
+    for ($i = 0; $i -lt $entries.Count; $i++) {
+        $e = $entries[$i]
+        $key = $e.Name.ToLower()
+        $written = [int64]0
+
+        if ($repl.ContainsKey($key)) {
+            $bytes = [System.IO.File]::ReadAllBytes($repl[$key])
+            $out.Write($bytes, 0, $bytes.Length)
+            $written = $bytes.Length
+            $replaced++
+            $used[$key] = $true
+        } else {
+            $in.Position = $e.Offset
+            $left = $e.Size
+            while ($left -gt 0) {
+                $take = [int][math]::Min($buf.Length, $left)
+                $got = $in.Read($buf, 0, $take)
+                if ($got -le 0) { break }
+                $out.Write($buf, 0, $got)
+                $written += $got
+                $left -= $got
+            }
+        }
+
+        $tail = $written % $SECTOR
+        if ($tail -ne 0) { $out.Write($pad, 0, $SECTOR - $tail); $written += ($SECTOR - $tail) }
+        $sizeSectors = [uint32]($written / $SECTOR)
+
+        $b = $i*32
+        [BitConverter]::GetBytes([uint32]$nextSector).CopyTo($newDir, $b)
+        [BitConverter]::GetBytes($sizeSectors).CopyTo($newDir, $b+4)
+        [System.Text.Encoding]::ASCII.GetBytes($e.Name).CopyTo($newDir, $b+8)
+        $nextSector += $sizeSectors
+    }
+} catch {
+    $failure = $_
+} finally {
+    if ($in) { $in.Close() }
+    if ($out) { $out.Close() }
+}
+
+if ($failure) {
+    # Nothing has been swapped yet, so the archive on disk is still the one we
+    # started from. Clear the half-written copy so a retry starts clean.
+    if (Test-Path -LiteralPath $outImg) {
+        Remove-Item -LiteralPath $outImg -Force -ErrorAction SilentlyContinue
+    }
+    throw ("Rebuilding '{0}' failed and the original was left untouched: {1}" -f
+        $Img, $failure.Exception.Message)
+}
+
 [System.IO.File]::WriteAllBytes("$dirPath.new", $newDir)
 
+# The originals go only once their replacements are on disk.
+if (-not (Test-Path -LiteralPath $outImg) -or
+    (Get-Item -LiteralPath $outImg).Length -lt $SECTOR) {
+    throw "The rebuilt archive '$outImg' is missing or empty; the original was left untouched."
+}
 Remove-Item $Img -Force; Rename-Item $outImg $Img
 Remove-Item $dirPath -Force; Rename-Item "$dirPath.new" $dirPath
 
