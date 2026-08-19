@@ -2106,7 +2106,7 @@ UpdateMelee()
 		const bool fastStrikeSample = enabled && motion.armed &&
 			tipSpeed >= threshold && deliberate &&
 			now-motion.lastStrikeTime >= 220U;
-		if(fastStrikeSample && weaponType == WEAPONTYPE_KATANA){
+		if(fastStrikeSample){
 			motion.strikeInProgress = true;
 			motion.strikePeakSpeed =
 				Max(motion.strikePeakSpeed, tipSpeed);
@@ -2114,9 +2114,12 @@ UpdateMelee()
 		}
 		// Once a genuine fast swing has started, keep publishing its slower
 		// tail. The trigger frame's short sweep segment usually hasn't reached
-		// the target yet; the blade must keep dealing contact while it travels.
+		// the target yet; the weapon must keep dealing contact while it
+		// travels. Without this a swing only landed when the player's own
+		// movement carried the one-frame segment onto the target -- running
+		// into someone worked, standing still and swinging a bat did not.
+		// Contact ends the window immediately, so this cannot repeat-hit.
 		const bool continuationSample =
-			weaponType == WEAPONTYPE_KATANA &&
 			motion.strikeInProgress &&
 			now <= motion.strikeContinueUntil && tipSpeed >= 0.08f;
 		if(enabled && motion.armed &&
