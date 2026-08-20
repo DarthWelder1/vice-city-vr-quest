@@ -101,7 +101,7 @@ makeTheaterMatrices(float viewProj[16], float im2dWorld[16],
 		im2dWorld[i] = 0.0f;
 	}
 
-	const float aspect = 16.0f/9.0f;
+	const float aspect = androidgame::VrTheaterAspectRatio();
 	const float nearZ = 0.05f;
 	const float farZ = 1000.0f;
 	const float tanHalfY = tanf(60.0f*0.5f*3.1415926535f/180.0f);

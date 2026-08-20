@@ -203,6 +203,7 @@ float VrScopeZoomFactor(void);
 // once and submitted to both eyes on a world-locked cinema quad instead of
 // being interpreted as an immersive stereo world.
 bool VrShouldUseTheaterMode(void);
+float VrTheaterAspectRatio(void);
 
 // One iteration of the game's gGameState machine, including rsIDLE. Must be
 // called between vulkan::beginFrame and vulkan::endFrame.

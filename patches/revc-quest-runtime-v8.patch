@@ -218,3 +218,109 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  #endif
  			) {
  			CFont::SetJustifyOff();
+diff --git a/src/render/Font.cpp b/src/render/Font.cpp
+--- a/src/render/Font.cpp
++++ b/src/render/Font.cpp
+@@ -648,6 +648,12 @@
+ 
+ 	Sprite[RenderState.style].SetRenderState();
+ 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	// CFont batches its strings and draws them all here, long after whoever
++	// queued them, so text inherits whatever depth state the last world pass
++	// left behind. The interface plane sits about two metres out, close
++	// enough for a cutscene prop to clip the subtitles behind its silhouette.
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+ 	RenderState = *(CFontRenderState*)&FontRenderStateBuf[0];
+ 	textPosX = RenderState.fTextPosX;
+ 	textPosY = RenderState.fTextPosY;
+--- a/src/render/Draw.cpp
++++ b/src/render/Draw.cpp
+@@ -5,6 +5,13 @@
+ #include "Camera.h"
+ #include "CutsceneMgr.h"
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++namespace androidgame {
++bool VrShouldUseTheaterMode(void);
++float VrTheaterAspectRatio(void);
++}
++#endif
++
+ float CDraw::ms_fAspectRatio = DEFAULT_ASPECT_RATIO;
+ #ifdef ASPECT_RATIO_SCALE
+ float CDraw::ms_fScaledFOV = 45.0f;
+@@ -55,6 +62,13 @@
+ float
+ CDraw::CalculateAspectRatio(void)
+ {
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	// Theater mode shows the frame on a quad of a fixed shape. AR_AUTO would
++	// report the eye buffer's own ratio, which is nearly square, and the
++	// interface would be laid out for one shape and displayed on another.
++	if(androidgame::VrShouldUseTheaterMode())
++		return CDraw::ms_fAspectRatio = androidgame::VrTheaterAspectRatio();
++#endif
+ #ifdef ASPECT_RATIO_SCALE
+ 	if (TheCamera.m_WideScreenOn)
+ 		CDraw::ms_fAspectRatio = (5.f / 3.f) * FindAspectRatio() / (16.f / 9.f); // It's used on theatrical showings according to Wiki
+--- a/src/core/FileLoader.cpp
++++ b/src/core/FileLoader.cpp
+@@ -99,36 +99,37 @@
+ 			LoadCollisionFile(line+10, 0);
+ 		}else if(strncmp(line, "MODELFILE", 9) == 0){
+ 			LoadingScreenLoadingFile(line + 10);
+-			// Some retail/modded default.dat variants do not load WHEELS.TXD
+-			// before WHEELS.DFF.  The Modern wheel model then binds dummy white
+-			// textures permanently, even though the correct TXD exists in the
+-			// optional overlay.  Make this dependency explicit for Modern cars;
+-			// it also keeps already-installed model packs repairable by APK only.
++			// The Modern wheel model has to bind against a freshly loaded wheel
++			// TXD, not merely against a dictionary that holds the names.  A model
++			// loaded earlier can leave same-named dummy textures with zero-sized
++			// rasters behind, and RenderWare keeps those white dummies in every
++			// cloned wheel.  Loading the model while the wheel TXD is current
++			// makes the material pointers independent of default.dat ordering.
+ 			if(ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEHICLES) &&
+ 			   CGeneral::faststricmp(GetFilename(line + 10), "WHEELS.DFF") == 0){
+ 				static const char *wheelTextureNames[] = {
+ 					"alloy", "classic", "lighttruck", "lightvan", "offroad",
+ 					"rim", "saloon", "smallcar", "sport", "truck", "tyre"
+ 				};
++				RwTexDictionary *wheelTxd = LoadTexDictionary("MODELS\\GENERIC\\WHEELS.TXD");
+ 				int32 present = 0;
+-				for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++)
+-					if(RwTexDictionaryFindNamedTexture(savedTxd, wheelTextureNames[i]))
++				for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++){
++					RwTexture *texture = RwTexDictionaryFindNamedTexture(wheelTxd,
++						wheelTextureNames[i]);
++					RwRaster *raster = texture ? RwTextureGetRaster(texture) : nil;
++					if(raster && RwRasterGetWidth(raster) > 0 &&
++					   RwRasterGetHeight(raster) > 0)
+ 						present++;
+-				const int32 initiallyPresent = present;
+-				if(present != ARRAY_SIZE(wheelTextureNames)){
+-					RwTexDictionary *wheelTxd = LoadTexDictionary("MODELS\\GENERIC\\WHEELS.TXD");
+-					AddTexDictionaries(savedTxd, wheelTxd);
+-					RwTexDictionaryDestroy(wheelTxd);
+-					present = 0;
+-					for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++)
+-						if(RwTexDictionaryFindNamedTexture(savedTxd, wheelTextureNames[i]))
+-							present++;
+ 				}
+-				printf("Modern wheel texture preflight: initial %d/%d, final %d/%d before WHEELS.DFF\n",
+-					initiallyPresent, (int32)ARRAY_SIZE(wheelTextureNames),
++				RwTexDictionarySetCurrent(wheelTxd);
++				LoadModelFile(line + 10);
++				RwTexDictionarySetCurrent(savedTxd);
++				AddTexDictionaries(savedTxd, wheelTxd);
++				RwTexDictionaryDestroy(wheelTxd);
++				printf("Modern wheel textures: %d/%d usable before WHEELS.DFF\n",
+ 					present, (int32)ARRAY_SIZE(wheelTextureNames));
+-			}
+-			LoadModelFile(line + 10);
++			}else
++				LoadModelFile(line + 10);
+ 		}else if(strncmp(line, "HIERFILE", 8) == 0){
+ 			LoadingScreenLoadingFile(line + 9);
+ 			LoadClumpFile(line + 9);

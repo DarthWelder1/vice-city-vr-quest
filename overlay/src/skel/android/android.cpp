@@ -515,6 +515,15 @@ CEntity *gVrPlayerEntity;
 bool gVrInVehicle;
 bool gVrHidePlayerBody = true;
 
+// The shape of the cinema screen theater mode draws on. The game lays its
+// interface out for this ratio while theater mode is up, so the plane in
+// android_main and CDraw both take it from here.
+float
+androidgame::VrTheaterAspectRatio(void)
+{
+	return 16.0f/9.0f;
+}
+
 bool
 androidgame::VrShouldUseTheaterMode(void)
 {
