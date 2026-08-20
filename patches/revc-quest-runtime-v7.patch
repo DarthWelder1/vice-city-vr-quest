@@ -642,7 +642,7 @@ diff --git a/src/core/Frontend.cpp b/src/core/Frontend.cpp
  #include "FileLoader.h"
  #include "User.h"
 -#include "sampman.h"
-+#include "sampman.h"
++#include "sampman.h"
 +#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
 +#include "OculusVR.h"
 +#endif

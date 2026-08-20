@@ -30,7 +30,7 @@ git init -q 2>$null
 git apply --whitespace=nowarn (Join-Path $repo "patches\revc-public-base-compat.patch")
 if ($LASTEXITCODE -ne 0) {
     Pop-Location
-    Write-Error "Public reVC compatibility patch did not apply. Use clean commit 026cd10f3fdbd92c089830e5067c4457c53c1b51."
+    Write-Error "Public reVC compatibility patch did not apply. The source must be a clean checkout of commit 026cd10f3fdbd92c089830e5067c4457c53c1b51 with no local edits and no patches already applied."
 }
 git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest.patch")
 if ($LASTEXITCODE -ne 0) {

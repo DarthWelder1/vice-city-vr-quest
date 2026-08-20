@@ -24,7 +24,7 @@ echo "[2/4] Applying the port patch..."
 cd "$OUT"
 git init -q
 git apply --whitespace=nowarn "$REPO/patches/revc-public-base-compat.patch" || {
-    echo "Public reVC compatibility patch did not apply. Use clean commit 026cd10f3fdbd92c089830e5067c4457c53c1b51."
+    echo "Public reVC compatibility patch did not apply. The source must be a clean checkout of commit 026cd10f3fdbd92c089830e5067c4457c53c1b51 with no local edits and no patches already applied."
     exit 1
 }
 git apply --whitespace=nowarn "$REPO/patches/revc-quest.patch" || {

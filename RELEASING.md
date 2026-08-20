@@ -12,13 +12,17 @@ Before a tag or GitHub release:
    model overlay, `.codex*`, `.claude`, `.agents`, `build`, `dist` or cache.
 3. Assemble from a clean public `mrxenginner/reVC` `miami` checkout at commit
    `026cd10f3fdbd92c089830e5067c4457c53c1b51` into a new output directory.
-4. Build `:app:assembleDebug` from that new assembled tree with the toolchain
+4. Confirm no file in `patches/` contains a CR byte. Patches are checked out
+   byte-exact on every platform, so one generated against a CRLF working tree
+   applies only where `core.autocrlf` produces CRLF and fails everywhere else,
+   including Linux, macOS and any Windows checkout that keeps line endings.
+5. Build `:app:assembleDebug` from that new assembled tree with the toolchain
    listed in `BUILDING.md`. Do not treat an incremental `qbuild` build as the
    reproducibility test.
-5. Inspect the generated APK locally. It should contain only application
+6. Inspect the generated APK locally. It should contain only application
    metadata/resources and the arm64 `libmiamivr.so`, `libc++_shared.so` and
    Khronos OpenXR loader. Do not add the APK to this source repository.
-6. Publish the commit/tag only after reviewing the complete GitHub file list.
+7. Publish the commit/tag only after reviewing the complete GitHub file list.
    If desired, use GitHub's automatic source archive; do not attach an APK,
    assembled reVC tree, retail data or a generated Modern model set.
 
