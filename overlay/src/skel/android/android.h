@@ -203,6 +203,25 @@ float VrScopeZoomFactor(void);
 // once and submitted to both eyes on a world-locked cinema quad instead of
 // being interpreted as an immersive stereo world.
 bool VrShouldUseTheaterMode(void);
+
+// The basis the frame is actually rendered with, in game space. Effects that
+// ask what is in front of the viewer have to read this rather than TheCamera:
+// the gameplay camera's own matrix keeps the heading the character faces, and
+// that heading stops following the player the moment the headset turns instead
+// of the stick. Any pointer may be nil. False when the game camera is the view.
+bool VrGetViewBasis(float position[3], float right[3], float up[3],
+                    float forward[3]);
+
+// Latch the pose being held now as the neutral one. A player who started
+// seated and then stood up is riding an eye height taken while seated until
+// this runs.
+void VrRecenterView(void);
+
+// A pad looks behind on R3 and crouches on L3. Both are off on foot in VR,
+// where the view is the player's own head and the two clicks recenter it
+// instead; the CONTROLS page hands either behaviour back.
+bool VrStickLookBehindEnabled(void);
+bool VrStickCrouchEnabled(void);
 float VrTheaterAspectRatio(void);
 
 // One iteration of the game's gGameState machine, including rsIDLE. Must be

@@ -1,7 +1,53 @@
 diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
 --- a/src/core/Pad.cpp
 +++ b/src/core/Pad.cpp
-@@ -3903,6 +3903,17 @@
+@@ -15,6 +15,12 @@
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ #include "OculusVR.h"
+ #endif
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++namespace androidgame {
++bool VrStickLookBehindEnabled(void);
++bool VrStickCrouchEnabled(void);
++}
++#endif
+ #include "ControllerConfig.h"
+ #include "Timer.h"
+ #include "Frontend.h"
+@@ -3113,6 +3119,16 @@
+ 	if ( ArePlayerControlsDisabled() )
+ 		return false;
+ 
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++	// Looking behind swings the follow camera, and on foot in VR the view is
++	// the player's own head: the world turned around a standing player rather
++	// than the camera turning behind him. The click recenters that view
++	// instead, and CONTROLS hands the stock behaviour back.
++	if ( OculusVR::IsQuestFirstPersonOnFoot() &&
++	     !androidgame::VrStickLookBehindEnabled() )
++		return false;
++#endif
++
+ 	return !!NewState.RightShock;
+ }
+ 
+@@ -3732,6 +3748,15 @@
+ 	if (ArePlayerControlsDisabled())
+ 		return false;
+ 
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++	// The crouch shares its click with the recenter, and a player who drops
++	// into a crouch every time he rebuilds his reference space is worse off
++	// than one who cannot crouch. CONTROLS hands it back.
++	if ( OculusVR::IsQuestFirstPersonOnFoot() &&
++	     !androidgame::VrStickCrouchEnabled() )
++		return false;
++#endif
++
+ 	return !!(NewState.LeftShock && !OldState.LeftShock);
+ }
+ 
+@@ -3903,6 +3928,17 @@
  	if ( ArePlayerControlsDisabled() )
  		return false;
  
@@ -324,3 +370,93 @@ diff --git a/src/render/Font.cpp b/src/render/Font.cpp
  		}else if(strncmp(line, "HIERFILE", 8) == 0){
  			LoadingScreenLoadingFile(line + 9);
  			LoadClumpFile(line + 9);
+--- a/src/render/SpecialFX.cpp
++++ b/src/render/SpecialFX.cpp
+@@ -27,6 +27,13 @@
+ #include "DMAudio.h"
+ #include "GameRenderCommand.h"
+ 
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++namespace androidgame {
++bool VrGetViewBasis(float position[3], float right[3], float up[3],
++                    float forward[3]);
++}
++#endif
++
+ RwIm3DVertex StreakVertices[4];
+ RwImVertexIndex StreakIndexList[12];
+ 
+@@ -418,17 +425,35 @@
+ 		aTraces[nextSlot].m_nLifeTime = modifiedLifeTime;
+ 	}
+ 
+-	float startProjFwd = DotProduct(TheCamera.GetForward(), *start - TheCamera.GetPosition());
+-	float endProjFwd = DotProduct(TheCamera.GetForward(), *end - TheCamera.GetPosition());
++	// The whizz-by is placed against the direction being looked along, not
++	// the heading of the gameplay camera: those part company as soon as the
++	// headset turns instead of the stick.
++	CVector viewPos = TheCamera.GetPosition();
++	CVector viewRight = TheCamera.GetRight();
++	CVector viewUp = TheCamera.GetUp();
++	CVector viewForward = TheCamera.GetForward();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	{
++		float vrPos[3], vrRight[3], vrUp[3], vrForward[3];
++		if(androidgame::VrGetViewBasis(vrPos, vrRight, vrUp, vrForward)){
++			viewPos = CVector(vrPos[0], vrPos[1], vrPos[2]);
++			viewRight = CVector(vrRight[0], vrRight[1], vrRight[2]);
++			viewUp = CVector(vrUp[0], vrUp[1], vrUp[2]);
++			viewForward = CVector(vrForward[0], vrForward[1], vrForward[2]);
++		}
++	}
++#endif
++	float startProjFwd = DotProduct(viewForward, *start - viewPos);
++	float endProjFwd = DotProduct(viewForward, *end - viewPos);
+ 	if (startProjFwd * endProjFwd < 0.0f) { //if one of point behind us and second before us
+ 		float fStartDistFwd = Abs(startProjFwd) / (Abs(startProjFwd) + Abs(endProjFwd));
+ 
+-		float startProjUp = DotProduct(TheCamera.GetUp(), *start - TheCamera.GetPosition());
+-		float endProjUp = DotProduct(TheCamera.GetUp(), *end - TheCamera.GetPosition());
++		float startProjUp = DotProduct(viewUp, *start - viewPos);
++		float endProjUp = DotProduct(viewUp, *end - viewPos);
+ 		float distUp = (endProjUp - startProjUp) * fStartDistFwd + startProjUp;
+ 
+-		float startProjRight = DotProduct(TheCamera.GetRight(), *start - TheCamera.GetPosition());
+-		float endProjRight = DotProduct(TheCamera.GetRight(), *end - TheCamera.GetPosition());
++		float startProjRight = DotProduct(viewRight, *start - viewPos);
++		float endProjRight = DotProduct(viewRight, *end - viewPos);
+ 		float distRight = (endProjRight - startProjRight) * fStartDistFwd + startProjRight;
+ 
+ 		float dist = Sqrt(SQR(distUp) + SQR(distRight));
+@@ -489,6 +514,20 @@
+ 
+ void CBulletTraces::Render(void)
+ {
++	// Traces are rejected against the direction actually being looked along.
++	// TheCamera's heading follows the character, so after a physical turn
++	// every trace behind him was dropped while the player watched it.
++	CVector viewPos = TheCamera.GetPosition();
++	CVector viewForward = TheCamera.GetForward();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	{
++		float vrPos[3], vrForward[3];
++		if(androidgame::VrGetViewBasis(vrPos, nil, nil, vrForward)){
++			viewPos = CVector(vrPos[0], vrPos[1], vrPos[2]);
++			viewForward = CVector(vrForward[0], vrForward[1], vrForward[2]);
++		}
++	}
++#endif
+ 	for (int i = 0; i < NUMBULLETTRACES; i++) {
+ 		if (!aTraces[i].m_bInUse)
+ 			continue;
+@@ -509,8 +548,8 @@
+ 
+ 		CVector start = aTraces[i].m_vecStartPos;
+ 		CVector end = aTraces[i].m_vecEndPos;
+-		float startProj = DotProduct(start - TheCamera.GetPosition(), TheCamera.GetForward()) - 0.7f;
+-		float endProj = DotProduct(end - TheCamera.GetPosition(), TheCamera.GetForward()) - 0.7f;
++		float startProj = DotProduct(start - viewPos, viewForward) - 0.7f;
++		float endProj = DotProduct(end - viewPos, viewForward) - 0.7f;
+ 		if (startProj < 0.0f && endProj < 0.0f) //we dont need render trace behind us
+ 			continue;
+ 

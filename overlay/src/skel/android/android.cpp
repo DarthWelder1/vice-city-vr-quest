@@ -525,6 +525,26 @@ androidgame::VrTheaterAspectRatio(void)
 }
 
 bool
+androidgame::VrGetViewBasis(float position[3], float right[3], float up[3],
+                            float forward[3])
+{
+	if(!gVrFirstPersonActive)
+		return false;
+	rw::float32 vr[3], vu[3], va[3], vp[3];
+	if(!rw::vulkan::getFirstPersonViewFrame(vr, vu, va, vp))
+		return false;
+	for(int i = 0; i < 3; i++){
+		// getFirstPersonViewFrame answers in the RenderWare camera
+		// convention, whose right column points left.
+		if(right != nil) right[i] = -vr[i];
+		if(up != nil) up[i] = vu[i];
+		if(forward != nil) forward[i] = va[i];
+		if(position != nil) position[i] = vp[i];
+	}
+	return true;
+}
+
+bool
 androidgame::VrShouldUseTheaterMode(void)
 {
 	// This is the Android equivalent of the desktop build's showGameplay

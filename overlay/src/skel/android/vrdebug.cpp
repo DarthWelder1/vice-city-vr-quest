@@ -98,6 +98,33 @@ static int gDebugFps;
 static double gDebugPreviousFrameMs;
 static float gDebugSmoothedFrameMs;
 static bool gTouchRecenterShortcutDown;
+// A pad looks behind on R3 and crouches on L3. Both are off in VR: the view
+// is the player's own head, so looking behind turns the world around him, and
+// a crouch fires from the same click that recenters. CONTROLS hands back
+// either one for anyone who wants it.
+static int gVrStickLookBehind;
+static int gVrStickCrouch;
+
+bool
+androidgame::VrStickLookBehindEnabled(void)
+{
+	return gVrStickLookBehind != 0;
+}
+
+bool
+androidgame::VrStickCrouchEnabled(void)
+{
+	return gVrStickCrouch != 0;
+}
+
+// Rebuild the reference space around the pose being held now. Physical wheel
+// grabs belong to the basis being dropped, so they are released with it.
+void
+androidgame::VrRecenterView(void)
+{
+	rw::vulkan::setFirstPersonAnchor(nil, 0.0f, 0, 0);
+	OculusVR::ResetQuestDrivingInteraction();
+}
 static bool gVrMenuVisible;
 static bool gVrMenuShortcutDown;
 static bool gVrCheatShortcutDown;
@@ -448,6 +475,7 @@ enum eVrLocomotionMenuItem {
 	VR_LOCOMOTION_SNAP_ANGLE,
 	VR_LOCOMOTION_HEAD_BOBBING,
 	VR_LOCOMOTION_REFRESH_RATE,
+	VR_LOCOMOTION_RECENTER,
 	VR_LOCOMOTION_BACK,
 	VR_LOCOMOTION_ITEM_COUNT
 };
@@ -464,6 +492,8 @@ enum eVrControlsMenuItem {
 	VR_CONTROLS_RIGHT_GRIP,
 	VR_CONTROLS_LEFT_STICK_CLICK,
 	VR_CONTROLS_RIGHT_STICK_CLICK,
+	VR_CONTROLS_LOOK_BEHIND,
+	VR_CONTROLS_CROUCH,
 	VR_CONTROLS_RESET,
 	VR_CONTROLS_BACK,
 	VR_CONTROLS_ITEM_COUNT
@@ -834,6 +864,10 @@ LoadVrSettings(void)
 			50, ".\\vr_settings.ini"), 25), 300);
 	gQuestSnapTurnAngleDegrees = Min(Max(GetPrivateProfileIntA("VR",
 		"SnapTurnAngleDegrees", 30, ".\\vr_settings.ini"), 15), 90);
+	gVrStickLookBehind = GetPrivateProfileIntA("VR", "StickLookBehind",
+		0, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gVrStickCrouch = GetPrivateProfileIntA("VR", "StickCrouch",
+		0, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	const int defaultPedPercent = Min(Max(
 		(int)(CIniFile::PedNumberMultiplier*100.0f+0.5f), 50), 300);
 	const int defaultCarPercent = Min(Max(
@@ -1055,7 +1089,7 @@ VrPadTargetName(int target)
 	case androidgame::VR_PAD_TARGET_R1: return "TARGET [R1]";
 	case androidgame::VR_PAD_TARGET_L2: return "PREVIOUS WEAPON [L2]";
 	case androidgame::VR_PAD_TARGET_R2: return "NEXT WEAPON [R2]";
-	case androidgame::VR_PAD_TARGET_L3: return "CROUCH / HORN [L3]";
+	case androidgame::VR_PAD_TARGET_L3: return "HORN / CROUCH [L3]";
 	case androidgame::VR_PAD_TARGET_R3: return "LOOK BEHIND [R3]";
 	}
 	return "UNUSED";
@@ -1479,19 +1513,15 @@ VrDebugUpdate(const PadInput &in)
 	}
 	gVrCheatShortcutDown = cheatShortcut;
 
-	// The desktop chord rebuilds its gameplay reference space around the
-	// current head pose. Quest already supplies head-relative translation, so
-	// dropping the renderer anchor for one update is the equivalent operation:
-	// VrUpdateFirstPersonAnchor will immediately re-latch the player's current
-	// physical yaw against Tommy/vehicle heading. Release any physical wheel
-	// grabs too, since their previous centre belongs to the old basis.
-	const bool recenterShortcut = modifier &&
+	// Both stick clicks rebuild the gameplay reference space, the desktop
+	// chord's job. No grips in it: reaching for one picks a weapon up. The
+	// clicks are free for it because R3 and L3 hand their pad behaviour to
+	// CONTROLS, off by default.
+	const bool recenterShortcut =
 		!gVrMenuVisible && !VrShouldUseTheaterMode() &&
 		in.leftStickClick && in.rightStickClick;
-	if(recenterShortcut && !gTouchRecenterShortcutDown){
-		rw::vulkan::setFirstPersonAnchor(nil, 0.0f, 0, 0);
-		OculusVR::ResetQuestDrivingInteraction();
-	}
+	if(recenterShortcut && !gTouchRecenterShortcutDown)
+		androidgame::VrRecenterView();
 	gTouchRecenterShortcutDown = recenterShortcut;
 
 	// The profiler had a chord of its own, both grips and Y. Both grips are
@@ -2138,6 +2168,14 @@ VrDebugUpdate(const PadInput &in)
 				SaveVrInteger("SnapTurnAngleDegrees",
 					gQuestSnapTurnAngleDegrees);
 				break;
+			case VR_LOCOMOTION_RECENTER:
+				// Same operation as the both-grips chord: drop the anchor and
+				// let VrUpdateFirstPersonAnchor latch the pose being held now.
+				// A player who sat down to start and then stood up is riding an
+				// eye height taken while seated until this runs.
+				androidgame::VrRecenterView();
+				gVrMenuVisible = false;
+				break;
 			case VR_LOCOMOTION_BACK:
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
 				break;
@@ -2164,6 +2202,12 @@ VrDebugUpdate(const PadInput &in)
 						VR_CONTROLS_LAYOUT_DEFAULT ?
 						kVrSwappedHandsBinding :
 						kVrPadBindingDefault);
+			}else if(gVrControlsSelection == VR_CONTROLS_LOOK_BEHIND){
+				gVrStickLookBehind = !gVrStickLookBehind;
+				SaveVrInteger("StickLookBehind", gVrStickLookBehind);
+			}else if(gVrControlsSelection == VR_CONTROLS_CROUCH){
+				gVrStickCrouch = !gVrStickCrouch;
+				SaveVrInteger("StickCrouch", gVrStickCrouch);
 			}else if(gVrControlsSelection == VR_CONTROLS_RESET){
 				ApplyControlsLayout(kVrPadBindingDefault);
 			}else if(gVrControlsSelection == VR_CONTROLS_BACK){
@@ -2909,6 +2953,7 @@ DrawQuestLocomotionPage(void)
 		"WALKING HEAD BOB  < %s >", gQuestHeadBobbing ? "ON" : "OFF");
 	snprintf(rows[VR_LOCOMOTION_REFRESH_RATE], sizeof(rows[0]),
 		"REFRESH RATE  < %d HZ >", gQuestRefreshRateHz);
+	strcpy(rows[VR_LOCOMOTION_RECENTER], "RECENTER VIEW");
 	strcpy(rows[VR_LOCOMOTION_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_LOCOMOTION_ITEM_COUNT; item++)
 		DrawFullVrMenuRow(rows[item], 190+item*68, 3,
@@ -2941,6 +2986,10 @@ DrawQuestControlsPage(void)
 			VrPadSourceName(source),
 			VrPadTargetName(gVrPadBinding[source]));
 	}
+	snprintf(rows[VR_CONTROLS_LOOK_BEHIND], sizeof(rows[0]),
+		"R3 LOOKS BEHIND  < %s >", gVrStickLookBehind ? "ON" : "OFF");
+	snprintf(rows[VR_CONTROLS_CROUCH], sizeof(rows[0]),
+		"L3 CROUCHES  < %s >", gVrStickCrouch ? "ON" : "OFF");
 	strcpy(rows[VR_CONTROLS_RESET], "RESET TO DEFAULTS");
 	strcpy(rows[VR_CONTROLS_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_CONTROLS_ITEM_COUNT; item++)
