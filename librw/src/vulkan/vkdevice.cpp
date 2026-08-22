@@ -1586,7 +1586,8 @@ static const struct {
 } gWristPanelSize[WRIST_PANEL_COUNT] = {
 	{ 256, 256 },	// the map is square
 	{ 512, 192 },	// the status readout is a wide strip of small text
-	{ 256, 128 }	// the clock is four digits and a colon
+	{ 256, 128 },	// the clock is four digits and a colon
+	{ 256, 128 }	// the ammo counter is reserve, a dash and a clip
 };
 
 static struct WristPanelTarget {

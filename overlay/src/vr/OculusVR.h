@@ -273,6 +273,7 @@ bool IsQuestVehicleCalibrationWholeCentimeters(int item);
 int GetQuestVehicleCalibrationValue(int hand, int item);
 void AdjustQuestVehicleCalibrationValue(int hand, int item, int direction);
 void SetQuestVehicleCalibrationPreview(bool visible);
+void SetQuestWeaponCalibrationPreview(bool visible);
 void ApplyQuestVehicleViewOffset(CMatrix *eyeCamera);
 void ApplyQuestBikeHorizonLock(CMatrix *baseCamera);
 

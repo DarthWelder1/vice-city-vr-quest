@@ -620,6 +620,7 @@ gameThreadMain(android_app *app, AppState *state)
 void VrDrawWristRadarContents(void);
 void VrDrawWristStatusContents(void);
 void VrDrawWristClockContents(void);
+void VrDrawWristAmmoContents(void);
 
 namespace androidgame {
 
@@ -631,7 +632,9 @@ static float gWristPanelExtent[rw::vulkan::WRIST_PANEL_COUNT][2];
 // How wide each panel ends up on the arm. Height follows from the rect, so
 // nothing is stretched.
 static const float kWristPanelMetres[rw::vulkan::WRIST_PANEL_COUNT] = {
-	0.115f, 0.130f, 0.055f
+	0.115f, 0.130f, 0.055f,
+	// The ammo counter is read mid-fight, so it is wider than the watch.
+	0.070f
 };
 // Where they sit relative to the grip pose: back along the arm from the hand,
 // and off the wrist by roughly the thickness of one.
@@ -664,6 +667,8 @@ RenderWristPanel(int panel)
 		VrDrawWristStatusContents();
 	else if(panel == rw::vulkan::WRIST_PANEL_CLOCK)
 		VrDrawWristClockContents();
+	else if(panel == rw::vulkan::WRIST_PANEL_AMMO)
+		VrDrawWristAmmoContents();
 	else
 		VrDrawWristRadarContents();
 	rw::vulkan::setIm2DTransform(gHudIm2D, gHudIm2DDistance, gHudIm2DEye);
@@ -688,6 +693,12 @@ RenderWristPanelClock(void)
 	RenderWristPanel(rw::vulkan::WRIST_PANEL_CLOCK);
 }
 
+static void
+RenderWristPanelAmmo(void)
+{
+	RenderWristPanel(rw::vulkan::WRIST_PANEL_AMMO);
+}
+
 // Rotates an orthonormal pair in its own plane. Used to swing a panel's frame
 // around each of its own axes in turn.
 static void
@@ -704,12 +715,11 @@ RotateWristAxes(float *first, float *second, float radians)
 // The plane a wrist quad lives on: screen pixels to metres, centred on the
 // panel's rect and lying on the wrist, plus whatever the player calibrated.
 static bool
-BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
-                     float widthPixels)
+BuildWristPanelPlane(int panel, int hand, float plane[16], float centreX,
+                     float centreY, float widthPixels)
 {
 	if(widthPixels < 1.0f)
 		return false;
-	const int hand = VrWristPanelHand(panel) ? 1 : 0;
 	float alongCm = 0.0f, acrossCm = 0.0f, liftCm = 0.0f;
 	float pitchDeg = 0.0f, yawDeg = 0.0f, rollDeg = 0.0f, sizeScale = 1.0f;
 	VrGetWristPanelCalibration(panel, &alongCm, &acrossCm, &liftCm,
@@ -807,6 +817,14 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 			right[axis]*acrossCm*0.01f;
 	}
 
+	// The right arm is the mirrored copy of the calibration, and that pair of
+	// flips is what leaves its text reading forwards. The left arm gets the
+	// values unmirrored and reads backwards, so its horizontal axis is turned
+	// here. Only the axis: the panel stays exactly where it was placed.
+	if(panel == rw::vulkan::WRIST_PANEL_AMMO && hand == 0)
+		for(int axis = 0; axis < 3; axis++)
+			right[axis] = -right[axis];
+
 	static const float kToRadians = 3.14159265f/180.0f;
 	if(yawDeg != 0.0f)
 		RotateWristAxes(normal, right, yawDeg*kToRadians);
@@ -834,8 +852,11 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 // backend for the next frame's render: the request is one-shot, so a paused or
 // menu frame stops feeding it by simply not asking.
 void *
+// hand is -1 for the panel's own setting, or a hand index to place the same
+// panel on the other arm. The calibration is written for the left hand and
+// mirrored, so a second copy needs nothing but the index.
 BeginVrWristPanel(int panel, float centreX, float centreY, float width,
-                  float height)
+                  float height, int hand)
 {
 	if(panel < 0 || panel >= rw::vulkan::WRIST_PANEL_COUNT)
 		return nil;
@@ -851,6 +872,8 @@ BeginVrWristPanel(int panel, float centreX, float centreY, float width,
 			&RenderWristPanelStatus);
 		rw::vulkan::setWristPanelRenderer(rw::vulkan::WRIST_PANEL_CLOCK,
 			&RenderWristPanelClock);
+		rw::vulkan::setWristPanelRenderer(rw::vulkan::WRIST_PANEL_AMMO,
+			&RenderWristPanelAmmo);
 		registered = true;
 	}
 	rw::vulkan::setWristPanelWanted(panel, true);
@@ -860,7 +883,9 @@ BeginVrWristPanel(int panel, float centreX, float centreY, float width,
 	rw::Raster *texture = rw::vulkan::getWristPanelRaster(panel);
 	float plane[16];
 	if(texture == nil || !gHudIm2DValid ||
-	   !BuildWristPanelPlane(panel, plane, centreX, centreY, width))
+	   !BuildWristPanelPlane(panel, hand < 0 ?
+	     (VrWristPanelHand(panel) ? 1 : 0) : hand,
+	     plane, centreX, centreY, width))
 		return nil;
 	rw::vulkan::setIm2DTransform(plane, gHudIm2DDistance, gHudIm2DEye);
 	rw::vulkan::setIm2DSafeAreaSuspended(true);

@@ -157,6 +157,8 @@ enum {
 	WRIST_PANEL_MAP = 0,
 	WRIST_PANEL_STATUS,
 	WRIST_PANEL_CLOCK,
+	// The round count, worn on the hand that holds the weapon.
+	WRIST_PANEL_AMMO,
 	WRIST_PANEL_COUNT
 };
 // Where a panel actually sits. A controller grip pose says nothing about the
@@ -194,6 +196,9 @@ static const char *const kWristContextName[WRIST_CONTEXT_COUNT] = {
 struct WristPlacement {
 	int along, across, lift, pitch, yaw, roll, size;
 };
+// The ammo counter is the odd one out: the hand it is worn on is holding a
+// weapon, and the visual hand matrix follows that grip, so the panel rides
+// the gun without any special anchoring.
 static const WristPlacement kWristDefault[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT] = {
 	{	// minimap, outer then inner
 		{ -61, -28, -25,  95, -955,  1200,  55 },
@@ -206,6 +211,10 @@ static const WristPlacement kWristDefault[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT] =
 	{	// watch, worn on the outside of the wrist
 		{ -63, -28, -62, -100, -968, -1632, 100 },
 		{ -55, -33, -52,  95, -955,  -539, 100 }
+	},
+	{	// ammo, sitting behind the weapon along the barrel
+		{ -30, -20, -30,   0, -900,     0,  70 },
+		{ -30, -20, -30,   0, -900,     0,  70 }
 	}
 };
 // Driving places the panels on the vehicle instead of the arms, so the two
@@ -216,12 +225,14 @@ static const WristPlacement kVehicleHudDefault[2][WRIST_PANEL_COUNT] = {
 	{	// in a car, arranged around the wheel without covering its centre
 		{ -74, -96,  23, 0, 0, 0,  55 },
 		{ -74,  76,  33, 0, 0, 0, 100 },
-		{ -74,  97,  -9, 0, 0, 0, 100 }
+		{ -74,  97,  -9, 0, 0, 0, 100 },
+		{ -74, -96, -20, 0, 0, 0,  70 }
 	},
 	{	// on a bike, a vertical stack centred between the two grips
 		{ -22, -118, 50, 0, 0, 0,  85 },
 		{   0,   -1, 80, 0, 0, 0, 100 },
-		{   0,    0,105, 0, 0, 0, 100 }
+		{   0,    0,105, 0, 0, 0, 100 },
+		{   0,    0, 55, 0, 0, 0,  70 }
 	}
 };
 // Raised when the shipped vehicle layout changes, so a calibration authored
@@ -232,12 +243,16 @@ enum { VEHICLE_HUD_ANCHOR_VERSION = 1 };
 // which is what the port looked like before the backend was given the
 // planes; it is here to compare the two.
 static bool gDistanceFog = true;
-static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false, false };
+// Ammo readout colour. Green by default: it has to be legible against a
+// street at night and against a wall in daylight, and it must not be
+// mistaken for the health or the wanted stars.
+static int gAmmoColour[3] = { 90, 235, 120 };
+static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false, false, false };
 // The watch is the odd one out: both wrists already have a panel underneath,
 // so it is worn where a watch is worn, on the outside of the right one.
-static bool gWristPanelUnderside[WRIST_PANEL_COUNT] = { true, true, false };
+static bool gWristPanelUnderside[WRIST_PANEL_COUNT] = { true, true, false, false };
 // The map on the left, the readout and the watch on the right.
-static int gWristPanelHand[WRIST_PANEL_COUNT] = { 0, 1, 1 };
+static int gWristPanelHand[WRIST_PANEL_COUNT] = { 0, 1, 1, 1 };
 // Driving normally hands the interface back to the head-locked plane. Immersive
 // driving keeps the arms on the wheel, so the panels can stay on them there.
 static bool gWristPanelsInVehicle;
@@ -254,8 +269,18 @@ static bool gWristContextOwned[WRIST_PANEL_COUNT][WRIST_CONTEXT_COUNT];
 static int gVrWristContextEdit;
 // Settings key prefixes. The map keeps the names it shipped with so an
 // existing calibration is read back unchanged.
+static const char *
+WristPanelName(int panel)
+{
+	switch(panel){
+	case WRIST_PANEL_STATUS: return "STATUS READOUT";
+	case WRIST_PANEL_CLOCK: return "CLOCK";
+	case WRIST_PANEL_AMMO: return "AMMO COUNTER";
+	}
+	return "MINIMAP";
+}
 static const char *const kWristPanelKey[WRIST_PANEL_COUNT] = {
-	"", "Status", "Clock"
+	"", "Status", "Clock", "Ammo"
 };
 // Weapon icon, ammo counter and clock. Part of the classic interface, which is
 // what a new player gets: the immersive layout is what switches them off.
@@ -373,13 +398,14 @@ enum eVrHudMenuItem {
 	VR_HUD_SCALE,
 	VR_HUD_OFFSET_X,
 	VR_HUD_OFFSET_Y,
-	VR_HUD_WRIST_RADAR,
-	VR_HUD_WRIST_RADAR_SIDE,
-	VR_HUD_WRIST_RADAR_CALIBRATE,
-	VR_HUD_WRIST_STATUS,
-	VR_HUD_WRIST_STATUS_CALIBRATE,
-	VR_HUD_WRIST_CLOCK,
-	VR_HUD_WRIST_CLOCK_CALIBRATE,
+	// The four panels are the same object with different contents, so they
+	// share one set of controls and a row that says which one is being
+	// worked on. Three copies of an identical interface filled the page.
+	VR_HUD_PANEL,
+	VR_HUD_PANEL_SHOW,
+	VR_HUD_PANEL_HAND,
+	VR_HUD_PANEL_SIDE,
+	VR_HUD_PANEL_CALIBRATE,
 	VR_HUD_WRIST_IN_VEHICLE,
 	VR_HUD_WEAPON_PANEL,
 	VR_HUD_CLOCK,
@@ -400,6 +426,11 @@ enum eVrWristRadarMenuItem {
 	VR_WRIST_YAW,
 	VR_WRIST_ROLL,
 	VR_WRIST_SIZE,
+	// Only the ammo counter is text the port draws itself, so only it has a
+	// colour to choose. The rows are hidden for the other three.
+	VR_WRIST_COLOUR_RED,
+	VR_WRIST_COLOUR_GREEN,
+	VR_WRIST_COLOUR_BLUE,
 	VR_WRIST_COPY,
 	VR_WRIST_RESET,
 	VR_WRIST_BACK,
@@ -764,6 +795,12 @@ LoadVrSettings(void)
 		"WristStatusUnderside", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelHand[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
 		"WristStatusHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gWristPanelOn[WRIST_PANEL_AMMO] = GetPrivateProfileIntA("VR",
+		"WristAmmo", 1, ".\\vr_settings.ini") != 0;
+	gWristPanelUnderside[WRIST_PANEL_AMMO] = GetPrivateProfileIntA("VR",
+		"WristAmmoUnderside", 0, ".\\vr_settings.ini") != 0;
+	gWristPanelHand[WRIST_PANEL_AMMO] = GetPrivateProfileIntA("VR",
+		"WristAmmoHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	gWristPanelOn[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
 		"WristClock", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelUnderside[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
@@ -864,6 +901,14 @@ LoadVrSettings(void)
 	// to the CLASSIC preset, which is one row away on the HUD page.
 	gDistanceFog = GetPrivateProfileIntA("VR", "DistanceFog", 1,
 		".\\vr_settings.ini") != 0;
+	static const char *const ammoColourKey[3] = {
+		"AmmoColourRed", "AmmoColourGreen", "AmmoColourBlue"
+	};
+	static const int ammoColourDefault[3] = { 90, 235, 120 };
+	for(int channel = 0; channel < 3; channel++)
+		gAmmoColour[channel] = Min(Max(GetPrivateProfileIntA("VR",
+			ammoColourKey[channel], ammoColourDefault[channel],
+			".\\vr_settings.ini"), 0), 255);
 	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 0,
 		".\\vr_settings.ini") != 0;
 	gHudClock = GetPrivateProfileIntA("VR", "HudClock", 0,
@@ -1011,6 +1056,13 @@ SaveWristPanels(void)
 		".\\vr_settings.ini");
 	WritePrivateProfileStringA("VR", "WristClockHand",
 		gWristPanelHand[WRIST_PANEL_CLOCK] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristAmmo",
+		gWristPanelOn[WRIST_PANEL_AMMO] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristAmmoUnderside",
+		gWristPanelUnderside[WRIST_PANEL_AMMO] ? "1" : "0",
+		".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristAmmoHand",
+		gWristPanelHand[WRIST_PANEL_AMMO] ? "1" : "0", ".\\vr_settings.ini");
 	WritePrivateProfileStringA("VR", "WristPanelsInVehicle",
 		gWristPanelsInVehicle ? "1" : "0", ".\\vr_settings.ini");
 	static const char *const names[7] = {
@@ -1390,19 +1442,20 @@ IsMenuItemVisible(int page, int item)
 		case VR_HUD_WEAPON_PANEL:
 		case VR_HUD_CLOCK:
 			return preset != VR_HUD_PRESET_IMMERSIVE;
-		case VR_HUD_WRIST_RADAR:
-		case VR_HUD_WRIST_RADAR_SIDE:
-		case VR_HUD_WRIST_RADAR_CALIBRATE:
-		case VR_HUD_WRIST_STATUS:
-		case VR_HUD_WRIST_STATUS_CALIBRATE:
-		case VR_HUD_WRIST_CLOCK:
-		case VR_HUD_WRIST_CLOCK_CALIBRATE:
+		case VR_HUD_PANEL:
+		case VR_HUD_PANEL_SHOW:
+		case VR_HUD_PANEL_HAND:
+		case VR_HUD_PANEL_SIDE:
+		case VR_HUD_PANEL_CALIBRATE:
 		case VR_HUD_WRIST_IN_VEHICLE:
 			return preset != VR_HUD_PRESET_CLASSIC;
 		}
 		return true;
 	}
 	if(page == VR_MENU_PAGE_WRIST_RADAR){
+		if(item == VR_WRIST_COLOUR_RED || item == VR_WRIST_COLOUR_GREEN ||
+		   item == VR_WRIST_COLOUR_BLUE)
+			return gVrWristPanelEdit == WRIST_PANEL_AMMO;
 		if(gVrWristContextEdit == WRIST_CONTEXT_DEFAULT)
 			return true;
 		// A vehicle panel is bolted to the control centre. Its hand, the
@@ -1665,6 +1718,10 @@ VrDebugUpdate(const PadInput &in)
 	// accident and could not read the game through them. It is a developer
 	// tool with a row on the GRAPHICS page; that is route enough.
 
+	// Armed from the page itself rather than cleared on every exit: the menu
+	// can be left in half a dozen ways and each one would have to remember.
+	OculusVR::SetQuestWeaponCalibrationPreview(
+		gVrMenuVisible && gVrMenuPage == VR_MENU_PAGE_CALIBRATION);
 	if(gVrMenuVisible){
 		if(gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION &&
 		   !OculusVR::IsQuestVehicleCalibrationAvailable()){
@@ -1978,39 +2035,27 @@ VrDebugUpdate(const PadInput &in)
 					gHudOffsetYCm+direction, -100), 100);
 				SaveVrInteger("HudOffsetYCm", gHudOffsetYCm);
 				break;
-			case VR_HUD_WRIST_RADAR:
-				gWristPanelOn[WRIST_PANEL_MAP] =
-					!gWristPanelOn[WRIST_PANEL_MAP];
+			case VR_HUD_PANEL:
+				gVrWristPanelEdit = (gVrWristPanelEdit+
+					WRIST_PANEL_COUNT+direction)%WRIST_PANEL_COUNT;
+				break;
+			case VR_HUD_PANEL_SHOW:
+				gWristPanelOn[gVrWristPanelEdit] =
+					!gWristPanelOn[gVrWristPanelEdit];
 				SaveWristPanels();
 				break;
-			case VR_HUD_WRIST_RADAR_SIDE:
-				gWristPanelUnderside[WRIST_PANEL_MAP] =
-					!gWristPanelUnderside[WRIST_PANEL_MAP];
+			case VR_HUD_PANEL_HAND:
+				gWristPanelHand[gVrWristPanelEdit] =
+					gWristPanelHand[gVrWristPanelEdit] ? 0 : 1;
 				SaveWristPanels();
 				break;
-			case VR_HUD_WRIST_RADAR_CALIBRATE:
+			case VR_HUD_PANEL_SIDE:
+				gWristPanelUnderside[gVrWristPanelEdit] =
+					!gWristPanelUnderside[gVrWristPanelEdit];
+				SaveWristPanels();
+				break;
+			case VR_HUD_PANEL_CALIBRATE:
 				gVrMenuPage = VR_MENU_PAGE_WRIST_RADAR;
-				gVrWristPanelEdit = WRIST_PANEL_MAP;
-				gVrWristRadarSelection = 0;
-				break;
-			case VR_HUD_WRIST_STATUS:
-				gWristPanelOn[WRIST_PANEL_STATUS] =
-					!gWristPanelOn[WRIST_PANEL_STATUS];
-				SaveWristPanels();
-				break;
-			case VR_HUD_WRIST_STATUS_CALIBRATE:
-				gVrMenuPage = VR_MENU_PAGE_WRIST_RADAR;
-				gVrWristPanelEdit = WRIST_PANEL_STATUS;
-				gVrWristRadarSelection = 0;
-				break;
-			case VR_HUD_WRIST_CLOCK:
-				gWristPanelOn[WRIST_PANEL_CLOCK] =
-					!gWristPanelOn[WRIST_PANEL_CLOCK];
-				SaveWristPanels();
-				break;
-			case VR_HUD_WRIST_CLOCK_CALIBRATE:
-				gVrMenuPage = VR_MENU_PAGE_WRIST_RADAR;
-				gVrWristPanelEdit = WRIST_PANEL_CLOCK;
 				gVrWristRadarSelection = 0;
 				break;
 			case VR_HUD_WRIST_IN_VEHICLE:
@@ -2093,6 +2138,20 @@ VrDebugUpdate(const PadInput &in)
 					gWristRoll[panel][slot]+step, -1800), 1800);
 				SaveWristPanels();
 				break;
+			case VR_WRIST_COLOUR_RED:
+			case VR_WRIST_COLOUR_GREEN:
+			case VR_WRIST_COLOUR_BLUE: {
+				static const char *const key[3] = {
+					"AmmoColourRed", "AmmoColourGreen",
+					"AmmoColourBlue"
+				};
+				const int channel =
+					gVrWristRadarSelection-VR_WRIST_COLOUR_RED;
+				gAmmoColour[channel] = Min(Max(
+					gAmmoColour[channel]+step*5, 0), 255);
+				SaveVrInteger(key[channel], gAmmoColour[channel]);
+				break;
+			}
 			case VR_WRIST_SIZE:
 				gWristSize[panel][slot] = Min(Max(
 					gWristSize[panel][slot]+step, 40), 250);
@@ -2857,31 +2916,20 @@ DrawQuestHudPage(void)
 		"HORIZONTAL OFFSET  < %+d CM >", gHudOffsetXCm);
 	snprintf(rows[VR_HUD_OFFSET_Y], sizeof(rows[0]),
 		"VERTICAL OFFSET  < %+d CM >", gHudOffsetYCm);
-	snprintf(rows[VR_HUD_WRIST_RADAR], sizeof(rows[0]),
-		"MINIMAP ON WRIST  < %s >",
-		gWristPanelOn[WRIST_PANEL_MAP] ? "ON" : "OFF");
-	snprintf(rows[VR_HUD_WRIST_RADAR_SIDE], sizeof(rows[0]),
-		"WRIST MINIMAP SIDE  < %s >",
-		gWristPanelUnderside[WRIST_PANEL_MAP] ?
-			"UNDER WRIST" : "TOP OF WRIST");
-	snprintf(rows[VR_HUD_WRIST_RADAR_CALIBRATE], sizeof(rows[0]),
-		"WRIST MINIMAP PLACEMENT  < %s SIDE, %s HAND >",
-		gWristPanelUnderside[WRIST_PANEL_MAP] ? "INNER" : "OUTER",
-		gWristPanelHand[WRIST_PANEL_MAP] ? "RIGHT" : "LEFT");
-	snprintf(rows[VR_HUD_WRIST_STATUS], sizeof(rows[0]),
-		"STATUS ON WRIST  < %s >",
-		gWristPanelOn[WRIST_PANEL_STATUS] ? "ON" : "OFF");
-	snprintf(rows[VR_HUD_WRIST_STATUS_CALIBRATE], sizeof(rows[0]),
-		"WRIST STATUS PLACEMENT  < %s SIDE, %s HAND >",
-		gWristPanelUnderside[WRIST_PANEL_STATUS] ? "INNER" : "OUTER",
-		gWristPanelHand[WRIST_PANEL_STATUS] ? "RIGHT" : "LEFT");
-	snprintf(rows[VR_HUD_WRIST_CLOCK], sizeof(rows[0]),
-		"CLOCK ON WRIST  < %s >",
-		gWristPanelOn[WRIST_PANEL_CLOCK] ? "ON" : "OFF");
-	snprintf(rows[VR_HUD_WRIST_CLOCK_CALIBRATE], sizeof(rows[0]),
-		"WRIST CLOCK PLACEMENT  < %s SIDE, %s HAND >",
-		gWristPanelUnderside[WRIST_PANEL_CLOCK] ? "INNER" : "OUTER",
-		gWristPanelHand[WRIST_PANEL_CLOCK] ? "RIGHT" : "LEFT");
+	const int panel = gVrWristPanelEdit;
+	snprintf(rows[VR_HUD_PANEL], sizeof(rows[0]),
+		"PANEL  < %s >", WristPanelName(panel));
+	snprintf(rows[VR_HUD_PANEL_SHOW], sizeof(rows[0]),
+		"%s  < %s >", WristPanelName(panel),
+		gWristPanelOn[panel] ? "WORN" : "OFF");
+	snprintf(rows[VR_HUD_PANEL_HAND], sizeof(rows[0]),
+		"WORN ON  < %s HAND >",
+		gWristPanelHand[panel] ? "RIGHT" : "LEFT");
+	snprintf(rows[VR_HUD_PANEL_SIDE], sizeof(rows[0]),
+		"WORN  < %s >",
+		gWristPanelUnderside[panel] ? "UNDER THE WRIST" : "ON TOP");
+	snprintf(rows[VR_HUD_PANEL_CALIBRATE], sizeof(rows[0]),
+		"PLACE AND SIZE %s  < OPEN >", WristPanelName(panel));
 	snprintf(rows[VR_HUD_WRIST_IN_VEHICLE], sizeof(rows[0]),
 		"WRIST PANELS WHILE DRIVING  < %s >",
 		gWristPanelsInVehicle ? "IMMERSIVE ONLY" : "OFF");
@@ -2910,8 +2958,7 @@ DrawQuestWristRadarPage(void)
 		WRIST_SIDE_INNER : WRIST_SIDE_OUTER;
 	const char *sideName = side == WRIST_SIDE_INNER ? "INNER" : "OUTER";
 	const char *otherName = side == WRIST_SIDE_INNER ? "OUTER" : "INNER";
-	const char *panelName = panel == WRIST_PANEL_STATUS ? "STATUS READOUT" :
-		(panel == WRIST_PANEL_CLOCK ? "CLOCK" : "MINIMAP");
+	const char *panelName = WristPanelName(panel);
 	const int context = gVrWristContextEdit;
 	const int slot = WRIST_SLOT(context, side);
 	char heading[96];
@@ -2947,6 +2994,11 @@ DrawQuestWristRadarPage(void)
 		"SPIN  < %+.1f DEG >", (float)gWristRoll[panel][slot]*0.1f);
 	snprintf(rows[VR_WRIST_SIZE], sizeof(rows[0]),
 		"SIZE  < %d%% >", gWristSize[panel][slot]);
+	static const char *const colourName[3] = { "RED", "GREEN", "BLUE" };
+	for(int channel = 0; channel < 3; channel++)
+		snprintf(rows[VR_WRIST_COLOUR_RED+channel], sizeof(rows[0]),
+			"TEXT %s  < %d >", colourName[channel],
+			gAmmoColour[channel]);
 	snprintf(rows[VR_WRIST_COPY], sizeof(rows[0]),
 		"COPY FROM %s SIDE", otherName);
 	if(context == WRIST_CONTEXT_DEFAULT)
@@ -3841,6 +3893,16 @@ VrWristPanelsInVehicle(void)
 {
 	LoadVrSettings();
 	return gWristPanelsInVehicle;
+}
+
+void
+VrWristAmmoColour(unsigned char *red, unsigned char *green,
+                  unsigned char *blue)
+{
+	LoadVrSettings();
+	if(red) *red = (unsigned char)gAmmoColour[0];
+	if(green) *green = (unsigned char)gAmmoColour[1];
+	if(blue) *blue = (unsigned char)gAmmoColour[2];
 }
 
 bool

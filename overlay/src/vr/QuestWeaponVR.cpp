@@ -366,6 +366,10 @@ static const BuiltInSupportGripDefaults gBuiltInSupportGripDefaults[] = {
 		{ -37,53,3 }, { -22,268,22 }, SUPPORT_GRIP_FROM_BELOW },
 	{ WEAPONTYPE_SPAS12_SHOTGUN, ModelSets::MODEL_SET_MODERN,
 		{ -18,79,-8 }, { 0,297,-354 }, SUPPORT_GRIP_FROM_BELOW },
+	// Tuned in the headset against the Modern rifle, whose handguard sits
+	// further forward and lower than the classic model.
+	{ WEAPONTYPE_M4, ModelSets::MODEL_SET_MODERN,
+		{ -12,70,-6 }, { -74,360,-332 }, SUPPORT_GRIP_FROM_BELOW },
 };
 
 struct DroppedWeapon
@@ -461,6 +465,10 @@ static int gHolsterSelection[VR_HAND_COUNT] = { -1, -1 };
 static bool gAttachedMissionWeaponForced;
 static int gAttachedMissionWeaponSlot = -1;
 static int gSupportHand[VR_HAND_COUNT] = { -1, -1 };
+// Set while the weapon calibration page is open. The free hand takes the
+// foregrip on its own there and keeps it, so the sockets being edited can
+// be judged against a hand that is actually on them.
+static bool gWeaponCalibrationPreview;
 static CMatrix gWeaponRenderMatrix[VR_HAND_COUNT];
 static int gWeaponRenderSlot[VR_HAND_COUNT] = { -1, -1 };
 static CMatrix gWeaponContactMatrix[VR_HAND_COUNT];
@@ -1684,7 +1692,9 @@ UpdateAttachedMissionWeaponInput()
 		gAttachedMissionWeaponSlot = slot;
 	}
 
-	const int supportHand = 0;
+	// The free hand, whichever that is. Hard-coding the left one left a
+	// left-handed grip supporting itself, which can never engage.
+	const int supportHand = 1-weaponHand;
 	const int weaponType = player->GetWeapon()->m_eWeaponType;
 	if(gSupportHand[weaponHand] == supportHand){
 		if(!gPoseValid[supportHand] || gGrip[supportHand] <= 0.30f)
@@ -1793,7 +1803,7 @@ UpdateHolsterInput(uint32 blockedHands)
 			gSupportHand[primary] = -1;
 			continue;
 		}
-		if(gGrip[support] <= 0.30f){
+		if(gGrip[support] <= 0.30f && !gWeaponCalibrationPreview){
 			gSupportHand[primary] = -1;
 			continue;
 		}
@@ -1815,8 +1825,16 @@ UpdateHolsterInput(uint32 blockedHands)
 		   slot < 0 || gSupportHand[primary] >= 0 ||
 		   gHeldSlot[support] >= 0 || IsSupportHand(support) ||
 		   IsAuxiliaryHandReserved(support) ||
-		   !IsTwoHanded(weaponType) || !gPoseValid[support] ||
-		   gGrip[support] < 0.65f || gGripLatched[support])
+		   !IsTwoHanded(weaponType) || !gPoseValid[support])
+			continue;
+		// While the calibration page is open the free hand takes the
+		// foregrip on its own: the numbers being edited move that socket,
+		// and they cannot be judged against a hand that is not on it.
+		if(gWeaponCalibrationPreview){
+			gSupportHand[primary] = support;
+			continue;
+		}
+		if(gGrip[support] < 0.65f || gGripLatched[support])
 			continue;
 		CVector pivot, expected;
 		if(BuildSupportVector(primary, weaponType, &pivot, &expected) &&
@@ -2464,7 +2482,19 @@ bool IsTrackedHandReady(int hand)
 	return hand >= 0 && hand < VR_HAND_COUNT &&
 		gPoseValid[hand] && ShouldUseTrackedHands();
 }
-bool AreWeaponHolsterHighlightsEnabled() { LoadSettings(); return gHolsterHighlights; }
+// The calibration page has to show what is being calibrated, whatever the
+// player has done with the highlights during ordinary play.
+void
+SetQuestWeaponCalibrationPreview(bool visible)
+{
+	gWeaponCalibrationPreview = visible;
+}
+
+bool AreWeaponHolsterHighlightsEnabled()
+{
+	LoadSettings();
+	return gHolsterHighlights || gWeaponCalibrationPreview;
+}
 bool IsTrackedWeaponLaserEnabled() { LoadSettings(); return gWeaponLaser; }
 bool IsTrackedScopeActive() { return gScopeHand >= 0; }
 bool IsTrackedScopeActiveForHand(int hand) { return gScopeHand == hand; }

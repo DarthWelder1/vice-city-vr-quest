@@ -264,6 +264,7 @@ enum {
 	WRIST_PANEL_MAP = 0,
 	WRIST_PANEL_STATUS,
 	WRIST_PANEL_CLOCK,
+	WRIST_PANEL_AMMO,
 	WRIST_PANEL_COUNT
 };
 void setWristPanelRenderer(int32 panel, void (*renderer)(void));

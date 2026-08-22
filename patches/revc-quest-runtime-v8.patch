@@ -100,32 +100,43 @@ diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
 diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 --- a/src/render/Hud.cpp
 +++ b/src/render/Hud.cpp
-@@ -34,6 +34,7 @@
+@@ -34,17 +34,33 @@
  bool VrGameplayHudEnabled(void);
  bool VrShouldUseTheaterMode(void);
  bool VrWristPanelEnabled(int panel);
 +bool VrWristPanelsInVehicle(void);
  bool VrHudWeaponPanelEnabled(void);
  bool VrHudClockEnabled(void);
++void VrWristAmmoColour(unsigned char *red, unsigned char *green,
++                       unsigned char *blue);
++int VrWristPanelHand(int panel);
  void *BeginVrWristPanel(int panel, float centreX, float centreY, float width,
-@@ -44,7 +45,15 @@
+-	float height);
++	float height, int hand = -1);
+ void EndVrWristPanel(void);
+ }
+ // Panel indices, mirroring librw's WRIST_PANEL_* without pulling the
  // backend header into the HUD.
  enum {
  	VR_WRIST_PANEL_MAP = 0,
 -	VR_WRIST_PANEL_STATUS = 1
 +	VR_WRIST_PANEL_STATUS = 1,
-+	VR_WRIST_PANEL_CLOCK = 2
++	VR_WRIST_PANEL_CLOCK = 2,
++	VR_WRIST_PANEL_AMMO = 3
 +};
 +// The clock panel has no screen rect to inherit, so it gets one of its own:
 +// a small strip just big enough for HH:MM at the interface font size.
 +enum {
 +	VR_WRIST_CLOCK_WIDTH = 120,
 +	VR_WRIST_CLOCK_HEIGHT = 40,
-+	VR_WRIST_CLOCK_MARGIN = 4
++	VR_WRIST_CLOCK_MARGIN = 4,
++	VR_WRIST_AMMO_WIDTH = 120,
++	VR_WRIST_AMMO_HEIGHT = 40,
++	VR_WRIST_AMMO_MARGIN = 4
  };
  #endif
  
-@@ -475,6 +484,17 @@
+@@ -475,6 +491,17 @@
  	DrawRadarContents();
  }
  
@@ -143,7 +154,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  // The finished map on the player's arm: one textured quad, depth tested like
  // anything else out there. False when the panel is off, so the flat interface
  // draws the radar as it always did.
-@@ -483,9 +503,7 @@
+@@ -483,9 +510,7 @@
  {
  	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_MAP))
  		return false;
@@ -154,7 +165,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  		return false;
  
  	const float width = SCREEN_SCALE_X(RADAR_WIDTH)+SCREEN_SCALE_X(12.0f);
-@@ -539,13 +557,49 @@
+@@ -539,13 +564,107 @@
  	CFont::DrawFonts();
  }
  
@@ -193,6 +204,64 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +	CFont::SetCentreOff();
 +}
 +
++// The round count, drawn where the shooter is already looking: along the
++// weapon. The hand it is worn on is the one holding the gun, and the
++// visual hand matrix follows the grip, so the panel travels with it.
++void
++VrDrawWristAmmoContents(void)
++{
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)rwCULLMODECULLNONE);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	CPlayerPed *player = FindPlayerPed();
++	if (player == nil)
++		return;
++	CWeapon *weapon = player->GetWeapon();
++	if (weapon == nil)
++		return;
++	const int32 type = weapon->m_eWeaponType;
++	const int32 amount =
++		CWeaponInfo::GetWeaponInfo((eWeaponType)type)->m_nAmountofAmmunition;
++	char text[24];
++	// The same reserve-clip split the corner readout uses, so a player who
++	// knows the flat interface reads this one without being told.
++	if (amount <= 1 || amount >= 1000)
++		sprintf(text, "%d", weapon->m_nAmmoTotal);
++	else {
++		const int32 divisor = type == WEAPONTYPE_FLAMETHROWER ? 10 : 1;
++		const int32 clip = weapon->m_nAmmoInClip/divisor;
++		const int32 reserve = Min((weapon->m_nAmmoTotal-
++			weapon->m_nAmmoInClip)/divisor, 9999);
++		sprintf(text, "%d-%d", reserve, clip);
++	}
++	uint8 red = 90, green = 235, blue = 120;
++	androidgame::VrWristAmmoColour(&red, &green, &blue);
++	CFont::SetJustifyOff();
++	CFont::SetBackgroundOff();
++	CFont::SetScale(SCREEN_SCALE_X(HUD_TEXT_SCALE_X), SCREEN_SCALE_Y(HUD_TEXT_SCALE_Y));
++	CFont::SetBackGroundOnlyTextOff();
++	CFont::SetPropOff();
++	// The blocky face the game counts with, not the serif one it writes
++	// dialogue in: these are digits read at a glance in a firefight.
++	CFont::SetFontStyle(FONT_HEADING);
++	CFont::SetRightJustifyOff();
++	CFont::SetCentreOn();
++	CFont::SetCentreSize(SCREEN_SCALE_X(VR_WRIST_AMMO_WIDTH));
++	CFont::SetDropShadowPosition(2);
++	CFont::SetDropColor(CRGBA(0, 0, 0, 255));
++	CFont::SetColor(CRGBA(red, green, blue, 255));
++	wchar wide[24];
++	AsciiToUnicode(text, wide);
++	CFont::PrintString(SCREEN_SCALE_X(VR_WRIST_AMMO_WIDTH)*0.5f,
++		SCREEN_SCALE_Y(VR_WRIST_AMMO_MARGIN), wide);
++	CFont::DrawFonts();
++	CFont::SetCentreOff();
++}
++
  // The finished readout on the player's other arm. False when the panel is
  // off, so the flat interface draws it as it always did.
  static bool
@@ -206,12 +275,72 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  		return false;
  
  	// The block the money, health, armour and wanted rows occupy, with a
-@@ -579,6 +633,38 @@
+@@ -579,6 +698,98 @@
  	androidgame::EndVrWristPanel();
  	return true;
  }
 +
 +// The watch. False when the panel is off, so the corner clock prints as usual.
++static void
++DrawWristAmmoOnHand(int hand, float width, float height)
++{
++	RwRaster *panel = (RwRaster*)androidgame::BeginVrWristPanel(
++		VR_WRIST_PANEL_AMMO, width*0.5f, height*0.5f, width, height,
++		hand);
++	if (panel == nil)
++		return;
++
++	CRect rect(0.0f, 0.0f, width, height);
++	const CRGBA white(255, 255, 255, 255);
++	CSprite2d::SetVertices(rect, white, white, white, white);
++	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, panel);
++	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
++	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)rwBLENDSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)rwBLENDINVSRCALPHA);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
++	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
++	GameRender::SubmitImmediate2D(rwPRIMTYPETRIFAN, CSprite2d::GetVertices(), 4);
++	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
++	androidgame::EndVrWristPanel();
++}
++
++static bool
++DrawWristAmmoQuad(void)
++{
++	if (!androidgame::VrWristPanelEnabled(VR_WRIST_PANEL_AMMO))
++		return false;
++	if (FindPlayerVehicle() != nil && !VrWristPanelsRideAlong())
++		return false;
++	CPlayerPed *player = FindPlayerPed();
++	// Nothing to count for a bare fist, and nothing to hang the panel on.
++	if (player == nil || player->GetWeapon() == nil ||
++	    player->GetWeapon()->m_eWeaponType == WEAPONTYPE_UNARMED)
++		return false;
++	// A bat has one of itself. Counting that is noise, not information.
++	CWeaponInfo *info = CWeaponInfo::GetWeaponInfo(
++		(eWeaponType)player->GetWeapon()->m_eWeaponType);
++	if (info == nil || info->m_eWeaponFire == WEAPON_FIRE_MELEE)
++		return false;
++
++	const float width = SCREEN_SCALE_X(VR_WRIST_AMMO_WIDTH);
++	const float height = SCREEN_SCALE_Y(VR_WRIST_AMMO_HEIGHT);
++	// The counter belongs to the hand that is holding the gun, whichever
++	// that is, and to both of them when both are armed. Only when no hand
++	// has physically taken a weapon does the configured arm carry it.
++	bool drawn = false;
++	for (int hand = 0; hand < 2; hand++)
++		if (OculusVR::GetHeldWeaponSlot(hand) >= 0) {
++			DrawWristAmmoOnHand(hand, width, height);
++			drawn = true;
++		}
++	if (!drawn)
++		DrawWristAmmoOnHand(
++			androidgame::VrWristPanelHand(VR_WRIST_PANEL_AMMO) ? 1 : 0,
++			width, height);
++	return true;
++}
++
 +static bool
 +DrawWristClockQuad(void)
 +{
@@ -245,7 +374,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  #endif
  
  
-@@ -1203,11 +1289,17 @@
+@@ -1203,11 +1414,18 @@
  		/*
  			DrawClock
  		*/
@@ -254,6 +383,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +		// worn, whatever the corner clock is set to. When it draws, the corner
 +		// one stands down: nobody wants the time in two places.
 +		const bool wristClock = m_ClockState && DrawWristClockQuad();
++		DrawWristAmmoQuad();
 +#endif
  		if (m_ClockState
  #if defined(RW_VULKAN) && defined(__ANDROID__)

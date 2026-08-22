@@ -180,14 +180,18 @@ void VrGetWristPanelCalibration(int panel, float *alongCm, float *acrossCm,
 // clock above them. Both are switches of their own on the headset.
 bool VrHudWeaponPanelEnabled(void);
 bool VrDistanceFogEnabled(void);
+// Colour of the ammo readout, chosen on its calibration page.
+void VrWristAmmoColour(unsigned char *red, unsigned char *green,
+                       unsigned char *blue);
 bool VrHudClockEnabled(void);
 bool VrGameplayHudEnabled(void);
 // Puts the interface plane on a wrist and hands back that panel's texture to
 // bind, or null when there is nothing to show yet; End restores the
 // head-locked plane. Each call also asks the backend to render the panel at
 // the top of the next frame -- that request is one-shot on purpose.
+// hand: -1 uses the panel own setting, 0/1 places it on that arm instead.
 void *BeginVrWristPanel(int panel, float centreX, float centreY, float width,
-                        float height);
+                        float height, int hand = -1);
 void EndVrWristPanel(void);
 void VrGetGameplayHudSettings(int *widthPercent, int *scalePercent,
                               int *offsetXCm, int *offsetYCm);
