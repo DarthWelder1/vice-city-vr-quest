@@ -2102,6 +2102,21 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 		memcpy(gvk.previousStereoViewProjectionUnjittered[eye],
 		       gvk.stereoViewProjectionUnjittered[eye], sizeof(float32)*16);
 	}
+	// Fog is linear between the two planes the game supplies. Without it
+	// the world simply stops at the far clip, which reads as half-drawn
+	// buildings hanging in clear air from anything with altitude.
+	{
+		const float32 range = gvk.fogEnd-gvk.fogStart;
+		const bool32 usable = range > 0.001f;
+		scene->fogParams[0] = gvk.fogStart;
+		scene->fogParams[1] = gvk.fogEnd;
+		scene->fogParams[2] = usable ? 1.0f/range : 0.0f;
+		scene->fogParams[3] = usable ? 1.0f : 0.0f;
+		scene->fogColour[0] = gstate.fogColor.red/255.0f;
+		scene->fogColour[1] = gstate.fogColor.green/255.0f;
+		scene->fogColour[2] = gstate.fogColor.blue/255.0f;
+		scene->fogColour[3] = 1.0f;
+	}
 	uploadSceneData();
 
 	// The wrist panels render into their own targets here, while the frame is
@@ -2998,6 +3013,13 @@ getFirstPersonLocalHeadYaw(float32 *yawOut)
 	while(yaw < -pi) yaw += twoPi;
 	*yawOut = yaw;
 	return 1;
+}
+
+void
+setFogParams(float32 start, float32 end)
+{
+	gvk.fogStart = start;
+	gvk.fogEnd = end;
 }
 
 void

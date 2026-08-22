@@ -179,6 +179,7 @@ void VrGetWristPanelCalibration(int panel, float *alongCm, float *acrossCm,
 // The weapon icon and ammo counter in the corner of the interface, and the
 // clock above them. Both are switches of their own on the headset.
 bool VrHudWeaponPanelEnabled(void);
+bool VrDistanceFogEnabled(void);
 bool VrHudClockEnabled(void);
 bool VrGameplayHudEnabled(void);
 // Puts the interface plane on a wrist and hands back that panel's texture to

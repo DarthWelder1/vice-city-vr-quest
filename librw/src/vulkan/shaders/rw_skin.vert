@@ -54,7 +54,12 @@ void main()
 	fragColour = vec4(clamp(colour, 0.0, 1.0), inColour.a) * push.materialColour;
 	fragTexCoord = inTexCoord;
 
-	fragFog = scene.fogParams.w > 0.5 ?
-		clamp((scene.fogParams.y - gl_Position.w) * scene.fogParams.z, 0.0, 1.0) :
+	// Fog by distance from the eye rather than by depth along the view axis.
+	// Planar depth makes the fog a wall perpendicular to the gaze, and in a
+	// headset that wall turns with the head: the mist appears to follow the
+	// player instead of sitting still in the world.
+	float fogDistance = length(world.xyz - scene.im2dParams.yzw);
+	fragFog = (scene.fogParams.w * push.ambientLight.w) > 0.5 ?
+		clamp((scene.fogParams.y - fogDistance) * scene.fogParams.z, 0.0, 1.0) :
 		1.0;
 }

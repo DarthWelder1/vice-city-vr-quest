@@ -110,6 +110,8 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 	// Zero-initialised: immediate geometry never uses the lighting fields, and
 	// garbage in them would still reach the shader.
 	PushConstants push = {};
+	// Same per-draw fog switch the atomic pipeline uses; see vkpipe.cpp.
+	push.ambientLight[3] = gstate.fogEnabled ? 1.0f : 0.0f;
 	// Im3D is world space, so it needs the game camera folded in like the
 	// world pipeline does. Im2D is not: it anchors its panel in play space
 	// through scene.im2dTransform and must stay clear of the game camera.

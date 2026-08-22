@@ -378,6 +378,11 @@ bool32 getFirstPersonLocalHeadYaw(float32 *yawOut);
 // covers the full view rather than the 2D panel.
 void setClearColour(uint8 red, uint8 green, uint8 blue);
 
+// Distance fog for world, skinned and im3d geometry. start is where it
+// begins and end is the far clip it reaches full strength at; the colour
+// comes from the FOGCOLOR render state the game already sets each frame.
+void setFogParams(float32 start, float32 end);
+
 // Final-image colour treatment. Mode 0 is a plain resolve and mode 1 is Vice
 // City's POSTFX_NORMAL filter. The filter runs once for both multiview layers
 // after all world and 2D rendering has completed.

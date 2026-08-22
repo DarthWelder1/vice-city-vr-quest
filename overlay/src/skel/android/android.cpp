@@ -23,6 +23,7 @@
 #include "Text.h"
 #include "Timer.h"
 #include "Camera.h"
+#include "Timecycle.h"
 #include "DMAudio.h"
 #include "MemoryMgr.h"
 #include "Lists.h"	// CPtrList, needed by PlayerInfo.h
@@ -1378,6 +1379,15 @@ Step(void)
 	if(!gForegroundApp || !gRwInitialised)
 		return;
 	EnforceQuestTextureBudget();
+	// Hand the backend the time cycle planes the desktop renderer takes from
+	// the RenderWare camera. Without them the world ends at the far clip with
+	// a hard edge, which is plain to see from anything that can gain height.
+	if(gGameState == GS_PLAYING_GAME)
+		rw::vulkan::setFogParams(
+			androidgame::VrDistanceFogEnabled() ?
+				CTimeCycle::GetFogStart() : 0.0f,
+			androidgame::VrDistanceFogEnabled() ?
+				CTimeCycle::GetFarClip() : 0.0f);
 
 	static RwUInt32 reportedState = 0xFFFFFFFF;
 	if(gGameState != reportedState){

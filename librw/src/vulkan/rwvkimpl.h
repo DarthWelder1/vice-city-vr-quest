@@ -248,6 +248,9 @@ struct Globals
 	bool32 eyePosesValid;
 	// Render pass clear colour; carries the timecycle sky. See beginFrame.
 	float32 clearColour[3];
+	// Linear fog planes, supplied by the game from its time cycle.
+	float32 fogStart;
+	float32 fogEnd;
 
 	// First person anchor: the player's head in the game world. anchorYaw is
 	// the world yaw that play-space forward maps to. On foot it is latched at

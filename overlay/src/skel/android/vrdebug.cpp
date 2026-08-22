@@ -228,6 +228,10 @@ static const WristPlacement kVehicleHudDefault[2][WRIST_PANEL_COUNT] = {
 // against the old wrist-follows-hand anchor is replaced instead of leaving
 // the panels behind or below the driver.
 enum { VEHICLE_HUD_ANCHOR_VERSION = 1 };
+// Distance fog, as the desktop game draws it. Off shows the bare far clip,
+// which is what the port looked like before the backend was given the
+// planes; it is here to compare the two.
+static bool gDistanceFog = true;
 static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false, false };
 // The watch is the odd one out: both wrists already have a panel underneath,
 // so it is worn where a watch is worn, on the outside of the right one.
@@ -432,6 +436,7 @@ enum eVrGraphicsMenuItem {
 	VR_GRAPHICS_SHADOWS,
 	VR_GRAPHICS_OCCLUSION,
 	VR_GRAPHICS_FOUNTAIN,
+	VR_GRAPHICS_FOG,
 	VR_GRAPHICS_QUICK_START,
 	VR_GRAPHICS_BACK,
 	VR_GRAPHICS_ITEM_COUNT
@@ -857,6 +862,8 @@ LoadVrSettings(void)
 	}
 	// The arms carry the interface out of the box. Both corner panels belong
 	// to the CLASSIC preset, which is one row away on the HUD page.
+	gDistanceFog = GetPrivateProfileIntA("VR", "DistanceFog", 1,
+		".\\vr_settings.ini") != 0;
 	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 0,
 		".\\vr_settings.ini") != 0;
 	gHudClock = GetPrivateProfileIntA("VR", "HudClock", 0,
@@ -1819,6 +1826,9 @@ VrDebugUpdate(const PadInput &in)
 					 VR_FOUNTAIN_QUALITY_COUNT)%VR_FOUNTAIN_QUALITY_COUNT;
 				CParticleObject::SetVrFountainQuality(quality);
 				SaveVrInteger("FountainQuality", quality);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_FOG){
+				gDistanceFog = !gDistanceFog;
+				SaveVrInteger("DistanceFog", gDistanceFog ? 1 : 0);
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_QUICK_START){
 				gQuestQuickTestStart = !gQuestQuickTestStart;
 				SaveVrInteger("QuickTestStart",
@@ -2616,6 +2626,8 @@ DrawQuestGraphicsPage(void)
 	snprintf(rows[VR_GRAPHICS_FOUNTAIN], sizeof(rows[0]),
 		"FOUNTAIN PARTICLES  < %s >",
 		CParticleObject::GetVrFountainQualityName());
+	snprintf(rows[VR_GRAPHICS_FOG], sizeof(rows[0]),
+		"DISTANCE FOG  < %s >", gDistanceFog ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_QUICK_START], sizeof(rows[0]),
 		"QUICK TEST START  < %s - NEXT LAUNCH >",
 		gQuestQuickTestStart ? "ON" : "OFF");
@@ -3829,6 +3841,13 @@ VrWristPanelsInVehicle(void)
 {
 	LoadVrSettings();
 	return gWristPanelsInVehicle;
+}
+
+bool
+VrDistanceFogEnabled(void)
+{
+	LoadVrSettings();
+	return gDistanceFog;
 }
 
 bool

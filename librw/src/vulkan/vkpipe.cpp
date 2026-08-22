@@ -449,7 +449,11 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	// geometry is unlit (prelight only), peds and vehicles take the world's
 	// ambient plus its first directional -- Vice City registers exactly one.
 	push.ambientLight[0] = push.ambientLight[1] = push.ambientLight[2] = 0.0f;
-	push.ambientLight[3] = 1.0f;
+	// w carries the fog switch for this draw. The game turns fog on for the
+	// world and off for the sky, the water and anything it wants left flat,
+	// and the scene block is uploaded once a frame, so the per-draw state
+	// has to travel with the draw.
+	push.ambientLight[3] = gstate.fogEnabled ? 1.0f : 0.0f;
 	push.lightDirColour[0] = 0.0f;
 	push.lightDirColour[1] = 0.0f;
 	push.lightDirColour[2] = 1.0f;
