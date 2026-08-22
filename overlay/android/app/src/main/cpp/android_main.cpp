@@ -710,6 +710,44 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 	if(widthPixels < 1.0f)
 		return false;
 	const int hand = VrWristPanelHand(panel) ? 1 : 0;
+	float alongCm = 0.0f, acrossCm = 0.0f, liftCm = 0.0f;
+	float pitchDeg = 0.0f, yawDeg = 0.0f, rollDeg = 0.0f, sizeScale = 1.0f;
+	VrGetWristPanelCalibration(panel, &alongCm, &acrossCm, &liftCm,
+		&pitchDeg, &yawDeg, &rollDeg, &sizeScale);
+
+	// Driving: the panel is dashboard instrumentation on the vehicle's own
+	// control centre, facing the driver. It is not worn, so none of the wrist
+	// geometry below applies -- no hand mirroring, no arm offsets and no panel
+	// rotations, only the three offsets from that centre.
+	{
+		float anchorPos[3], anchorRight[3], anchorUp[3], anchorForward[3];
+		if(VrGetWristVehicleAnchorPose(anchorPos, anchorRight, anchorUp,
+		     anchorForward)){
+			float centre[3], normal[3], up[3], right[3];
+			for(int axis = 0; axis < 3; axis++){
+				right[axis] = anchorRight[axis];
+				up[axis] = anchorUp[axis];
+				normal[axis] = -anchorForward[axis];
+				centre[axis] = anchorPos[axis]+
+					anchorForward[axis]*(alongCm*0.01f)+
+					right[axis]*(acrossCm*0.01f)+
+					up[axis]*(liftCm*0.01f);
+			}
+			const float scale =
+				kWristPanelMetres[panel]*sizeScale/widthPixels;
+			memset(plane, 0, sizeof(float)*16);
+			for(int axis = 0; axis < 3; axis++){
+				plane[axis] = right[axis]*scale;
+				plane[4+axis] = -up[axis]*scale;
+				plane[8+axis] = normal[axis];
+				plane[12+axis] = centre[axis]-
+					right[axis]*(centreX*scale)+
+					up[axis]*(centreY*scale);
+			}
+			plane[15] = 1.0f;
+			return true;
+		}
+	}
 
 	// Controller axes: the OpenXR grip pose looks along -Z out of the hand, so
 	// +Z runs back towards the wrist and +Y stands away from the palm.
@@ -748,11 +786,6 @@ BuildWristPanelPlane(int panel, float plane[16], float centreX, float centreY,
 		side[axis] *= handSign;
 		palmUp[axis] *= handSign;
 	}
-
-	float alongCm = 0.0f, acrossCm = 0.0f, liftCm = 0.0f;
-	float pitchDeg = 0.0f, yawDeg = 0.0f, rollDeg = 0.0f, sizeScale = 1.0f;
-	VrGetWristPanelCalibration(panel, &alongCm, &acrossCm, &liftCm,
-		&pitchDeg, &yawDeg, &rollDeg, &sizeScale);
 
 	// The face lies on the wrist looking away from the arm, twelve o'clock
 	// towards the fingers, and is not turned towards the head: it is an object

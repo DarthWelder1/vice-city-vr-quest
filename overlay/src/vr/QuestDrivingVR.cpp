@@ -181,6 +181,10 @@ static float gImmersiveBikePhysicalAngle;
 static float gImmersiveBikeDesiredAngle;
 static float gImmersiveBikeSteeringOverflow;
 static float gImmersiveBikeThrottle;
+// The twist is a motorcycle gesture, not an easy one: the hand has to stay on
+// the bar while the wrist turns. Off by default, the trigger drives the bike
+// the way it drives a car.
+static int gBikeManualThrottle;
 static float gImmersiveBikeLean;
 static bool gBikeThrottleGestureActive;
 static bool gBikeThrottleReferenceValid;
@@ -295,6 +299,8 @@ LoadDrivingSettings()
 	gBikeDrivingType = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "BikeDrivingType", legacyDrivingType, kSettingsPath),
 		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
+	gBikeManualThrottle = GetPrivateProfileIntA("VR",
+		"ImmersiveBikeManualThrottle", 0, kSettingsPath) != 0 ? 1 : 0;
 	gMotionSteeringHand = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "MotionSteeringHand", 1, kSettingsPath), 0,
 		VR_HAND_COUNT-1);
@@ -1873,7 +1879,8 @@ static void
 UpdateBikeThrottle(CBike *bike, bool rightGrabbed,
 	const androidgame::PadInput &input)
 {
-	if(!bike || !rightGrabbed || input.rightTrigger < 0.45f){
+	if(!gBikeManualThrottle || !bike || !rightGrabbed ||
+	   input.rightTrigger < 0.45f){
 		gImmersiveBikeThrottle = 0.0f;
 		gBikeThrottleGestureActive = false;
 		gBikeThrottleReferenceValid = false;
@@ -2302,6 +2309,74 @@ UpdateImmersiveCarModelSteeringWheel(CVehicle *vehicle)
 }
 
 bool IsImmersiveDrivingActive() { return IsVrDrivingActive(); }
+
+bool
+IsQuestBikeManualThrottle()
+{
+	LoadDrivingSettings();
+	return gBikeManualThrottle != 0;
+}
+
+void
+ToggleQuestBikeManualThrottle()
+{
+	LoadDrivingSettings();
+	gBikeManualThrottle = gBikeManualThrottle ? 0 : 1;
+	SaveSetting("ImmersiveBikeManualThrottle", gBikeManualThrottle);
+}
+
+bool
+IsQuestCarDrivingDefault()
+{
+	LoadDrivingSettings();
+	return gCarDrivingType == VR_DRIVING_DEFAULT;
+}
+
+bool
+IsQuestBikeDrivingDefault()
+{
+	LoadDrivingSettings();
+	return gBikeDrivingType == VR_DRIVING_DEFAULT;
+}
+
+// In a vehicle the immersive HUD is dashboard instrumentation, not a sticker
+// on a controller. The anchor is the neutral control centre carrying the
+// vehicle's own basis, with physical steering deliberately left out, so the
+// panels neither swing with the hands nor turn with the wheel.
+bool
+GetQuestVehicleHudAnchor(CMatrix *matrix)
+{
+	if(!matrix || !IsVrDrivingActive())
+		return false;
+	CVehicle *vehicle = FindPlayerVehicle();
+	if(!vehicle)
+		return false;
+	CMatrix left, right;
+	if(vehicle->IsBike()){
+		BikeHandlePose pose;
+		if(!BuildBikeHandlePose((CBike*)vehicle, &pose))
+			return false;
+		if(BuildBikeHandleMatrix(0, &left, false) &&
+		   BuildBikeHandleMatrix(1, &right, false))
+			pose.center =
+				(left.GetPosition()+right.GetPosition())*0.5f;
+		matrix->SetUnity();
+		matrix->GetRight() = pose.right;
+		matrix->GetUp() = pose.up;
+		matrix->GetForward() = pose.forward;
+		matrix->GetPosition() = pose.center;
+		return true;
+	}
+	if(!BuildCarWheelMatrix(0, &left, false) ||
+	   !BuildCarWheelMatrix(1, &right, false))
+		return false;
+	*matrix = left;
+	matrix->GetPosition() = (left.GetPosition()+right.GetPosition())*0.5f;
+	matrix->GetRight().Normalise();
+	matrix->GetUp().Normalise();
+	matrix->GetForward().Normalise();
+	return true;
+}
 bool IsImmersiveCarDrivingActive() { return IsImmersiveCarActive(); }
 bool IsImmersiveBikeDrivingActive() { return IsImmersiveBikeActive(); }
 bool IsVrCarDrivingActive() { return IsVrCarActive(); }
@@ -2362,7 +2437,9 @@ GetImmersiveBikeSteering(CVehicle *bike, float *steering)
 bool
 GetImmersiveBikeThrottle(CVehicle *bike, float *throttle)
 {
-	if(!throttle || !IsImmersiveBikeActive(bike))
+	// Refusing here hands the bike back to the pad accelerator in Bike.cpp,
+	// which is the whole point of the option being off.
+	if(!throttle || !gBikeManualThrottle || !IsImmersiveBikeActive(bike))
 		return false;
 	*throttle = gImmersiveBikeThrottle;
 	return true;

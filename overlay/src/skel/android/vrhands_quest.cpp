@@ -141,4 +141,29 @@ VrGetWristAnchorPose(int hand, float position[3], float side[3],
 #endif
 }
 
+// Dashboard anchor for the in-vehicle panels: the neutral control centre with
+// the vehicle's basis, taken to play space the same way the wrist anchor is.
+bool
+VrGetWristVehicleAnchorPose(float position[3], float right[3], float up[3],
+                            float forward[3])
+{
+	if(!position || !right || !up || !forward)
+		return false;
+#ifdef GTA_VR_WEAPONS
+	CMatrix matrix;
+	if(!::gVrFirstPersonActive || !OculusVR::GetQuestVehicleHudAnchor(&matrix))
+		return false;
+	const CVector &worldPosition = matrix.GetPosition();
+	if(!rw::vulkan::firstPersonWorldPositionToPlay(&worldPosition.x, position) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(&matrix.GetRight().x, right) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(&matrix.GetUp().x, up) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(&matrix.GetForward().x, forward))
+		return false;
+	return true;
+#else
+	(void)position; (void)right; (void)up; (void)forward;
+	return false;
+#endif
+}
+
 } // namespace androidgame

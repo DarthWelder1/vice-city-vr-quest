@@ -133,6 +133,8 @@ void RenderTrackedHands(void);
 // grip or a socket. Axes follow the OpenXR grip convention -- +X across the
 // palm, +Y out of its back, +Z back towards the wrist. False when there is no
 // tracked hand to place anything on.
+bool VrGetWristVehicleAnchorPose(float position[3], float right[3],
+                                 float up[3], float forward[3]);
 bool VrGetWristAnchorPose(int hand, float position[3], float side[3],
                           float palmUp[3], float backward[3]);
 

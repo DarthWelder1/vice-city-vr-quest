@@ -208,6 +208,26 @@ static const WristPlacement kWristDefault[WRIST_PANEL_COUNT][WRIST_SIDE_COUNT] =
 		{ -55, -33, -52,  95, -955,  -539, 100 }
 	}
 };
+// Driving places the panels on the vehicle instead of the arms, so the two
+// vehicle contexts ship their own dashboard layout rather than inheriting a
+// placement authored for a wrist. Only along/across/lift and size are read
+// there: a dashboard does not carry the wrist rotations.
+static const WristPlacement kVehicleHudDefault[2][WRIST_PANEL_COUNT] = {
+	{	// in a car, arranged around the wheel without covering its centre
+		{ -74, -96,  23, 0, 0, 0,  55 },
+		{ -74,  76,  33, 0, 0, 0, 100 },
+		{ -74,  97,  -9, 0, 0, 0, 100 }
+	},
+	{	// on a bike, a vertical stack centred between the two grips
+		{ -22, -118, 50, 0, 0, 0,  85 },
+		{   0,   -1, 80, 0, 0, 0, 100 },
+		{   0,    0,105, 0, 0, 0, 100 }
+	}
+};
+// Raised when the shipped vehicle layout changes, so a calibration authored
+// against the old wrist-follows-hand anchor is replaced instead of leaving
+// the panels behind or below the driver.
+enum { VEHICLE_HUD_ANCHOR_VERSION = 1 };
 static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false, false };
 // The watch is the odd one out: both wrists already have a panel underneath,
 // so it is worn where a watch is worn, on the outside of the right one.
@@ -463,6 +483,7 @@ enum eVrVehicleMenuItem {
 	VR_VEHICLE_WHEEL_HAND_PULL_BACK,
 	VR_VEHICLE_HANDLE_HIGHLIGHTS,
 	VR_VEHICLE_BIKE_LOCK_HORIZON,
+	VR_VEHICLE_BIKE_THROTTLE,
 	VR_VEHICLE_CALIBRATION,
 	VR_VEHICLE_BACK,
 	VR_VEHICLE_ITEM_COUNT
@@ -617,6 +638,7 @@ DrawVrMenuText(const char *value, int centreX, int y, int scale,
 namespace androidgame {
 
 static void SaveVrInteger(const char *key, int value);
+static void SaveWristPanels(void);
 
 // Marks a vehicle context as carrying its own values rather than the on-foot
 // ones. Kept out of the placement keys so an older settings file still reads
@@ -640,34 +662,22 @@ ActiveWristContext(void)
 	return vehicle->IsBike() ? WRIST_CONTEXT_BIKE : WRIST_CONTEXT_CAR;
 }
 
-// ...and the one whose values actually apply, following inheritance.
+// ...and the one whose values apply. Every context carries a usable
+// placement of its own, so the active one is always the one that counts.
 static int
 ResolvedWristContext(int panel)
 {
-	const int context = ActiveWristContext();
-	return gWristContextOwned[panel][context] ?
-		context : WRIST_CONTEXT_DEFAULT;
+	(void)panel;
+	return ActiveWristContext();
 }
 
-// Editing a vehicle context for the first time takes the on-foot values with
-// it, so the panel does not jump the moment the first value is nudged.
+// The vehicle slots already hold the shipped dashboard layout, so claiming one
+// only records that the player has started editing it.
 static void
 OwnWristContext(int panel, int context)
 {
-	if(context == WRIST_CONTEXT_DEFAULT ||
-	   gWristContextOwned[panel][context])
+	if(context == WRIST_CONTEXT_DEFAULT)
 		return;
-	for(int side = 0; side < WRIST_SIDE_COUNT; side++){
-		const int from = WRIST_SLOT(WRIST_CONTEXT_DEFAULT, side);
-		const int to = WRIST_SLOT(context, side);
-		gWristAlong[panel][to] = gWristAlong[panel][from];
-		gWristAcross[panel][to] = gWristAcross[panel][from];
-		gWristLift[panel][to] = gWristLift[panel][from];
-		gWristPitch[panel][to] = gWristPitch[panel][from];
-		gWristYaw[panel][to] = gWristYaw[panel][from];
-		gWristRoll[panel][to] = gWristRoll[panel][from];
-		gWristSize[panel][to] = gWristSize[panel][from];
-	}
 	gWristContextOwned[panel][context] = true;
 }
 
@@ -773,8 +783,9 @@ LoadVrSettings(void)
 				const int slot = WRIST_SLOT(context, side);
 				// A vehicle context that has never been edited reads back the
 				// on-foot values, so switching to it shows what is on screen.
-				const int inherited = WRIST_SLOT(
-					WRIST_CONTEXT_DEFAULT, side);
+				const WristPlacement &dashboard =
+					kVehicleHudDefault[context == WRIST_CONTEXT_BIKE ?
+						1 : 0][panel];
 				int *field[7] = {
 					&gWristAlong[panel][slot], &gWristAcross[panel][slot],
 					&gWristLift[panel][slot], &gWristPitch[panel][slot],
@@ -785,14 +796,10 @@ LoadVrSettings(void)
 					shipped.along, shipped.across, shipped.lift,
 					shipped.pitch, shipped.yaw, shipped.roll, shipped.size
 				};
-				const int inheritedValue[7] = {
-					gWristAlong[panel][inherited],
-					gWristAcross[panel][inherited],
-					gWristLift[panel][inherited],
-					gWristPitch[panel][inherited],
-					gWristYaw[panel][inherited],
-					gWristRoll[panel][inherited],
-					gWristSize[panel][inherited]
+				const int dashboardValue[7] = {
+					dashboard.along, dashboard.across, dashboard.lift,
+					dashboard.pitch, dashboard.yaw, dashboard.roll,
+					dashboard.size
 				};
 				for(int item = 0; item < 7; item++){
 					char key[64];
@@ -803,14 +810,48 @@ LoadVrSettings(void)
 						fieldNames[item]);
 					const int fallback =
 						context == WRIST_CONTEXT_DEFAULT ?
-							shippedValue[item] : inheritedValue[item];
-					*field[item] = Min(Max((int)(int32)
-						GetPrivateProfileIntA("VR", key, fallback,
-						".\\vr_settings.ini"),
+							shippedValue[item] : dashboardValue[item];
+					// A vehicle context nobody has edited takes the
+					// shipped dashboard layout, ignoring whatever an
+					// older build left in the file for it.
+					const int loaded =
+						context != WRIST_CONTEXT_DEFAULT &&
+						!gWristContextOwned[panel][context] ?
+							fallback : (int)(int32)
+							GetPrivateProfileIntA("VR", key,
+								fallback, ".\\vr_settings.ini");
+					*field[item] = Min(Max(loaded,
 						fieldLimit[item][0]), fieldLimit[item][1]);
 				}
 			}
 		}
+	if(GetPrivateProfileIntA("VR", "VehicleHudAnchorVersion", 0,
+	     ".\\vr_settings.ini") < VEHICLE_HUD_ANCHOR_VERSION){
+		// Those values were authored around a panel that rode the hand and
+		// can leave the dashboard one behind or below the driver. Only the
+		// vehicle contexts are touched; on-foot calibration is kept.
+		for(int panel = 0; panel < WRIST_PANEL_COUNT; panel++)
+			for(int context = WRIST_CONTEXT_CAR;
+			    context < WRIST_CONTEXT_COUNT; context++){
+				const WristPlacement &dashboard =
+					kVehicleHudDefault[
+						context == WRIST_CONTEXT_BIKE ? 1 : 0][panel];
+				gWristContextOwned[panel][context] = false;
+				for(int side = 0; side < WRIST_SIDE_COUNT; side++){
+					const int slot = WRIST_SLOT(context, side);
+					gWristAlong[panel][slot] = dashboard.along;
+					gWristAcross[panel][slot] = dashboard.across;
+					gWristLift[panel][slot] = dashboard.lift;
+					gWristPitch[panel][slot] = 0;
+					gWristYaw[panel][slot] = 0;
+					gWristRoll[panel][slot] = 0;
+					gWristSize[panel][slot] = dashboard.size;
+				}
+			}
+		SaveWristPanels();
+		SaveVrInteger("VehicleHudAnchorVersion",
+			VEHICLE_HUD_ANCHOR_VERSION);
+	}
 	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 1,
 		".\\vr_settings.ini") != 0;
 	gHudClock = GetPrivateProfileIntA("VR", "HudClock", 1,
@@ -1321,6 +1362,76 @@ CurrentMenuItemCount(void)
 	}
 }
 
+// Rows that cannot do anything in the current configuration are not drawn and
+// cannot be reached: a wrist placement under CLASSIC, or a steering wheel
+// under a DEFAULT view, is a control with nothing behind it.
+static bool
+IsMenuItemVisible(int page, int item)
+{
+	if(page == VR_MENU_PAGE_HUD){
+		const int preset = CurrentHudPreset();
+		switch(item){
+		case VR_HUD_HORIZONTAL_SCALE:
+		case VR_HUD_SCALE:
+		case VR_HUD_OFFSET_X:
+		case VR_HUD_OFFSET_Y:
+		case VR_HUD_WEAPON_PANEL:
+		case VR_HUD_CLOCK:
+			return preset != VR_HUD_PRESET_IMMERSIVE;
+		case VR_HUD_WRIST_RADAR:
+		case VR_HUD_WRIST_RADAR_SIDE:
+		case VR_HUD_WRIST_RADAR_CALIBRATE:
+		case VR_HUD_WRIST_STATUS:
+		case VR_HUD_WRIST_STATUS_CALIBRATE:
+		case VR_HUD_WRIST_CLOCK:
+		case VR_HUD_WRIST_CLOCK_CALIBRATE:
+		case VR_HUD_WRIST_IN_VEHICLE:
+			return preset != VR_HUD_PRESET_CLASSIC;
+		}
+		return true;
+	}
+	if(page == VR_MENU_PAGE_WRIST_RADAR){
+		if(gVrWristContextEdit == WRIST_CONTEXT_DEFAULT)
+			return true;
+		// A vehicle panel is bolted to the control centre. Its hand, the
+		// wrist side it is worn on and the panel rotations have nothing to
+		// act on there.
+		switch(item){
+		case VR_WRIST_CONTEXT:
+		case VR_WRIST_ALONG:
+		case VR_WRIST_ACROSS:
+		case VR_WRIST_LIFT:
+		case VR_WRIST_SIZE:
+		case VR_WRIST_RESET:
+		case VR_WRIST_BACK:
+			return true;
+		}
+		return false;
+	}
+	if(page == VR_MENU_PAGE_VEHICLE){
+		const bool thirdPerson = OculusVR::IsQuestVehicleThirdPerson();
+		const bool carDriven =
+			!thirdPerson && !OculusVR::IsQuestCarDrivingDefault();
+		const bool bikeDriven =
+			!thirdPerson && !OculusVR::IsQuestBikeDrivingDefault();
+		switch(item){
+		case VR_VEHICLE_WHEEL_VISIBLE:
+		case VR_VEHICLE_MODEL_WHEEL_VISIBLE:
+		case VR_VEHICLE_WHEEL_HAND_PULL_BACK:
+			return carDriven;
+		case VR_VEHICLE_HANDLE_HIGHLIGHTS:
+		case VR_VEHICLE_BIKE_LOCK_HORIZON:
+		case VR_VEHICLE_BIKE_THROTTLE:
+			return bikeDriven;
+		case VR_VEHICLE_MOTION_HAND:
+		case VR_VEHICLE_CALIBRATION:
+			return carDriven || bikeDriven;
+		}
+		return true;
+	}
+	return true;
+}
+
 static bool
 CurrentMenuValueRepeats(void)
 {
@@ -1537,9 +1648,14 @@ VrDebugUpdate(const PadInput &in)
 		}
 		const int itemCount = CurrentMenuItemCount();
 		const int navigationPulse = MenuNavigationPulse(in.leftStickY, now);
-		if(navigationPulse != 0){
+		if(navigationPulse != 0 && itemCount > 0){
 			int *selection = CurrentMenuSelection();
-			*selection = (*selection+navigationPulse+itemCount)%itemCount;
+			int guard = itemCount;
+			do{
+				*selection =
+					(*selection+navigationPulse+itemCount)%itemCount;
+			}while(!IsMenuItemVisible(gVrMenuPage, *selection) &&
+			       --guard > 0);
 		}
 		const bool cheatCycle = gVrMenuPage == VR_MENU_PAGE_CHEATS &&
 			(Abs(in.leftStickX) >= 0.65f);
@@ -2055,6 +2171,9 @@ VrDebugUpdate(const PadInput &in)
 				break;
 			case VR_VEHICLE_BIKE_LOCK_HORIZON:
 				OculusVR::ToggleQuestBikeHorizonLock();
+				break;
+			case VR_VEHICLE_BIKE_THROTTLE:
+				OculusVR::ToggleQuestBikeManualThrottle();
 				break;
 			case VR_VEHICLE_CALIBRATION:
 				if(OculusVR::IsQuestVehicleCalibrationAvailable()){
@@ -2694,9 +2813,13 @@ DrawQuestHudPage(void)
 	snprintf(rows[VR_HUD_CLOCK], sizeof(rows[0]),
 		"CLOCK  < %s >", gHudClock ? "ON" : "OFF");
 	strcpy(rows[VR_HUD_BACK], "BACK TO SETTINGS");
-	for(int item = 0; item < VR_HUD_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 146+item*33, 3,
+	int visibleRow = 0;
+	for(int item = 0; item < VR_HUD_ITEM_COUNT; item++){
+		if(!IsMenuItemVisible(VR_MENU_PAGE_HUD, item))
+			continue;
+		DrawFullVrMenuRow(rows[item], 146+visibleRow++*33, 3,
 			item == gVrHudSelection);
+	}
 	DrawVrMenuText(
 		"LEFT STICK SELECT   L2 MINUS   R2 OR A PLUS   B BACK",
 		VR_MENU_WIDTH/2, 718, 2, 170, 190, 210);
@@ -2755,10 +2878,14 @@ DrawQuestWristRadarPage(void)
 	else
 		strcpy(rows[VR_WRIST_RESET], "GO BACK TO THE ON FOOT PLACEMENT");
 	strcpy(rows[VR_WRIST_BACK], "BACK TO HUD SETTINGS");
-	for(int item = 0; item < VR_WRIST_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 148+item*42, 3,
+	int visibleRow = 0;
+	for(int item = 0; item < VR_WRIST_ITEM_COUNT; item++){
+		if(!IsMenuItemVisible(VR_MENU_PAGE_WRIST_RADAR, item))
+			continue;
+		DrawFullVrMenuRow(rows[item], 148+visibleRow++*42, 3,
 			item == gVrWristRadarSelection,
 			item <= VR_WRIST_HAND || gWristPanelOn[panel]);
+	}
 	if(!gWristPanelOn[panel])
 		DrawVrMenuText("THIS PANEL IS OFF - TURN IT ON IN HUD SETTINGS",
 			VR_MENU_WIDTH/2, 690, 2, 245, 205, 90);
@@ -2848,12 +2975,19 @@ DrawQuestVehiclePage(void)
 	snprintf(rows[VR_VEHICLE_BIKE_LOCK_HORIZON], sizeof(rows[0]),
 		"BIKE LOCK HORIZON  < %s >",
 		OculusVR::IsQuestBikeHorizonLocked() ? "ON" : "OFF");
+	snprintf(rows[VR_VEHICLE_BIKE_THROTTLE], sizeof(rows[0]),
+		"BIKE THROTTLE  < %s >",
+		OculusVR::IsQuestBikeManualThrottle() ?
+			"WRIST TWIST" : "RIGHT TRIGGER");
 	snprintf(rows[VR_VEHICLE_CALIBRATION], sizeof(rows[0]),
 		"CONTROL CALIBRATION  < %s >",
 		OculusVR::IsQuestVehicleCalibrationAvailable() ?
 			"OPEN" : "ENTER VEHICLE");
 	strcpy(rows[VR_VEHICLE_BACK], "BACK TO SETTINGS");
+	int visibleRow = 0;
 	for(int item = 0; item < VR_VEHICLE_ITEM_COUNT; item++){
+		if(!IsMenuItemVisible(VR_MENU_PAGE_VEHICLE, item))
+			continue;
 		bool available = true;
 		// The third-person view has no seat and nothing to reach for, so
 		// every cockpit control is greyed out instead of silently doing
@@ -2868,7 +3002,7 @@ DrawQuestVehiclePage(void)
 		        item <= VR_VEHICLE_MODEL_SEAT_FORWARD)
 			available = OculusVR::HasQuestVehicleSeatCalibrationTarget() &&
 				!OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
-		DrawFullVrMenuRow(rows[item], 158+item*32, 2,
+		DrawFullVrMenuRow(rows[item], 158+visibleRow++*32, 2,
 			item == gVrVehicleSelection, available);
 	}
 	DrawVrMenuText("VALUES ARE SAVED IN VR SETTINGS",

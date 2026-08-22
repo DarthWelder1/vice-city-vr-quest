@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.2 RC8"
+#define MIAMIVR_VERSION_TEXT "0.5.2"
 
 namespace OculusVR
 {
@@ -133,6 +133,12 @@ bool GetTrackedVisualHandAimRay(int hand, CVector *origin,
 	CVector *direction);
 #endif
 bool IsImmersiveDrivingActive();
+bool IsQuestBikeManualThrottle();
+void ToggleQuestBikeManualThrottle();
+bool IsQuestCarDrivingDefault();
+bool IsQuestBikeDrivingDefault();
+// Neutral control centre of the vehicle being driven, for the dashboard HUD.
+bool GetQuestVehicleHudAnchor(CMatrix *matrix);
 bool IsImmersiveCarDrivingActive();
 bool IsImmersiveBikeDrivingActive();
 bool IsVrCarDrivingActive();
