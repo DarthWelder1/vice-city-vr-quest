@@ -484,6 +484,9 @@ enum eVrVehicleMenuItem {
 	VR_VEHICLE_HANDLE_HIGHLIGHTS,
 	VR_VEHICLE_BIKE_LOCK_HORIZON,
 	VR_VEHICLE_BIKE_THROTTLE,
+	VR_VEHICLE_BIKE_VISUAL_LEAN,
+	VR_VEHICLE_BIKE_VIEW_TILT,
+	VR_VEHICLE_BIKE_THROW_RIDER,
 	VR_VEHICLE_CALIBRATION,
 	VR_VEHICLE_BACK,
 	VR_VEHICLE_ITEM_COUNT
@@ -745,25 +748,25 @@ LoadVrSettings(void)
 	CShadows::SetRenderEnabled(GetPrivateProfileIntA("VR", "ShadowsEnabled",
 		1, ".\\vr_settings.ini") != 0);
 	gWristPanelOn[WRIST_PANEL_MAP] = GetPrivateProfileIntA("VR",
-		"WristRadar", 0, ".\\vr_settings.ini") != 0;
+		"WristRadar", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelUnderside[WRIST_PANEL_MAP] = GetPrivateProfileIntA("VR",
 		"WristRadarUnderside", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelHand[WRIST_PANEL_MAP] = GetPrivateProfileIntA("VR",
 		"WristRadarHand", 0, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	gWristPanelOn[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
-		"WristStatus", 0, ".\\vr_settings.ini") != 0;
+		"WristStatus", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelUnderside[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
 		"WristStatusUnderside", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelHand[WRIST_PANEL_STATUS] = GetPrivateProfileIntA("VR",
 		"WristStatusHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	gWristPanelOn[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
-		"WristClock", 0, ".\\vr_settings.ini") != 0;
+		"WristClock", 1, ".\\vr_settings.ini") != 0;
 	gWristPanelUnderside[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
 		"WristClockUnderside", 0, ".\\vr_settings.ini") != 0;
 	gWristPanelHand[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
 		"WristClockHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	gWristPanelsInVehicle = GetPrivateProfileIntA("VR",
-		"WristPanelsInVehicle", 0, ".\\vr_settings.ini") != 0;
+		"WristPanelsInVehicle", 1, ".\\vr_settings.ini") != 0;
 	static const char *const fieldNames[7] = {
 		"Along", "Across", "Lift", "Pitch", "Yaw", "Roll", "Size"
 	};
@@ -852,9 +855,11 @@ LoadVrSettings(void)
 		SaveVrInteger("VehicleHudAnchorVersion",
 			VEHICLE_HUD_ANCHOR_VERSION);
 	}
-	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 1,
+	// The arms carry the interface out of the box. Both corner panels belong
+	// to the CLASSIC preset, which is one row away on the HUD page.
+	gHudWeaponPanel = GetPrivateProfileIntA("VR", "HudWeaponPanel", 0,
 		".\\vr_settings.ini") != 0;
-	gHudClock = GetPrivateProfileIntA("VR", "HudClock", 1,
+	gHudClock = GetPrivateProfileIntA("VR", "HudClock", 0,
 		".\\vr_settings.ini") != 0;
 	gGameplayHudEnabled =
 		GetPrivateProfileIntA("VR", "GameplayHud", 1,
@@ -1422,10 +1427,23 @@ IsMenuItemVisible(int page, int item)
 		case VR_VEHICLE_HANDLE_HIGHLIGHTS:
 		case VR_VEHICLE_BIKE_LOCK_HORIZON:
 		case VR_VEHICLE_BIKE_THROTTLE:
+		case VR_VEHICLE_BIKE_VISUAL_LEAN:
+		case VR_VEHICLE_BIKE_VIEW_TILT:
+		case VR_VEHICLE_BIKE_THROW_RIDER:
 			return bikeDriven;
 		case VR_VEHICLE_MOTION_HAND:
 		case VR_VEHICLE_CALIBRATION:
 			return carDriven || bikeDriven;
+		case VR_VEHICLE_DEFAULT_SEAT_HEIGHT:
+		case VR_VEHICLE_DEFAULT_SEAT_FORWARD:
+			return OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
+		case VR_VEHICLE_GLOBAL_SEAT_HEIGHT:
+		case VR_VEHICLE_GLOBAL_SEAT_FORWARD:
+			return OculusVR::HasQuestVehicleSeatCalibrationTarget() &&
+				!OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
+		case VR_VEHICLE_MODEL_SEAT_HEIGHT:
+		case VR_VEHICLE_MODEL_SEAT_FORWARD:
+			return OculusVR::HasQuestVehicleSeatCalibrationTarget();
 		}
 		return true;
 	}
@@ -2145,14 +2163,12 @@ VrDebugUpdate(const PadInput &in)
 						direction*repeatMagnitude);
 				break;
 			case VR_VEHICLE_MODEL_SEAT_HEIGHT:
-				if(!OculusVR::HasQuestDefaultVehicleViewOffsetTarget())
-					OculusVR::AdjustQuestVehicleModelSeatHeightCm(
-						direction*repeatMagnitude);
+				OculusVR::AdjustQuestVehicleModelSeatHeightCm(
+					direction*repeatMagnitude);
 				break;
 			case VR_VEHICLE_MODEL_SEAT_FORWARD:
-				if(!OculusVR::HasQuestDefaultVehicleViewOffsetTarget())
-					OculusVR::AdjustQuestVehicleModelSeatDistanceCm(
-						direction*repeatMagnitude);
+				OculusVR::AdjustQuestVehicleModelSeatDistanceCm(
+					direction*repeatMagnitude);
 				break;
 			case VR_VEHICLE_MOTION_HAND:
 				OculusVR::ToggleQuestMotionSteeringHand();
@@ -2174,6 +2190,15 @@ VrDebugUpdate(const PadInput &in)
 				break;
 			case VR_VEHICLE_BIKE_THROTTLE:
 				OculusVR::ToggleQuestBikeManualThrottle();
+				break;
+			case VR_VEHICLE_BIKE_VISUAL_LEAN:
+				OculusVR::AdjustQuestBikeVisualLeanPercent(direction);
+				break;
+			case VR_VEHICLE_BIKE_VIEW_TILT:
+				OculusVR::ToggleQuestBikeViewFollowsTilt();
+				break;
+			case VR_VEHICLE_BIKE_THROW_RIDER:
+				OculusVR::ToggleQuestBikeRiderCanBeThrown();
 				break;
 			case VR_VEHICLE_CALIBRATION:
 				if(OculusVR::IsQuestVehicleCalibrationAvailable()){
@@ -2416,6 +2441,52 @@ VrDebugUpdate(const PadInput &in)
 }
 
 static void
+QuestMainCategoryColour(int item, uint8 *red, uint8 *green, uint8 *blue)
+{
+	static const uint8 colours[VR_MAIN_ITEM_COUNT][3] = {
+		{100,225,255}, {125,255,145}, {255,205,90},
+		{190,145,255}, {255,155,90}, {90,220,210},
+		{145,200,255}, {255,120,205}, {240,180,105},
+		{255,105,105}, {170,190,210}
+	};
+	*red = colours[item][0]; *green = colours[item][1];
+	*blue = colours[item][2];
+}
+
+// A submenu wears the colour its category has on the settings page, and the
+// pages opened from a submenu keep their parent's, so the palette says where
+// the player is without reading the heading.
+static void
+QuestMenuPageColour(uint8 *red, uint8 *green, uint8 *blue)
+{
+	int category = -1;
+	switch(gVrMenuPage){
+	case VR_MENU_PAGE_GRAPHICS: category = VR_MAIN_GRAPHICS; break;
+	case VR_MENU_PAGE_TRAFFIC: category = VR_MAIN_TRAFFIC_SETTINGS; break;
+	case VR_MENU_PAGE_HUD:
+	case VR_MENU_PAGE_WRIST_RADAR: category = VR_MAIN_HUD; break;
+	case VR_MENU_PAGE_MODEL_ASSETS: category = VR_MAIN_MODEL_ASSETS; break;
+	case VR_MENU_PAGE_VEHICLE:
+	case VR_MENU_PAGE_VEHICLE_CALIBRATION:
+		category = VR_MAIN_VEHICLE_SETTINGS; break;
+	case VR_MENU_PAGE_LOCOMOTION:
+		category = VR_MAIN_LOCOMOTION_SETTINGS; break;
+	case VR_MENU_PAGE_CONTROLS: category = VR_MAIN_CONTROLS; break;
+	case VR_MENU_PAGE_WEAPONS:
+	case VR_MENU_PAGE_CALIBRATION: category = VR_MAIN_WEAPONS; break;
+	case VR_MENU_PAGE_HOLSTERS: category = VR_MAIN_HOLSTERS; break;
+	case VR_MENU_PAGE_CHEATS:
+	case VR_MENU_PAGE_MISSIONS: category = VR_MAIN_CHEATS; break;
+	case VR_MENU_PAGE_ABOUT: category = VR_MAIN_ABOUT; break;
+	}
+	if(category < 0){
+		*red = 100; *green = 225; *blue = 255;
+		return;
+	}
+	QuestMainCategoryColour(category, red, green, blue);
+}
+
+static void
 BeginFullVrMenuPage(const char *heading, const char *subtitle = nil)
 {
 	FillVrMenuRect(0, 0, VR_MENU_WIDTH, VR_MENU_HEIGHT,
@@ -2424,8 +2495,9 @@ BeginFullVrMenuPage(const char *heading, const char *subtitle = nil)
 		10, 22, 38, 245);
 	DrawVrMenuText("VICE CITY VR", VR_MENU_WIDTH/2, 55, 7,
 		255, 120, 205);
-	DrawVrMenuText(heading, VR_MENU_WIDTH/2, 112, 4,
-		100, 225, 255);
+	uint8 red, green, blue;
+	QuestMenuPageColour(&red, &green, &blue);
+	DrawVrMenuText(heading, VR_MENU_WIDTH/2, 112, 4, red, green, blue);
 	if(subtitle && subtitle[0] != '\0')
 		DrawVrMenuText(subtitle, VR_MENU_WIDTH/2, 146, 2,
 			170, 190, 210);
@@ -2442,6 +2514,12 @@ DrawFullVrMenuRow(const char *text, int y, int scale, bool selected,
 			warning ? 125 : (positive ? 20 : (available ? 25 : 55)),
 			warning ? 35 : (positive ? 105 : (available ? 95 : 62)),
 			warning ? 30 : (positive ? 60 : (available ? 135 : 72)), 245);
+	if(!warning && !positive && !selected && available){
+		uint8 red, green, blue;
+		QuestMenuPageColour(&red, &green, &blue);
+		DrawVrMenuText(text, VR_MENU_WIDTH/2, y, scale, red, green, blue);
+		return;
+	}
 	DrawVrMenuText(text, VR_MENU_WIDTH/2, y, scale,
 		warning ? 255 : (positive ? (selected ? 210 : 105) :
 			(selected ? 255 : (available ? 205 : 120))),
@@ -2451,19 +2529,6 @@ DrawFullVrMenuRow(const char *text, int y, int scale, bool selected,
 		warning ? (selected ? 120 : 95) :
 			(positive ? 145 : (selected ? (available ? 110 : 130) :
 			 (available ? 225 : 145))));
-}
-
-static void
-QuestMainCategoryColour(int item, uint8 *red, uint8 *green, uint8 *blue)
-{
-	static const uint8 colours[VR_MAIN_ITEM_COUNT][3] = {
-		{100,225,255}, {125,255,145}, {255,205,90},
-		{190,145,255}, {255,155,90}, {90,220,210},
-		{145,200,255}, {255,120,205}, {240,180,105},
-		{255,105,105}, {170,190,210}
-	};
-	*red = colours[item][0]; *green = colours[item][1];
-	*blue = colours[item][2];
 }
 
 static void
@@ -2945,10 +3010,12 @@ DrawQuestVehiclePage(void)
 			"GLOBAL HEIGHT  < IMMERSIVE / MOTION ONLY >");
 		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_FORWARD],
 			"GLOBAL FORWARD  < IMMERSIVE / MOTION ONLY >");
-		strcpy(rows[VR_VEHICLE_MODEL_SEAT_HEIGHT],
-			"MODEL HEIGHT  < IMMERSIVE / MOTION ONLY >");
-		strcpy(rows[VR_VEHICLE_MODEL_SEAT_FORWARD],
-			"MODEL FORWARD  < IMMERSIVE / MOTION ONLY >");
+		snprintf(rows[VR_VEHICLE_MODEL_SEAT_HEIGHT], sizeof(rows[0]),
+			"MODEL HEIGHT  < %+d CM >",
+			OculusVR::GetQuestVehicleModelSeatHeightCm());
+		snprintf(rows[VR_VEHICLE_MODEL_SEAT_FORWARD], sizeof(rows[0]),
+			"MODEL FORWARD  < %+d CM >",
+			OculusVR::GetQuestVehicleModelSeatDistanceCm());
 	}else{
 		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_HEIGHT], "GLOBAL HEIGHT  < ENTER VEHICLE >");
 		strcpy(rows[VR_VEHICLE_GLOBAL_SEAT_FORWARD], "GLOBAL FORWARD  < ENTER VEHICLE >");
@@ -2979,6 +3046,15 @@ DrawQuestVehiclePage(void)
 		"BIKE THROTTLE  < %s >",
 		OculusVR::IsQuestBikeManualThrottle() ?
 			"WRIST TWIST" : "RIGHT TRIGGER");
+	snprintf(rows[VR_VEHICLE_BIKE_VISUAL_LEAN], sizeof(rows[0]),
+		"BIKE LEAN SHOWN  < %d%% >",
+		OculusVR::GetQuestBikeVisualLeanPercent());
+	snprintf(rows[VR_VEHICLE_BIKE_VIEW_TILT], sizeof(rows[0]),
+		"BIKE VIEW FOLLOWS TILT  < %s >",
+		OculusVR::IsQuestBikeViewFollowingTilt() ? "ON" : "OFF");
+	snprintf(rows[VR_VEHICLE_BIKE_THROW_RIDER], sizeof(rows[0]),
+		"THROWN OFF ON A CRASH  < %s >",
+		OculusVR::CanQuestBikeRiderBeThrown() ? "ON" : "OFF");
 	snprintf(rows[VR_VEHICLE_CALIBRATION], sizeof(rows[0]),
 		"CONTROL CALIBRATION  < %s >",
 		OculusVR::IsQuestVehicleCalibrationAvailable() ?
@@ -2988,22 +3064,12 @@ DrawQuestVehiclePage(void)
 	for(int item = 0; item < VR_VEHICLE_ITEM_COUNT; item++){
 		if(!IsMenuItemVisible(VR_MENU_PAGE_VEHICLE, item))
 			continue;
-		bool available = true;
-		// The third-person view has no seat and nothing to reach for, so
-		// every cockpit control is greyed out instead of silently doing
-		// nothing. Only the view switch itself and BACK stay live.
-		if(thirdPersonView && item != VR_VEHICLE_THIRD_PERSON &&
-		   item != VR_VEHICLE_BACK)
-			available = false;
-		else if(item >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
-		   item <= VR_VEHICLE_DEFAULT_SEAT_FORWARD)
-			available = OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
-		else if(item >= VR_VEHICLE_GLOBAL_SEAT_HEIGHT &&
-		        item <= VR_VEHICLE_MODEL_SEAT_FORWARD)
-			available = OculusVR::HasQuestVehicleSeatCalibrationTarget() &&
-				!OculusVR::HasQuestDefaultVehicleViewOffsetTarget();
+		// Which control the bike takes its throttle from decides whether the
+		// thing moves at all, and it is the first row a new rider comes
+		// looking for. It is marked so it can be found without reading.
 		DrawFullVrMenuRow(rows[item], 158+visibleRow++*32, 2,
-			item == gVrVehicleSelection, available);
+			item == gVrVehicleSelection, true,
+			item == VR_VEHICLE_BIKE_THROTTLE);
 	}
 	DrawVrMenuText("VALUES ARE SAVED IN VR SETTINGS",
 		VR_MENU_WIDTH/2, 694, 2, 125, 255, 145);

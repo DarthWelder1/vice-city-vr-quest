@@ -87,6 +87,11 @@ struct VehicleViewCalibration
 {
 	int seatDistanceCm;
 	int seatHeightCm;
+	// DEFAULT driving keeps its own per-model height. The physical seat
+	// above belongs to the immersive layers, where the eye sits behind a
+	// wheel the player is holding; the two are not the same measurement.
+	int defaultSeatHeightCm;
+	int defaultSeatDistanceCm;
 	int wheelCenterXCm, wheelCenterYCm, wheelCenterZCm;
 	int carWheelRadiusCm;
 	int wheelRadiusCm;
@@ -95,6 +100,7 @@ struct VehicleViewCalibration
 	bool valid;
 
 	VehicleViewCalibration() : seatDistanceCm(0), seatHeightCm(0),
+		defaultSeatHeightCm(0), defaultSeatDistanceCm(0),
 		wheelCenterXCm(0), wheelCenterYCm(0), wheelCenterZCm(0),
 		carWheelRadiusCm(0), wheelRadiusCm(0),
 		carWheelPitchHalfDeg(0), carWheelYawHalfDeg(0),
@@ -185,6 +191,32 @@ static float gImmersiveBikeThrottle;
 // the bar while the wrist turns. Off by default, the trigger drives the bike
 // the way it drives a car.
 static int gBikeManualThrottle;
+// A bike leans far enough in the stock game that a rider whose hands are
+// pinned to the bars is thrown sideways with it. The physical lean is left
+// alone; only what is drawn -- model, camera, rider and the bars the hands
+// hold -- uses this fraction of it.
+static int gBikeVisualLeanPercent = 50;
+// A bike carries every bump into the view through its own pitch and roll.
+// With this off the seat keeps only the bike's heading and the horizon stays
+// where the room is, which is the difference between riding and being shaken.
+static int gBikeViewFollowsTilt;
+// Landing a jump badly throws the rider off, as it does on a pad. It can read
+// as a crash rather than a stunt in a headset, so it can be switched off.
+static int gBikeRiderCanBeThrown = 1;
+// How far the throttle is open, as road speed against the model's own top
+// speed. The rider reads the bike's pace off his own wrist instead of a
+// dial, which is the only instrument a motorcycle in this game has.
+static float
+BikeThrottleVisual(CBike *bike)
+{
+	if(!bike || gBikeManualThrottle || bike->pHandling == nil)
+		return 0.0f;
+	const float maximum = bike->pHandling->Transmission.fMaxVelocity;
+	if(!(maximum > 0.01f))
+		return 0.0f;
+	return clamp(bike->m_vecMoveSpeed.Magnitude2D()/maximum, 0.0f, 1.0f);
+}
+
 static float gImmersiveBikeLean;
 static bool gBikeThrottleGestureActive;
 static bool gBikeThrottleReferenceValid;
@@ -286,7 +318,7 @@ LoadDrivingSettings()
 		legacyDrivingType = atoi(drivingType);
 	else
 		legacyDrivingType =
-			GetPrivateProfileIntA("VR", "ImmersiveDriving", 0,
+			GetPrivateProfileIntA("VR", "ImmersiveDriving", 1,
 				kSettingsPath) != 0 ?
 				VR_DRIVING_IMMERSIVE : VR_DRIVING_DEFAULT;
 	legacyDrivingType = clamp(legacyDrivingType, (int)VR_DRIVING_DEFAULT,
@@ -301,11 +333,17 @@ LoadDrivingSettings()
 		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
 	gBikeManualThrottle = GetPrivateProfileIntA("VR",
 		"ImmersiveBikeManualThrottle", 0, kSettingsPath) != 0 ? 1 : 0;
+	gBikeVisualLeanPercent = clamp((int)(int32)GetPrivateProfileIntA(
+		"VR", "BikeVisualLeanPercent", 50, kSettingsPath), 25, 100);
+	gBikeViewFollowsTilt = GetPrivateProfileIntA("VR",
+		"BikeViewFollowsTilt", 0, kSettingsPath) != 0 ? 1 : 0;
+	gBikeRiderCanBeThrown = GetPrivateProfileIntA("VR",
+		"BikeRiderCanBeThrown", 1, kSettingsPath) != 0 ? 1 : 0;
 	gMotionSteeringHand = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "MotionSteeringHand", 1, kSettingsPath), 0,
 		VR_HAND_COUNT-1);
 	gHandleHighlightsEnabled = GetPrivateProfileIntA(
-		"VR", "BikeHandleHighlights", 0, kSettingsPath) != 0;
+		"VR", "BikeHandleHighlights", 1, kSettingsPath) != 0;
 	gBikeHorizonLocked = GetPrivateProfileIntA(
 		"VR", "BikeLockHorizon", 1, kSettingsPath) != 0;
 	gVehicleThirdPerson = GetPrivateProfileIntA(
@@ -854,6 +892,8 @@ GetDefaultViewCalibration(int model)
 {
 	VehicleViewCalibration calibration;
 	calibration.seatDistanceCm = model == MI_SANCHEZ ? -23 : 0;
+	// Tuned in the headset: the DEFAULT view rides too high on the Sanchez.
+	calibration.defaultSeatHeightCm = model == MI_SANCHEZ ? -32 : 0;
 	const ModelSets::eModelSet set = ModelSets::GetActiveForCategory(
 		ModelSets::MODEL_CATEGORY_VEHICLES);
 	const BuiltInVehicleViewDefaults *found = nil;
@@ -909,6 +949,12 @@ GetViewCalibration(int model)
 		"SeatDistanceCm", defaults.seatDistanceCm), -100, 100);
 	calibration.seatHeightCm = clamp(ReadViewValue(model,
 		"SeatHeightCm", defaults.seatHeightCm), -100, 100);
+	calibration.defaultSeatHeightCm = clamp(ReadViewValue(model,
+		"DefaultSeatHeightCm", defaults.defaultSeatHeightCm),
+		-100, 100);
+	calibration.defaultSeatDistanceCm = clamp(ReadViewValue(model,
+		"DefaultSeatDistanceCm", defaults.defaultSeatDistanceCm),
+		-100, 100);
 	calibration.wheelCenterXCm = clamp(ReadViewValue(model,
 		"WheelCenterXCm", defaults.wheelCenterXCm), -100, 100);
 	calibration.wheelCenterYCm = clamp(ReadViewValue(model,
@@ -1057,9 +1103,13 @@ BuildBikeHandlePose(CBike *bike, BikeHandlePose *pose)
 {
 	if(!bike || !pose)
 		return false;
-	pose->right = bike->GetRight();
-	pose->forward = bike->GetForward();
-	pose->up = bike->GetUp();
+	// The bars are drawn on the leaned chassis, so the frame the hands are
+	// pinned to has to be the leaned one. Taking the upright body basis here
+	// is what left the hands hanging beside the bike through every corner.
+	bike->CalculateLeanMatrix();
+	pose->right = bike->m_leanMatrix.GetRight();
+	pose->forward = bike->m_leanMatrix.GetForward();
+	pose->up = bike->m_leanMatrix.GetUp();
 	if(pose->right.MagnitudeSqr() < 0.0001f ||
 	   pose->forward.MagnitudeSqr() < 0.0001f ||
 	   pose->up.MagnitudeSqr() < 0.0001f)
@@ -1073,6 +1123,37 @@ BuildBikeHandlePose(CBike *bike, BikeHandlePose *pose)
 		if(handle)
 			pose->center = CVector(handle->pos);
 	}
+	CVector controlCenterOffset;
+	GetVehicleControlAdjustment(bike, &controlCenterOffset, nil);
+	pose->center += pose->right*controlCenterOffset.x+
+		pose->forward*controlCenterOffset.y+
+		pose->up*controlCenterOffset.z;
+	return true;
+}
+
+// The handlebars are not simply yawed: PreRender turns them by -m_fWheelAngle
+// about the model's raked fork axis, and the node also carries the lean and
+// the front suspension. Rebuilding that from the body basis leaves the hands
+// beside the grips, so read the frame the game has already posed.
+static bool
+BuildDrawnBikeHandlePose(CBike *bike, BikeHandlePose *pose)
+{
+	if(!bike || !pose || bike->m_aBikeNodes[BIKE_HANDLEBARS] == nil)
+		return false;
+	RwMatrix *handle = RwFrameGetLTM(bike->m_aBikeNodes[BIKE_HANDLEBARS]);
+	if(handle == nil)
+		return false;
+	pose->right = CVector(handle->right.x, handle->right.y, handle->right.z);
+	pose->forward = CVector(handle->up.x, handle->up.y, handle->up.z);
+	pose->up = CVector(handle->at.x, handle->at.y, handle->at.z);
+	pose->center = CVector(handle->pos.x, handle->pos.y, handle->pos.z);
+	if(pose->right.MagnitudeSqr() < 0.0001f ||
+	   pose->forward.MagnitudeSqr() < 0.0001f ||
+	   pose->up.MagnitudeSqr() < 0.0001f)
+		return false;
+	pose->right.Normalise();
+	pose->forward.Normalise();
+	pose->up.Normalise();
 	CVector controlCenterOffset;
 	GetVehicleControlAdjustment(bike, &controlCenterOffset, nil);
 	pose->center += pose->right*controlCenterOffset.x+
@@ -1095,6 +1176,10 @@ BuildBikeHandleMatrix(int hand, CMatrix *matrix, bool applySteering)
 	BikeHandlePose pose;
 	if(!BuildBikeHandlePose(bike, &pose))
 		return false;
+	// The neutral frame stays the reference for anything that must not swing
+	// with the bars, the dashboard HUD above all. The hands take the drawn one.
+	const bool onDrawnBars =
+		applySteering && BuildDrawnBikeHandlePose(bike, &pose);
 	float controlRadiusOffset = 0.0f;
 	GetVehicleControlAdjustment(bike, nil, &controlRadiusOffset);
 	matrix->SetUnity();
@@ -1113,7 +1198,7 @@ BuildBikeHandleMatrix(int hand, CMatrix *matrix, bool applySteering)
 	ApplyHandleRotation(matrix, *calibration);
 	const float steeringAngle = IsImmersiveBikeActive(bike) ?
 		gImmersiveBikePhysicalAngle : bike->m_fWheelAngle;
-	if(applySteering && steeringAngle != 0.0f){
+	if(applySteering && !onDrawnBars && steeringAngle != 0.0f){
 		matrix->GetPosition() = pose.center+RotateAroundAxis(
 			matrix->GetPosition()-pose.center, pose.up, steeringAngle);
 		matrix->GetRight() = RotateAroundAxis(
@@ -1122,6 +1207,20 @@ BuildBikeHandleMatrix(int hand, CMatrix *matrix, bool applySteering)
 			matrix->GetForward(), pose.up, steeringAngle);
 		matrix->GetUp() = RotateAroundAxis(
 			matrix->GetUp(), pose.up, steeringAngle);
+	}
+	if(hand == 1){
+		// The throttle hand turns with road speed, over the same travel the
+		// physical twist uses and about the axis that solver measures. It is
+		// the rendered wrist only; the accelerator is still the trigger.
+		const float twist = BikeThrottleVisual(bike)*DEGTORAD(43.0f);
+		if(twist > 0.0f){
+			// Opening the throttle rolls the wrist back towards the
+			// rider, which is the negative direction about this axis.
+			matrix->GetRight() = RotateAroundAxis(
+				matrix->GetRight(), matrix->GetForward(), -twist);
+			matrix->GetUp() = RotateAroundAxis(
+				matrix->GetUp(), matrix->GetForward(), -twist);
+		}
 	}
 	return true;
 }
@@ -2310,6 +2409,61 @@ UpdateImmersiveCarModelSteeringWheel(CVehicle *vehicle)
 
 bool IsImmersiveDrivingActive() { return IsVrDrivingActive(); }
 
+float
+QuestBikeVisualLeanScale(CVehicle *vehicle)
+{
+	LoadDrivingSettings();
+	if(!vehicle || !vehicle->IsBike() || !IsVrBikeActive((CBike*)vehicle))
+		return 1.0f;
+	return (float)gBikeVisualLeanPercent/100.0f;
+}
+
+bool
+IsQuestBikeViewFollowingTilt()
+{
+	LoadDrivingSettings();
+	return gBikeViewFollowsTilt != 0;
+}
+
+void
+ToggleQuestBikeViewFollowsTilt()
+{
+	LoadDrivingSettings();
+	gBikeViewFollowsTilt = gBikeViewFollowsTilt ? 0 : 1;
+	SaveSetting("BikeViewFollowsTilt", gBikeViewFollowsTilt);
+}
+
+bool
+CanQuestBikeRiderBeThrown()
+{
+	LoadDrivingSettings();
+	return gBikeRiderCanBeThrown != 0;
+}
+
+void
+ToggleQuestBikeRiderCanBeThrown()
+{
+	LoadDrivingSettings();
+	gBikeRiderCanBeThrown = gBikeRiderCanBeThrown ? 0 : 1;
+	SaveSetting("BikeRiderCanBeThrown", gBikeRiderCanBeThrown);
+}
+
+int
+GetQuestBikeVisualLeanPercent()
+{
+	LoadDrivingSettings();
+	return gBikeVisualLeanPercent;
+}
+
+void
+AdjustQuestBikeVisualLeanPercent(int direction)
+{
+	LoadDrivingSettings();
+	gBikeVisualLeanPercent = clamp(gBikeVisualLeanPercent+
+		(direction < 0 ? -5 : 5), 25, 100);
+	SaveSetting("BikeVisualLeanPercent", gBikeVisualLeanPercent);
+}
+
 bool
 IsQuestBikeManualThrottle()
 {
@@ -2434,6 +2588,21 @@ GetImmersiveBikeSteering(CVehicle *bike, float *steering)
 	return false;
 }
 
+// The angle the rider has actually turned the bars through. The fork carries
+// the front wheel angle, which is a couple of degrees; this is the one his
+// hands are holding.
+bool
+GetQuestBikeVisualSteerAngle(CVehicle *bike, float *angle)
+{
+	if(!angle || !IsImmersiveBikeActive(bike))
+		return false;
+	if(!isfinite(gImmersiveBikePhysicalAngle) ||
+	   Abs(gImmersiveBikePhysicalAngle) < 0.00001f)
+		return false;
+	*angle = gImmersiveBikePhysicalAngle;
+	return true;
+}
+
 bool
 GetImmersiveBikeThrottle(CVehicle *bike, float *throttle)
 {
@@ -2467,15 +2636,18 @@ IsImmersiveBikeHandleGrabbed(int hand)
 		IsImmersiveBikeActive() && gBikeHandleGrabbed[hand];
 }
 
+// The highlight is an instruction, not decoration: players who do not know
+// the bars have to be taken hold of never find out otherwise. It goes out
+// for the hand that has taken hold, so a rider who knows sees nothing.
+// Calibration keeps both lit, since that is what is being aimed at.
 bool
 ShouldRenderImmersiveBikeHandleMarker(int hand)
 {
-	return hand >= 0 && hand < VR_HAND_COUNT &&
-		IsImmersiveBikeActive() &&
-		(gCalibrationPreview ||
-		 (gHandleHighlightsEnabled &&
-		  (gBikeHandleGrabbed[hand] ||
-		   gBikeHandleDistance[hand] <= 0.23f)));
+	if(hand < 0 || hand >= VR_HAND_COUNT || !IsImmersiveBikeActive())
+		return false;
+	if(gCalibrationPreview)
+		return true;
+	return gHandleHighlightsEnabled && !gBikeHandleGrabbed[hand];
 }
 
 bool
@@ -2501,8 +2673,11 @@ ShouldRenderImmersiveSteeringHandleMarker(int hand)
 {
 	if(hand < 0 || hand >= VR_HAND_COUNT)
 		return false;
-	if(IsImmersiveCarActive())
-		return gCalibrationPreview || gHandleHighlightsEnabled;
+	if(IsImmersiveCarActive()){
+		if(gCalibrationPreview)
+			return true;
+		return gHandleHighlightsEnabled && !gCarWheelGrabbed[hand];
+	}
 	return ShouldRenderImmersiveBikeHandleMarker(hand);
 }
 
@@ -2683,7 +2858,10 @@ int GetQuestVehicleModelSeatHeightCm()
 	CVehicle *vehicle = FindPlayerVehicle();
 	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
-	return calibration ? calibration->seatHeightCm : 0;
+	if(!calibration)
+		return 0;
+	return GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ?
+		calibration->defaultSeatHeightCm : calibration->seatHeightCm;
 }
 
 int GetQuestVehicleModelSeatDistanceCm()
@@ -2691,7 +2869,10 @@ int GetQuestVehicleModelSeatDistanceCm()
 	CVehicle *vehicle = FindPlayerVehicle();
 	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
-	return calibration ? calibration->seatDistanceCm : 0;
+	if(!calibration)
+		return 0;
+	return GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ?
+		calibration->defaultSeatDistanceCm : calibration->seatDistanceCm;
 }
 
 static void
@@ -2737,8 +2918,14 @@ void AdjustQuestVehicleModelSeatHeightCm(int direction)
 	CVehicle *vehicle = FindPlayerVehicle();
 	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
-	if(calibration) AdjustQuestVehicleModelSeat("SeatHeightCm",
-		&calibration->seatHeightCm, direction);
+	if(!calibration)
+		return;
+	if(GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT)
+		AdjustQuestVehicleModelSeat("DefaultSeatHeightCm",
+			&calibration->defaultSeatHeightCm, direction);
+	else
+		AdjustQuestVehicleModelSeat("SeatHeightCm",
+			&calibration->seatHeightCm, direction);
 }
 
 void AdjustQuestVehicleModelSeatDistanceCm(int direction)
@@ -2748,8 +2935,12 @@ void AdjustQuestVehicleModelSeatDistanceCm(int direction)
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
 	if(!calibration)
 		return;
-	AdjustQuestVehicleModelSeat("SeatDistanceCm",
-		&calibration->seatDistanceCm, direction);
+	if(GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT)
+		AdjustQuestVehicleModelSeat("DefaultSeatDistanceCm",
+			&calibration->defaultSeatDistanceCm, direction);
+	else
+		AdjustQuestVehicleModelSeat("SeatDistanceCm",
+			&calibration->seatDistanceCm, direction);
 }
 
 int
@@ -3178,10 +3369,14 @@ ApplyQuestVehicleViewOffset(CMatrix *eyeCamera)
 			VR_DEFAULT_VIEW_BIKE : VR_DEFAULT_VIEW_CAR;
 		const DefaultVehicleViewOffset &offset =
 			gDefaultVehicleViewOffset[type];
+		VehicleViewCalibration *model =
+			GetViewCalibration(vehicle->GetModelIndex());
 		eyeCamera->GetPosition().z +=
-			(float)offset.seatHeightCm/100.0f;
+			(float)(offset.seatHeightCm+
+			 (model ? model->defaultSeatHeightCm : 0))/100.0f;
 		eyeCamera->GetPosition() += vehicle->GetForward()*
-			((float)offset.seatDistanceCm/100.0f);
+			((float)(offset.seatDistanceCm+
+			 (model ? model->defaultSeatDistanceCm : 0))/100.0f);
 		return;
 	}
 	VehicleCategoryCalibration *category = GetCategoryCalibration(vehicle);

@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.2"
+#define MIAMIVR_VERSION_TEXT "0.5.2 (0.5.3 RC1)"
 
 namespace OculusVR
 {
@@ -134,6 +134,14 @@ bool GetTrackedVisualHandAimRay(int hand, CVector *origin,
 #endif
 bool IsImmersiveDrivingActive();
 bool IsQuestBikeManualThrottle();
+// Fraction of the physical lean the bike is drawn with, 1.0 outside VR riding.
+float QuestBikeVisualLeanScale(CVehicle *vehicle);
+int GetQuestBikeVisualLeanPercent();
+bool IsQuestBikeViewFollowingTilt();
+void ToggleQuestBikeViewFollowsTilt();
+bool CanQuestBikeRiderBeThrown();
+void ToggleQuestBikeRiderCanBeThrown();
+void AdjustQuestBikeVisualLeanPercent(int direction);
 void ToggleQuestBikeManualThrottle();
 bool IsQuestCarDrivingDefault();
 bool IsQuestBikeDrivingDefault();
@@ -148,6 +156,7 @@ bool ConsumeVrRadioChange();
 bool GetImmersiveCarSteering(CVehicle *car, float *steering);
 bool GetImmersiveBikeSteering(CVehicle *bike, float *steering);
 bool GetImmersiveBikeThrottle(CVehicle *bike, float *throttle);
+bool GetQuestBikeVisualSteerAngle(CVehicle *bike, float *angle);
 bool GetImmersiveBikeLean(CVehicle *bike, float *lean);
 bool GetImmersiveBikeHandleMatrix(int hand, CMatrix *matrix);
 bool IsImmersiveBikeHandleGrabbed(int hand);

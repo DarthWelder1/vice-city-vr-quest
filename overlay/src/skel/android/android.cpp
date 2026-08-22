@@ -700,6 +700,39 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			head = player->GetPosition()+up*0.59f;
 		}else
 			player->m_pedIK.GetComponentPosition(head, PED_HEAD);
+		if(gVrInVehicle && player->m_pMyVehicle->IsBike()){
+			// The riding animation moves this bone every frame, and on a bike
+			// it moves a long way: the eye ends up shaken by the animation on
+			// top of the road. Take the bone once, in the bike's own frame,
+			// and rebuild the seat from the bike matrix after that, so the
+			// only motion left is the bike's.
+			static CVehicle *seatVehicle;
+			static CVector seatLocal;
+			static bool seatLatched;
+			CVehicle *bike = player->m_pMyVehicle;
+			if(seatVehicle != bike){
+				seatVehicle = bike;
+				seatLatched = false;
+			}
+			const CVector delta = head-bike->GetPosition();
+			const CVector candidate(
+				DotProduct(delta, bike->GetRight()),
+				DotProduct(delta, bike->GetForward()),
+				DotProduct(delta, bike->GetUp()));
+			// Refuse a bone caught mid mount or dismount: it sits well away
+			// from the saddle and would latch the whole ride to the kerb.
+			if(!seatLatched && Abs(candidate.x) < 1.2f &&
+			   Abs(candidate.y) < 2.5f &&
+			   candidate.z > -0.5f && candidate.z < 2.5f){
+				seatLocal = candidate;
+				seatLatched = true;
+			}
+			if(seatLatched)
+				head = bike->GetPosition()+
+					bike->GetRight()*seatLocal.x+
+					bike->GetForward()*seatLocal.y+
+					bike->GetUp()*seatLocal.z;
+		}
 		head += forward * 0.12f;
 		if(thirdPersonVehicle){
 			// Ride the stock chase camera instead of a seat: its position
@@ -739,11 +772,22 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			// pitch over hills/wheelies) and replaces only its rolled up vector
 			// with world-up. Feeding both through the same basis API also keeps
 			// controller/hand conversion consistent with the rendered eyes.
+			const bool levelBikeView = viewVehicle->IsBike() &&
+				!OculusVR::IsQuestBikeViewFollowingTilt();
 			CVector vehicleUp =
 				viewVehicle->IsBike() &&
-			 OculusVR::IsQuestBikeHorizonLocked() ?
+			 (levelBikeView || OculusVR::IsQuestBikeHorizonLocked()) ?
 				CVector(0.0f, 0.0f, 1.0f) :
 				viewVehicle->GetUp();
+			if(levelBikeView){
+				// Horizon lock takes the roll out and leaves the pitch, which
+				// is most of what a jump throws at the player. Flattening the
+				// forward as well leaves the seat turning with the bike and
+				// nothing else.
+				vehicleForward.z = 0.0f;
+				if(vehicleForward.MagnitudeSqr() < 0.0001f)
+					vehicleForward = viewVehicle->GetForward();
+			}
 			if(vehicleForward.MagnitudeSqr() > 0.0001f &&
 			   vehicleUp.MagnitudeSqr() > 0.0001f){
 				vehicleForward.Normalise();
@@ -804,11 +848,22 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 				RwFrameUpdateObjects(RwCameraGetFrame(Scene.camera));
 				RwFrameOrthoNormalize(RwCameraGetFrame(Scene.camera));
 				const CVector viewPosition(vp[0], vp[1], vp[2]);
-				// The RenderWare view already uses the HMD frame above. Keep the
-				// game-side camera origins used by legacy occlusion in lockstep;
-				// otherwise close walls are tested from the old chase camera.
+				// Put the game camera on the same frame. Position alone was not
+				// enough: m_cameraMatrix is the inverse of this matrix and every
+				// IsSphereVisible in the game tests against it, so with a stale
+				// orientation the frustum belonged to the chase camera. That is
+				// what cut holes in the sea for anyone looking off the nose of a
+				// helicopter. CCamera::Process rebuilds this every frame from the
+				// active cam, so writing it here only affects rendering.
+				TheCamera.GetMatrix().GetRight() =
+					CVector(-vr[0], -vr[1], -vr[2]);
+				TheCamera.GetMatrix().GetForward() =
+					CVector(va[0], va[1], va[2]);
+				TheCamera.GetMatrix().GetUp() =
+					CVector(vu[0], vu[1], vu[2]);
 				TheCamera.GetMatrix().GetPosition() = viewPosition;
 				CRenderer::SetVrViewCameraPosition(viewPosition);
+				TheCamera.CalculateDerivedValues();
 				TheCamera.m_viewMatrix.Update();
 			}
 		}
