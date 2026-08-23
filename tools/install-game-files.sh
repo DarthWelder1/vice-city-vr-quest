@@ -263,9 +263,9 @@ echo "Quest: $SERIAL"
 # A missing gamedata root means the game was never given its data; copying
 # the port assets into an empty tree would look like success and still fail
 # on launch, so say what is actually wrong instead.
-probe_argv=()
+probe_argv=("$ADB")
 if [ -n "$SERIAL" ]; then probe_argv+=("-s" "$SERIAL"); fi
-probe_argv+=("$ADB" "shell" "ls" "$REMOTE_GAME_DATA/models/gta3.img")
+probe_argv+=("shell" "ls" "$REMOTE_GAME_DATA/models/gta3.img")
 probe_output="$("${probe_argv[@]}" 2>&1)"
 probe_rc=$?
 if [ "$probe_rc" -ne 0 ] || echo "$probe_output" | grep -q "No such file"; then

@@ -479,9 +479,9 @@ echo "Quest: $SERIAL"
 # Build the full adb argv (with -s SERIAL when pinned) and run it, capturing
 # output because a failed install must be inspected, not treated as fatal
 # before the incompatible-signature handling below.
-adb_argv=()
+adb_argv=("$ADB")
 if [ -n "$SERIAL" ]; then adb_argv+=("-s" "$SERIAL"); fi
-adb_argv+=("$ADB" "install" "-r" "$APK")
+adb_argv+=("install" "-r" "$APK")
 install_output="$("${adb_argv[@]}" 2>&1)"
 install_rc=$?
 echo "$install_output"
@@ -513,9 +513,9 @@ if [ "$install_rc" -ne 0 ]; then
   fi
 fi
 # Run the save-provider bootstrap query with the same device prefix.
-provider_argv=()
+provider_argv=("$ADB")
 if [ -n "$SERIAL" ]; then provider_argv+=("-s" "$SERIAL"); fi
-provider_argv+=("$ADB" "shell" "content" "query" "--uri" "$SAVE_PROVIDER_URI" "--projection" "_display_name:_size")
+provider_argv+=("shell" "content" "query" "--uri" "$SAVE_PROVIDER_URI" "--projection" "_display_name:_size")
 provider_output="$("${provider_argv[@]}" 2>&1)"
 provider_rc=$?
 if [ "$provider_rc" -ne 0 ] || ! echo "$provider_output" | grep -q '_display_name=GTAVCsf1\.b'; then
