@@ -14,7 +14,145 @@ diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
  #include "ControllerConfig.h"
  #include "Timer.h"
  #include "Frontend.h"
-@@ -3113,6 +3119,16 @@
+@@ -48,6 +54,7 @@
+ #include "TrafficLights.h"
+ #include "WeaponInfo.h"
+ #include "Bike.h"
++#include "Boat.h"
+ #include "VehicleModelInfo.h"
+ #include "Object.h"
+ #include "Pools.h"
+@@ -708,6 +715,7 @@
+ 	VR_SPECIAL_SPAWN_NEXT_MOTORCYCLE,
+ 	VR_SPECIAL_SPAWN_NEXT_HELICOPTER,
+ 	VR_SPECIAL_SPAWN_NEXT_AIRPLANE,
++	VR_SPECIAL_SPAWN_NEXT_BOAT,
+ 	VR_SPECIAL_GOD_MODE,
+ 	VR_SPECIAL_RUN_WITHOUT_LIMITS,
+ 	VR_SPECIAL_OPEN_STORY_BRIDGES,
+@@ -724,9 +732,74 @@
+ 	MI_MAVERICK, MI_VCNMAV, MI_POLMAV
+ };
+ static const int gVrCycleAirplaneModels[] = { MI_SKIMMER };
++// Boats are moored around the coast and take finding. The fast ones come
++// first: those are what a player asking for a boat usually wants.
++// VehicleCheat builds a CAutomobile and drops it on the nearest car path
++// node. A boat is neither of those things: the wrong class crashes on the
++// first frame it is processed, and out on the water there is no car node,
++// so the spawn quietly did nothing there. Same cheat, written for hulls.
++static void
++VrBoatCheat(int model)
++{
++	CHud::SetHelpMessage(TheText.Get("CHEAT1"), true);
++	CStreaming::RequestModel(model, STREAMFLAGS_DONT_REMOVE);
++	CStreaming::LoadAllRequestedModels(false);
++	if(CStreaming::ms_aInfoForModel[model].m_loadState != STREAMSTATE_LOADED)
++		return;
++	if(!(CStreaming::ms_aInfoForModel[model].m_loadState &
++	     STREAMFLAGS_DONT_REMOVE)){
++		CStreaming::SetModelIsDeletable(model);
++		CStreaming::SetModelTxdIsDeletable(model);
++	}
++	const CVector player = FindPlayerCoors();
++	// Look outward for open water, close in first, so a boat called from a
++	// quayside arrives within reach rather than out in the bay.
++	CVector spawn;
++	bool found = false;
++	for(int ring = 0; ring < 8 && !found; ring++){
++		const float radius = 8.0f+ring*6.0f;
++		for(int step = 0; step < 12 && !found; step++){
++			const float angle = DEGTORAD(step*30.0f);
++			CVector candidate(player.x+Cos(angle)*radius,
++				player.y+Sin(angle)*radius, player.z);
++			float level = 0.0f;
++			if(!CWaterLevel::GetWaterLevelNoWaves(candidate.x, candidate.y,
++			     candidate.z, &level))
++				continue;
++			candidate.z = level+1.0f;
++			// Water under a pier is still water. Ask for open sky above the
++			// surface so the hull does not arrive inside a jetty.
++			if(!CWorld::GetIsLineOfSightClear(candidate,
++			     candidate+CVector(0.0f, 0.0f, 6.0f), true, false, false,
++			     false, false, false))
++				continue;
++			spawn = candidate;
++			found = true;
++		}
++	}
++	// Nothing but dry land within reach: leave it, rather than deliver a
++	// boat the player cannot see.
++	if(!found)
++		return;
++	CBoat *boat = new CBoat(model, RANDOM_VEHICLE);
++	if(boat == nil)
++		return;
++	boat->SetPosition(spawn);
++	boat->SetOrientation(0.0f, 0.0f, DEGTORAD(200.0f));
++	boat->SetStatus(STATUS_ABANDONED);
++	boat->m_nDoorLock = CARLOCK_UNLOCKED;
++	CWorld::Add(boat);
++}
++
++static const int gVrCycleBoatModels[] = {
++	MI_SPEEDER, MI_SQUALO, MI_JETMAX, MI_RIO,
++	MI_REEFER, MI_TROPIC, MI_MARQUIS, MI_DINGHY,
++	MI_COASTG, MI_PREDATOR
++};
+ static int gVrCycleBikeIndex;
+ static int gVrCycleHelicopterIndex;
+ static int gVrCycleAirplaneIndex;
++static int gVrCycleBoatIndex;
+ static int gVrCycleCarCursor = MI_FIRST_VEHICLE;
+ static bool gVrGodModeEnabled;
+ 
+@@ -1125,6 +1198,9 @@
+ 	else if(index == VR_SPECIAL_SPAWN_NEXT_AIRPLANE)
+ 		CycleVrModelIndex(gVrCycleAirplaneIndex,
+ 			ARRAY_SIZE(gVrCycleAirplaneModels), direction);
++	else if(index == VR_SPECIAL_SPAWN_NEXT_BOAT)
++		CycleVrModelIndex(gVrCycleBoatIndex,
++			ARRAY_SIZE(gVrCycleBoatModels), direction);
+ 	else
+ 		return false;
+ 	return true;
+@@ -1170,6 +1246,7 @@
+ 	static char bikeName[64];
+ 	static char helicopterName[64];
+ 	static char airplaneName[64];
++	static char boatName[64];
+ 	if(index == VR_SPECIAL_PASS_CURRENT_MISSION)
+ 		return "PASS CURRENT MISSION";
+ 	if(index == VR_SPECIAL_SPAWN_NEXT_CAR){
+@@ -1200,6 +1277,13 @@
+ 			GetVrVehicleModelName(model));
+ 		return airplaneName;
+ 	}
++	if(index == VR_SPECIAL_SPAWN_NEXT_BOAT){
++		const int model = gVrCycleBoatModels[gVrCycleBoatIndex %
++			ARRAY_SIZE(gVrCycleBoatModels)];
++		sprintf(boatName, "SPAWN BOAT - %s",
++			GetVrVehicleModelName(model));
++		return boatName;
++	}
+ 	if(index == VR_SPECIAL_GOD_MODE)
+ 		return gVrGodModeEnabled ?
+ 			"GOD MODE - ON" : "GOD MODE - OFF";
+@@ -1285,6 +1369,14 @@
+ 			ARRAY_SIZE(gVrCycleHelicopterModels);
+ 		return true;
+ 	}
++	if(index == VR_SPECIAL_SPAWN_NEXT_BOAT){
++		if(!FindPlayerPed()) return false;
++		VrBoatCheat(gVrCycleBoatModels[gVrCycleBoatIndex %
++			ARRAY_SIZE(gVrCycleBoatModels)]);
++		gVrCycleBoatIndex = (gVrCycleBoatIndex+1)%
++			ARRAY_SIZE(gVrCycleBoatModels);
++		return true;
++	}
+ 	if(index == VR_SPECIAL_SPAWN_NEXT_AIRPLANE){
+ 		if(!FindPlayerPed()) return false;
+ 		VehicleCheat(gVrCycleAirplaneModels[gVrCycleAirplaneIndex %
+@@ -3113,6 +3205,16 @@
  	if ( ArePlayerControlsDisabled() )
  		return false;
  
@@ -31,7 +169,7 @@ diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
  	return !!NewState.RightShock;
  }
  
-@@ -3732,6 +3748,15 @@
+@@ -3732,6 +3834,15 @@
  	if (ArePlayerControlsDisabled())
  		return false;
  
@@ -47,7 +185,7 @@ diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
  	return !!(NewState.LeftShock && !OldState.LeftShock);
  }
  
-@@ -3903,6 +3928,17 @@
+@@ -3903,6 +4014,17 @@
  	if ( ArePlayerControlsDisabled() )
  		return false;
  
@@ -849,3 +987,55 @@ diff --git a/src/render/Font.cpp b/src/render/Font.cpp
  							
  							CParticle::AddParticle(PARTICLE_WATER_SPARK,
  								vecPos,
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -1991,14 +1991,17 @@
+ 		return;
+ 	// The beam is a hip-fire aid only. Once the optic is at the eye, the reticle
+ 	// itself is authoritative and the temporary calibration beam is hidden.
+-	if(!OculusVR::IsTrackedWeaponLaserEnabled() ||
+-	   OculusVR::IsTrackedScopeActiveForHand(hand))
++	// Whether the beam is wanted is a per-weapon choice, so it is read once
++	// the held weapon is known, a few lines below.
++	if(OculusVR::IsTrackedScopeActiveForHand(hand))
+ 		return;
+ 	const int heldSlot = OculusVR::GetHeldWeaponSlot(hand);
+ 	if(heldSlot < 0 || heldSlot >= TOTAL_WEAPON_SLOTS)
+ 		return;
+ 	CWeapon *weapon = &player->GetWeapon(heldSlot);
+-	if(!weapon || !OculusVR::IsPhysicalGunType(weapon->m_eWeaponType) ||
++	if(!weapon ||
++	   !OculusVR::IsTrackedWeaponLaserEnabledForType(weapon->m_eWeaponType) ||
++	   !OculusVR::IsPhysicalGunType(weapon->m_eWeaponType) ||
+ 	   weapon->m_eWeaponType == WEAPONTYPE_CAMERA ||
+ 	   weapon->m_eWeaponType == WEAPONTYPE_FLAMETHROWER ||
+ 	   weapon->m_eWeaponType == WEAPONTYPE_MINIGUN ||
+--- a/src/vehicles/Boat.cpp
++++ b/src/vehicles/Boat.cpp
+@@ -29,6 +29,9 @@
+ #include "Shadows.h"
+ #include "Wanted.h"
+ #include "GameRenderCommand.h"
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++#include "OculusVR.h"
++#endif
+ 
+ #define INVALID_ORIENTATION (-9999.99f)
+ 
+@@ -780,6 +783,16 @@
+ 	}else
+ 		m_fAccelerate = -m_fBrake*0.3f;
+ 
++#if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
++	// The helm supplies the same target the pad would, so the hull keeps
++	// its own smoothing and its own steering lock. Without this the wheel
++	// turned in the player's hands and the boat carried on straight.
++	float immersiveSteering = 0.0f;
++	if(OculusVR::GetImmersiveCarSteering(this, &immersiveSteering))
++		m_fSteeringLeftRight +=
++			(immersiveSteering - m_fSteeringLeftRight)*0.2f;
++	else
++#endif
+ 	m_fSteeringLeftRight += (-CPad::GetPad(pad)->GetSteeringLeftRight()/128.0f - m_fSteeringLeftRight)*0.2f;
+ 	m_fSteeringLeftRight = clamp(m_fSteeringLeftRight, -1.0f, 1.0f);
+ 

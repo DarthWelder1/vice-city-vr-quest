@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.2 (0.5.3 RC1)"
+#define MIAMIVR_VERSION_TEXT "0.5.2 (0.5.3 RC2)"
 
 namespace OculusVR
 {
@@ -221,6 +221,17 @@ void RestrictQuestVehicleWeaponsToSidearms();
 
 const char *GetQuestCarDrivingTypeName();
 const char *GetQuestBikeDrivingTypeName();
+const char *GetQuestBoatDrivingTypeName();
+bool IsQuestBoatDrivingDefault();
+// The vehicle page works on one kind at a time; these follow that choice.
+int GetQuestVehicleKind();
+const char *GetQuestVehicleKindName();
+void CycleQuestVehicleKind(int direction);
+const char *GetQuestVehicleKindDrivingTypeName();
+void CycleQuestVehicleKindDrivingType(int direction);
+bool IsQuestVehicleKindDrivingDefault();
+bool IsQuestVehicleKindThirdPerson();
+void CycleQuestBoatDrivingType(int direction);
 void CycleQuestCarDrivingType(int direction);
 void CycleQuestBikeDrivingType(int direction);
 bool HasQuestVehicleSeatCalibrationTarget();
@@ -282,6 +293,10 @@ const char *GetQuestWeaponSettingName(int setting);
 bool GetQuestWeaponSetting(int setting);
 void ToggleQuestWeaponSetting(int setting);
 int GetQuestCalibrationWeaponType(int hand);
+// Per-weapon laser: -1 follows the global switch, 0 off, 1 on.
+bool IsTrackedWeaponLaserEnabledForType(int weaponType);
+int GetQuestWeaponLaserOverride(int weaponType);
+void CycleQuestWeaponLaserOverride(int weaponType, int direction);
 int GetQuestCalibrationValue(int hand, int weaponType, int item);
 void AdjustQuestCalibrationValue(int hand, int weaponType, int item,
 	int direction);

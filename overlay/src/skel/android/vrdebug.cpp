@@ -504,9 +504,11 @@ enum eQuestCpuPerformanceMode {
 };
 
 enum eVrVehicleMenuItem {
-	VR_VEHICLE_THIRD_PERSON = 0,
-	VR_VEHICLE_CAR_DRIVING_TYPE,
-	VR_VEHICLE_BIKE_DRIVING_TYPE,
+	// The page works on one kind of vehicle at a time. Everything under the
+	// selector belongs to the kind it names; nothing else is drawn.
+	VR_VEHICLE_KIND = 0,
+	VR_VEHICLE_DRIVING_TYPE,
+	VR_VEHICLE_THIRD_PERSON,
 	VR_VEHICLE_DEFAULT_SEAT_HEIGHT,
 	VR_VEHICLE_DEFAULT_SEAT_FORWARD,
 	VR_VEHICLE_GLOBAL_SEAT_HEIGHT,
@@ -1414,7 +1416,7 @@ CurrentMenuItemCount(void)
 			OculusVR::GetQuestVehicleCalibrationItemCount()+1);
 	case VR_MENU_PAGE_LOCOMOTION: return VR_LOCOMOTION_ITEM_COUNT;
 	case VR_MENU_PAGE_CONTROLS: return VR_CONTROLS_ITEM_COUNT;
-	case VR_MENU_PAGE_CALIBRATION: return 21;
+	case VR_MENU_PAGE_CALIBRATION: return 22;
 	case VR_MENU_PAGE_HOLSTERS:
 		return OculusVR::GetQuestHolsterPointCount()+1;
 	case VR_MENU_PAGE_CHEATS: return Max(1, GetVrCheatCount()+1);
@@ -1474,11 +1476,14 @@ IsMenuItemVisible(int page, int item)
 		return false;
 	}
 	if(page == VR_MENU_PAGE_VEHICLE){
-		const bool thirdPerson = OculusVR::IsQuestVehicleThirdPerson();
-		const bool carDriven =
-			!thirdPerson && !OculusVR::IsQuestCarDrivingDefault();
-		const bool bikeDriven =
-			!thirdPerson && !OculusVR::IsQuestBikeDrivingDefault();
+		const int kind = OculusVR::GetQuestVehicleKind();
+		const bool thirdPerson = OculusVR::IsQuestVehicleKindThirdPerson();
+		const bool driven =
+			!thirdPerson && !OculusVR::IsQuestVehicleKindDrivingDefault();
+		const bool wheelKind = kind != 1;
+		// A helm is the same wheel as a car's, so those rows serve both.
+		const bool carDriven = driven && wheelKind;
+		const bool bikeDriven = driven && !wheelKind;
 		switch(item){
 		case VR_VEHICLE_WHEEL_VISIBLE:
 		case VR_VEHICLE_MODEL_WHEEL_VISIBLE:
@@ -2205,13 +2210,11 @@ VrDebugUpdate(const PadInput &in)
 			case VR_VEHICLE_THIRD_PERSON:
 				OculusVR::ToggleQuestVehicleThirdPerson();
 				break;
-			case VR_VEHICLE_CAR_DRIVING_TYPE:
-				if(!OculusVR::IsQuestVehicleThirdPerson())
-					OculusVR::CycleQuestCarDrivingType(direction);
+			case VR_VEHICLE_KIND:
+				OculusVR::CycleQuestVehicleKind(direction);
 				break;
-			case VR_VEHICLE_BIKE_DRIVING_TYPE:
-				if(!OculusVR::IsQuestVehicleThirdPerson())
-					OculusVR::CycleQuestBikeDrivingType(direction);
+			case VR_VEHICLE_DRIVING_TYPE:
+				OculusVR::CycleQuestVehicleKindDrivingType(direction);
 				break;
 			case VR_VEHICLE_DEFAULT_SEAT_HEIGHT:
 				OculusVR::AdjustQuestDefaultVehicleSeatHeightCm(
@@ -2441,6 +2444,12 @@ VrDebugUpdate(const PadInput &in)
 					gVrCalibrationSelection-1,
 					(decreasePulse ? -1 : 1)*repeatMagnitude);
 			}else if(gVrCalibrationSelection == 20 &&
+			         (positivePulse || decreasePulse)){
+				OculusVR::CycleQuestWeaponLaserOverride(
+					OculusVR::GetQuestCalibrationWeaponType(
+						gVrCalibrationHand),
+					decreasePulse ? -1 : 1);
+			}else if(gVrCalibrationSelection == 21 &&
 			         positivePulse)
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
 		}else if(gVrMenuPage == VR_MENU_PAGE_HOLSTERS){
@@ -3029,19 +3038,18 @@ DrawQuestVehiclePage(void)
 	BeginFullVrMenuPage("VEHICLE SETTINGS",
 		"DRIVING CONTROLS AND PER-VEHICLE CALIBRATION");
 	char rows[VR_VEHICLE_ITEM_COUNT][112];
+	// Third person is a per-kind choice now, so the page reads the one it is
+	// showing rather than whatever the player happens to be sitting in.
+	const bool thirdPersonView = OculusVR::IsQuestVehicleKindThirdPerson();
+	snprintf(rows[VR_VEHICLE_KIND], sizeof(rows[0]),
+		"SETTINGS FOR  < %s >", OculusVR::GetQuestVehicleKindName());
+	snprintf(rows[VR_VEHICLE_DRIVING_TYPE], sizeof(rows[0]),
+		"DRIVING TYPE  < %s >", thirdPersonView ?
+			"DEFAULT (THIRD PERSON)" :
+			OculusVR::GetQuestVehicleKindDrivingTypeName());
 	snprintf(rows[VR_VEHICLE_THIRD_PERSON], sizeof(rows[0]),
-		"VEHICLE VIEW  < %s >",
-		OculusVR::IsQuestVehicleThirdPerson() ?
-			"THIRD PERSON" : "FIRST PERSON");
-	const bool thirdPersonView = OculusVR::IsQuestVehicleThirdPerson();
-	snprintf(rows[VR_VEHICLE_CAR_DRIVING_TYPE], sizeof(rows[0]),
-		"CAR DRIVING TYPE  < %s >", thirdPersonView ?
-			"DEFAULT (THIRD PERSON)" :
-			OculusVR::GetQuestCarDrivingTypeName());
-	snprintf(rows[VR_VEHICLE_BIKE_DRIVING_TYPE], sizeof(rows[0]),
-		"BIKE DRIVING TYPE  < %s >", thirdPersonView ?
-			"DEFAULT (THIRD PERSON)" :
-			OculusVR::GetQuestBikeDrivingTypeName());
+		"VIEW  < %s >",
+		thirdPersonView ? "THIRD PERSON" : "FIRST PERSON");
 	if(OculusVR::HasQuestDefaultVehicleViewOffsetTarget()){
 		snprintf(rows[VR_VEHICLE_DEFAULT_SEAT_HEIGHT], sizeof(rows[0]),
 			"DEFAULT %s HEIGHT  < %+d CM >",
@@ -3287,11 +3295,18 @@ DrawQuestWeaponCalibrationPage(void)
 		"SUPPORT GRIP ROT X", "SUPPORT GRIP ROT Y",
 		"SUPPORT GRIP ROT Z", "SUPPORT GRIP STYLE"
 	};
-	for(int item = 0; item < 21; item++){
+	for(int item = 0; item < 22; item++){
 		char row[112];
 		if(item == 0)
 			snprintf(row, sizeof(row), "EDIT HAND  < %s >",
 				gVrCalibrationHand == 0 ? "LEFT" : "RIGHT");
+		else if(item == 20){
+			const int laser =
+				OculusVR::GetQuestWeaponLaserOverride(weaponType);
+			snprintf(row, sizeof(row), "LASER SIGHT  < %s >",
+				laser < 0 ? "FOLLOW WEAPONS PAGE" :
+					(laser ? "ON" : "OFF"));
+		}
 		else if(item <= 19){
 			const int value =
 				OculusVR::GetQuestCalibrationValue(

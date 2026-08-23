@@ -138,6 +138,7 @@ struct BikeLeanCalibration
 static bool gSettingsLoaded;
 static int gCarDrivingType;
 static int gBikeDrivingType;
+static int gBoatDrivingType;
 static int gMotionSteeringHand = 1;
 // How far the gripping hand is pulled off the wheel plane, towards the
 // driver, so the rim does not end up inside its wrist.
@@ -146,8 +147,35 @@ static bool gHandleHighlightsEnabled = true;
 static bool gBikeHorizonLocked = true;
 // Third-person vehicle view: the ordinary chase camera in stereo, with the
 // default controls. It is not a seating position, so no seat offset applies.
-static bool gVehicleThirdPerson = false;
-static bool gImmersiveCarWheelVisible = true;
+// One switch per kind of vehicle. Riding a bike from behind and sitting
+// in a car cockpit are different preferences, and a single flag made
+// choosing one mean losing the other.
+enum {
+	VR_VEHICLE_KIND_CAR = 0,
+	VR_VEHICLE_KIND_BIKE,
+	VR_VEHICLE_KIND_BOAT,
+	VR_VEHICLE_KIND_COUNT
+};
+static bool gVehicleThirdPerson[VR_VEHICLE_KIND_COUNT];
+// Which kind the vehicle page is showing. Everything on it belongs to
+// one kind, so the page follows this rather than mixing all three.
+static int gVehicleKindEdit;
+
+static int
+VehicleKindFor(CVehicle *vehicle)
+{
+	if(vehicle == nil)
+		return gVehicleKindEdit;
+	if(vehicle->IsBike())
+		return VR_VEHICLE_KIND_BIKE;
+	if(vehicle->IsBoat())
+		return VR_VEHICLE_KIND_BOAT;
+	return VR_VEHICLE_KIND_CAR;
+}
+// One switch per kind that has a wheel. Hiding the rim in cars, where the
+// dashboard already draws one, says nothing about a boat, where the helm
+// is the only thing to hold.
+static bool gImmersiveCarWheelVisible[2] = { true, true };
 static bool gCalibrationPreview;
 
 static HandleCalibration
@@ -162,6 +190,8 @@ enum eDefaultVehicleViewType
 {
 	VR_DEFAULT_VIEW_CAR = 0,
 	VR_DEFAULT_VIEW_BIKE,
+	// A helm seat is its own thing: neither a car cabin nor a saddle.
+	VR_DEFAULT_VIEW_BOAT,
 	VR_DEFAULT_VIEW_COUNT
 };
 struct DefaultVehicleViewOffset
@@ -331,6 +361,12 @@ LoadDrivingSettings()
 	gBikeDrivingType = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "BikeDrivingType", legacyDrivingType, kSettingsPath),
 		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
+	// Boats were steered by the car setting when the wheel first reached
+	// them. Inheriting it as the fallback keeps that choice for anyone who
+	// already made it, and gives the helm a switch of its own from here.
+	gBoatDrivingType = clamp((int)(int32)GetPrivateProfileIntA(
+		"VR", "BoatDrivingType", gCarDrivingType, kSettingsPath),
+		(int)VR_DRIVING_DEFAULT, (int)VR_DRIVING_TYPE_COUNT-1);
 	gBikeManualThrottle = GetPrivateProfileIntA("VR",
 		"ImmersiveBikeManualThrottle", 0, kSettingsPath) != 0 ? 1 : 0;
 	gBikeVisualLeanPercent = clamp((int)(int32)GetPrivateProfileIntA(
@@ -346,10 +382,26 @@ LoadDrivingSettings()
 		"VR", "BikeHandleHighlights", 1, kSettingsPath) != 0;
 	gBikeHorizonLocked = GetPrivateProfileIntA(
 		"VR", "BikeLockHorizon", 1, kSettingsPath) != 0;
-	gVehicleThirdPerson = GetPrivateProfileIntA(
-		"VR", "VehicleThirdPerson", 0, kSettingsPath) != 0;
-	gImmersiveCarWheelVisible = GetPrivateProfileIntA(
+	{
+		// The old single key is the fallback for all three, so a choice
+		// already made survives the split.
+		static const char *const key[VR_VEHICLE_KIND_COUNT] = {
+			"VehicleThirdPersonCar", "VehicleThirdPersonBike",
+			"VehicleThirdPersonBoat"
+		};
+		const int legacy = GetPrivateProfileIntA("VR",
+			"VehicleThirdPerson", 0, kSettingsPath) != 0 ? 1 : 0;
+		for(int kind = 0; kind < VR_VEHICLE_KIND_COUNT; kind++)
+			gVehicleThirdPerson[kind] = GetPrivateProfileIntA("VR",
+				key[kind], legacy, kSettingsPath) != 0;
+	}
+	gImmersiveCarWheelVisible[0] = GetPrivateProfileIntA(
 		"VR", "ImmersiveCarWheelVisible", 1, kSettingsPath) != 0;
+	// The car key is the boat's fallback, so a choice made before boats had
+	// a helm carries over rather than resetting.
+	gImmersiveCarWheelVisible[1] = GetPrivateProfileIntA(
+		"VR", "ImmersiveBoatWheelVisible",
+		gImmersiveCarWheelVisible[0] ? 1 : 0, kSettingsPath) != 0;
 	ReloadVehicleCalibration();
 	gSettingsLoaded = true;
 }
@@ -382,13 +434,22 @@ GetActivePlayerBike()
 	return vehicle && vehicle->IsBike() ? (CBike*)vehicle : nil;
 }
 
-static CAutomobile *
+// A boat is steered from a wheel in front of a seat, exactly as a car is,
+// and everything the wheel logic reads -- the seat position out of the
+// model and the vehicle matrix -- a boat has. The one car-only piece is the
+// rotating wheel node, and that is guarded where it is used: boat models do
+// not carry one, so only the wheel the port draws itself turns.
+static CVehicle *
 GetActivePlayerCar()
 {
 	CVehicle *vehicle = FindPlayerVehicle();
-	return vehicle && vehicle->IsCar() &&
+	if(!vehicle)
+		return nil;
+	if(vehicle->IsBoat())
+		return vehicle;
+	return vehicle->IsCar() &&
 		!vehicle->IsRealHeli() && !vehicle->IsRealPlane() ?
-			(CAutomobile*)vehicle : nil;
+			vehicle : nil;
 }
 
 static int
@@ -398,7 +459,10 @@ GetDrivingTypeForVehicle(CVehicle *vehicle)
 		return VR_DRIVING_DEFAULT;
 	if(vehicle->IsBike())
 		return gBikeDrivingType;
-	if(vehicle->IsCar() && !vehicle->IsRealHeli() && !vehicle->IsRealPlane())
+	if(vehicle->IsBoat())
+		return gBoatDrivingType;
+	if(vehicle->IsCar() && !vehicle->IsRealHeli() &&
+	   !vehicle->IsRealPlane())
 		return gCarDrivingType;
 	return VR_DRIVING_DEFAULT;
 }
@@ -410,7 +474,7 @@ IsDrivingEnvironmentActive()
 	CVehicle *vehicle = FindPlayerVehicle();
 	// The third-person view has no cockpit to reach into, so the physical
 	// wheel and motion steering stay off and the controls remain DEFAULT.
-	if(gVehicleThirdPerson ||
+	if(IsQuestVehicleThirdPerson() ||
 	   GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ||
 	   !gVrFirstPersonActive ||
 	   gGameState != GS_PLAYING_GAME ||
@@ -458,7 +522,7 @@ IsImmersiveCarActive(CVehicle *expected = nil)
 {
 	if(!IsImmersiveEnvironmentActive())
 		return false;
-	CAutomobile *car = GetActivePlayerCar();
+	CVehicle *car = GetActivePlayerCar();
 	return car && (!expected || expected == car);
 }
 
@@ -477,7 +541,7 @@ IsVrCarActive(CVehicle *expected = nil)
 {
 	if(!IsDrivingEnvironmentActive())
 		return false;
-	CAutomobile *car = GetActivePlayerCar();
+	CVehicle *car = GetActivePlayerCar();
 	return car && (!expected || expected == car);
 }
 
@@ -785,10 +849,12 @@ ReloadVehicleCalibration()
 		ReadProfileInt("VR", "DrivingYOffsetCm", &legacyHeight);
 	legacyHeight = clamp(legacyHeight, -100, 150);
 	static const char *heightKeys[VR_DEFAULT_VIEW_COUNT] = {
-		"DefaultCarSeatHeightCm", "DefaultBikeSeatHeightCm"
+		"DefaultCarSeatHeightCm", "DefaultBikeSeatHeightCm",
+		"DefaultBoatSeatHeightCm"
 	};
 	static const char *distanceKeys[VR_DEFAULT_VIEW_COUNT] = {
-		"DefaultCarSeatDistanceCm", "DefaultBikeSeatDistanceCm"
+		"DefaultCarSeatDistanceCm", "DefaultBikeSeatDistanceCm",
+		"DefaultBoatSeatDistanceCm"
 	};
 	for(int type = 0; type < VR_DEFAULT_VIEW_COUNT; type++){
 		gDefaultVehicleViewOffset[type].seatHeightCm = clamp(
@@ -885,6 +951,13 @@ static const BuiltInVehicleViewDefaults gBuiltInVehicleViewDefaults[] = {
 		{ -19,-16, 0,0,0, 0,0, 0,0,0, -1 } },
 	{ MI_SANCHEZ, ModelSets::MODEL_SET_MODERN,
 		{ -22,-27, 0,0,0, 0,0, 0,0,0, -1 } },
+	// Helm, tuned in the headset. The two model sets put the console at
+	// different heights, so the wheel centre and rake differ; the model's
+	// own wheel is hidden because the one the port draws replaces it.
+	{ MI_SPEEDER, ModelSets::MODEL_SET_CLASSIC,
+		{ 0,0, 3,4,12, 14,0, -22,0,0, 0 } },
+	{ MI_SPEEDER, ModelSets::MODEL_SET_MODERN,
+		{ 0,0, 3,4,9, 16,0, -26,6,0, 0 } },
 };
 
 static VehicleViewCalibration
@@ -1235,7 +1308,7 @@ struct CarWheelPose
 };
 
 static bool
-BuildCarWheelPose(CAutomobile *car, CarWheelPose *pose)
+BuildCarWheelPose(CVehicle *car, CarWheelPose *pose)
 {
 	if(!car || !pose)
 		return false;
@@ -1244,7 +1317,11 @@ BuildCarWheelPose(CAutomobile *car, CarWheelPose *pose)
 	if(!model)
 		return false;
 	CVector local = model->GetFrontSeatPosn();
-	local.x = -local.x;
+	// CPed seats a driver by the same rule: a car stores the passenger side
+	// and has to be mirrored, a boat already stores the helm side. Mirroring
+	// a boat too put the wheel across the deck from the seat.
+	if(!car->IsBoat())
+		local.x = -local.x;
 	local.y += 0.33f;
 	local.z += 0.30f;
 	CVector controlCenterOffset;
@@ -1314,7 +1391,7 @@ BuildCarWheelPose(CAutomobile *car, CarWheelPose *pose)
 }
 
 static bool
-BuildCarWheelCenter(CAutomobile *car, CVector *center, CVector *axis)
+BuildCarWheelCenter(CVehicle *car, CVector *center, CVector *axis)
 {
 	CarWheelPose pose;
 	if(!center || !axis || !BuildCarWheelPose(car, &pose))
@@ -1330,7 +1407,7 @@ BuildCarWheelMatrix(int hand, CMatrix *matrix, bool applySteering)
 	if(!matrix || hand < 0 || hand >= VR_HAND_COUNT ||
 	   !IsVrCarActive())
 		return false;
-	CAutomobile *car = GetActivePlayerCar();
+	CVehicle *car = GetActivePlayerCar();
 	CarWheelPose pose;
 	if(!BuildCarWheelPose(car, &pose))
 		return false;
@@ -1648,7 +1725,7 @@ GetRawHandPosition(int hand, CVector *position)
 }
 
 static void
-UpdateCarHorn(CAutomobile *car, const CVector &center,
+UpdateCarHorn(CVehicle *car, const CVector &center,
 	uint32 blockedHands)
 {
 	if(!car){
@@ -1699,7 +1776,7 @@ UpdateImmersiveCarInput(const float *grips, uint32 blockedHands)
 		ResetCarInteraction();
 		return 0;
 	}
-	CAutomobile *car = GetActivePlayerCar();
+	CVehicle *car = GetActivePlayerCar();
 	if(!car){
 		ResetCarInteraction();
 		return 0;
@@ -2720,6 +2797,99 @@ GetQuestCarDrivingTypeName()
 }
 
 const char *
+GetQuestBoatDrivingTypeName()
+{
+	LoadDrivingSettings();
+	return DrivingTypeName(gBoatDrivingType);
+}
+
+int
+GetQuestVehicleKind()
+{
+	LoadDrivingSettings();
+	return gVehicleKindEdit;
+}
+
+const char *
+GetQuestVehicleKindName()
+{
+	LoadDrivingSettings();
+	switch(gVehicleKindEdit){
+	case VR_VEHICLE_KIND_BIKE: return "BIKES";
+	case VR_VEHICLE_KIND_BOAT: return "BOATS";
+	}
+	return "CARS";
+}
+
+void
+CycleQuestVehicleKind(int direction)
+{
+	LoadDrivingSettings();
+	gVehicleKindEdit = (gVehicleKindEdit+VR_VEHICLE_KIND_COUNT+
+		(direction < 0 ? -1 : 1)) % VR_VEHICLE_KIND_COUNT;
+}
+
+// The driving type, third person switch and calibration all follow the
+// kind the page is showing rather than the vehicle underfoot: a player
+// sets bikes up while standing in the street.
+const char *
+GetQuestVehicleKindDrivingTypeName()
+{
+	LoadDrivingSettings();
+	switch(gVehicleKindEdit){
+	case VR_VEHICLE_KIND_BIKE: return DrivingTypeName(gBikeDrivingType);
+	case VR_VEHICLE_KIND_BOAT: return DrivingTypeName(gBoatDrivingType);
+	}
+	return DrivingTypeName(gCarDrivingType);
+}
+
+void
+CycleQuestVehicleKindDrivingType(int direction)
+{
+	LoadDrivingSettings();
+	switch(gVehicleKindEdit){
+	case VR_VEHICLE_KIND_BIKE: CycleQuestBikeDrivingType(direction); break;
+	case VR_VEHICLE_KIND_BOAT: CycleQuestBoatDrivingType(direction); break;
+	default: CycleQuestCarDrivingType(direction); break;
+	}
+}
+
+bool
+IsQuestVehicleKindDrivingDefault()
+{
+	LoadDrivingSettings();
+	switch(gVehicleKindEdit){
+	case VR_VEHICLE_KIND_BIKE: return gBikeDrivingType == VR_DRIVING_DEFAULT;
+	case VR_VEHICLE_KIND_BOAT: return gBoatDrivingType == VR_DRIVING_DEFAULT;
+	}
+	return gCarDrivingType == VR_DRIVING_DEFAULT;
+}
+
+bool
+IsQuestVehicleKindThirdPerson()
+{
+	LoadDrivingSettings();
+	return gVehicleThirdPerson[gVehicleKindEdit];
+}
+
+bool
+IsQuestBoatDrivingDefault()
+{
+	LoadDrivingSettings();
+	return gBoatDrivingType == VR_DRIVING_DEFAULT;
+}
+
+void
+CycleQuestBoatDrivingType(int direction)
+{
+	LoadDrivingSettings();
+	gBoatDrivingType =
+		(gBoatDrivingType+VR_DRIVING_TYPE_COUNT+
+		 (direction < 0 ? -1 : 1)) % VR_DRIVING_TYPE_COUNT;
+	SaveSetting("BoatDrivingType", gBoatDrivingType);
+}
+
+const char *
 GetQuestBikeDrivingTypeName()
 {
 	LoadDrivingSettings();
@@ -2756,6 +2926,8 @@ GetDefaultVehicleViewTypeForCurrentVehicle()
 		return -1;
 	if(vehicle->IsBike())
 		return VR_DEFAULT_VIEW_BIKE;
+	if(vehicle->IsBoat())
+		return VR_DEFAULT_VIEW_BOAT;
 	if(vehicle->IsCar() && !vehicle->IsRealHeli() && !vehicle->IsRealPlane())
 		return VR_DEFAULT_VIEW_CAR;
 	return -1;
@@ -2772,8 +2944,11 @@ const char *
 GetQuestDefaultVehicleViewOffsetName()
 {
 	LoadDrivingSettings();
-	return GetDefaultVehicleViewTypeForCurrentVehicle() ==
-		VR_DEFAULT_VIEW_BIKE ? "BIKE" : "CAR";
+	switch(GetDefaultVehicleViewTypeForCurrentVehicle()){
+	case VR_DEFAULT_VIEW_BIKE: return "BIKE";
+	case VR_DEFAULT_VIEW_BOAT: return "BOAT";
+	}
+	return "CAR";
 }
 
 int
@@ -2801,9 +2976,11 @@ AdjustQuestDefaultVehicleSeatHeightCm(int direction)
 		return;
 	DefaultVehicleViewOffset &offset = gDefaultVehicleViewOffset[type];
 	offset.seatHeightCm = clamp(offset.seatHeightCm+direction, -100, 150);
-	SaveSetting(type == VR_DEFAULT_VIEW_BIKE ?
-		"DefaultBikeSeatHeightCm" : "DefaultCarSeatHeightCm",
-		offset.seatHeightCm);
+	static const char *const key[VR_DEFAULT_VIEW_COUNT] = {
+		"DefaultCarSeatHeightCm", "DefaultBikeSeatHeightCm",
+		"DefaultBoatSeatHeightCm"
+	};
+	SaveSetting(key[type], offset.seatHeightCm);
 }
 
 void
@@ -2815,9 +2992,11 @@ AdjustQuestDefaultVehicleSeatDistanceCm(int direction)
 		return;
 	DefaultVehicleViewOffset &offset = gDefaultVehicleViewOffset[type];
 	offset.seatDistanceCm = clamp(offset.seatDistanceCm+direction, -100, 100);
-	SaveSetting(type == VR_DEFAULT_VIEW_BIKE ?
-		"DefaultBikeSeatDistanceCm" : "DefaultCarSeatDistanceCm",
-		offset.seatDistanceCm);
+	static const char *const key[VR_DEFAULT_VIEW_COUNT] = {
+		"DefaultCarSeatDistanceCm", "DefaultBikeSeatDistanceCm",
+		"DefaultBoatSeatDistanceCm"
+	};
+	SaveSetting(key[type], offset.seatDistanceCm);
 }
 
 const char *
@@ -2959,42 +3138,51 @@ ToggleQuestMotionSteeringHand()
 	ResetMotionInteraction();
 }
 
+// The page reads the kind it is showing; the world reads the kind being
+// driven.
 bool IsQuestImmersiveCarWheelVisible()
 {
 	LoadDrivingSettings();
-	return gImmersiveCarWheelVisible;
+	return gImmersiveCarWheelVisible[
+		gVehicleKindEdit == VR_VEHICLE_KIND_BOAT ? 1 : 0];
 }
 
 bool ShouldRenderQuestImmersiveCarWheel()
 {
 	LoadDrivingSettings();
-	CVehicle *vehicle = FindPlayerVehicle();
-	VehicleViewCalibration *calibration = vehicle && vehicle->IsCar() ?
+	CVehicle *vehicle = GetActivePlayerCar();
+	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
-	return gImmersiveCarWheelVisible &&
+	return gImmersiveCarWheelVisible[
+		(vehicle && vehicle->IsBoat()) ? 1 : 0] &&
 		(!calibration || calibration->carWheelVisibilityOverride != 0);
 }
 
 void ToggleQuestImmersiveCarWheelVisible()
 {
 	LoadDrivingSettings();
-	gImmersiveCarWheelVisible = !gImmersiveCarWheelVisible;
-	SaveSetting("ImmersiveCarWheelVisible", gImmersiveCarWheelVisible);
+	const int slot = gVehicleKindEdit == VR_VEHICLE_KIND_BOAT ? 1 : 0;
+	gImmersiveCarWheelVisible[slot] = !gImmersiveCarWheelVisible[slot];
+	SaveSetting(slot ? "ImmersiveBoatWheelVisible" :
+		"ImmersiveCarWheelVisible", gImmersiveCarWheelVisible[slot]);
 }
 
 const char *GetQuestVehicleModelWheelVisibilityName()
 {
-	CVehicle *vehicle = FindPlayerVehicle();
-	VehicleViewCalibration *calibration = vehicle && vehicle->IsCar() ?
+	// Anything steered by a wheel, which since the helm arrived means boats
+	// as well. IsCar also answered yes for helicopters, which have no wheel
+	// to hide; the active-vehicle helper draws the line in the right place.
+	CVehicle *vehicle = GetActivePlayerCar();
+	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
-	if(!calibration) return "ENTER CAR";
+	if(!calibration) return "ENTER A CAR OR BOAT";
 	return calibration->carWheelVisibilityOverride == 0 ? "HIDE" : "INHERIT";
 }
 
 void ToggleQuestVehicleModelWheelVisibility()
 {
-	CVehicle *vehicle = FindPlayerVehicle();
-	VehicleViewCalibration *calibration = vehicle && vehicle->IsCar() ?
+	CVehicle *vehicle = GetActivePlayerCar();
+	VehicleViewCalibration *calibration = vehicle ?
 		GetViewCalibration(vehicle->GetModelIndex()) : nil;
 	if(!calibration) return;
 	calibration->carWheelVisibilityOverride =
@@ -3072,15 +3260,22 @@ bool
 IsQuestVehicleThirdPerson()
 {
 	LoadDrivingSettings();
-	return gVehicleThirdPerson;
+	// The kind being driven decides, so a player who wants the chase
+	// camera on a bike still gets the cockpit in a car.
+	return gVehicleThirdPerson[VehicleKindFor(FindPlayerVehicle())];
 }
 
 void
 ToggleQuestVehicleThirdPerson()
 {
 	LoadDrivingSettings();
-	gVehicleThirdPerson = !gVehicleThirdPerson;
-	SaveSetting("VehicleThirdPerson", gVehicleThirdPerson);
+	const int kind = gVehicleKindEdit;
+	static const char *const key[VR_VEHICLE_KIND_COUNT] = {
+		"VehicleThirdPersonCar", "VehicleThirdPersonBike",
+		"VehicleThirdPersonBoat"
+	};
+	gVehicleThirdPerson[kind] = !gVehicleThirdPerson[kind];
+	SaveSetting(key[kind], gVehicleThirdPerson[kind]);
 	ResetQuestDrivingInteraction();
 }
 
@@ -3362,11 +3557,9 @@ ApplyQuestVehicleViewOffset(CMatrix *eyeCamera)
 	if(!vehicle)
 		return;
 	const int categoryIndex = GetVehicleCategory(vehicle);
-	if(GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT &&
-	   (categoryIndex == VR_VEHICLE_CATEGORY_CAR ||
-	    categoryIndex == VR_VEHICLE_CATEGORY_BIKE)){
-		const int type = categoryIndex == VR_VEHICLE_CATEGORY_BIKE ?
-			VR_DEFAULT_VIEW_BIKE : VR_DEFAULT_VIEW_CAR;
+	const int defaultViewType = GetDefaultVehicleViewTypeForCurrentVehicle();
+	if(defaultViewType >= 0){
+		const int type = defaultViewType;
 		const DefaultVehicleViewOffset &offset =
 			gDefaultVehicleViewOffset[type];
 		VehicleViewCalibration *model =

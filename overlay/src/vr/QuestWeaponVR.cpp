@@ -48,6 +48,8 @@ enum SupportGripType {
 	SUPPORT_GRIP_TYPE_COUNT
 };
 
+enum { SUPPORT_GRIP_FROM_BELOW_ROLL_HALF_DEG = -292 };
+
 enum {
 	HOLSTER_WAIST_LEFT = 0,
 	HOLSTER_WAIST_RIGHT,
@@ -173,8 +175,8 @@ static const BuiltInWeaponDefaults gBuiltInWeaponDefaults[] = {
 		{ { 5,0,-12, 6,25,65, 0,0,0, 0,0,11 }, { -1,41,-20 } },
 		{ { 5,0,-12, -6,25,65, 0,0,0, 0,0,11 }, { -1,41,-20 } } } },
 	{ WEAPONTYPE_RUGER, {
-		{ { 2,0,-7, 0,20,0, 0,0,0, -1,8,11 }, { 0,51,-7 } },
-		{ { 2,0,-7, 0,20,0, 0,0,0, -1,8,11 }, { 0,50,-6 } } } },
+		{ { 1,0,-11, 0,20,0, 0,0,0, 0,8,11 }, { 0,51,-7 } },
+		{ { -1,0,-11, 0,20,0, 0,0,0, 0,8,11 }, { 0,50,-6 } } } },
 	{ WEAPONTYPE_SNIPERRIFLE, {
 		{ { -3,0,-6, 0,10,100, 0,0,0, 0,10,11 }, { 0,60,-10 } },
 		{ { -3,0,-6, 0,10,100, 0,0,0, 0,10,11 }, { 0,60,-10 } } } },
@@ -349,9 +351,9 @@ static const BuiltInSupportGripDefaults gBuiltInSupportGripDefaults[] = {
 	{ WEAPONTYPE_MP5, ModelSets::MODEL_SET_CLASSIC,
 		{ -7,39,-10 }, { -64,360,32 }, SUPPORT_GRIP_MAGAZINE },
 	{ WEAPONTYPE_M4, ModelSets::MODEL_SET_CLASSIC,
-		{ 8,38,-6 }, { -66,360,14 }, SUPPORT_GRIP_MAGAZINE },
+		{ -15,75,-6 }, { -66,359,-292 }, SUPPORT_GRIP_FROM_BELOW },
 	{ WEAPONTYPE_RUGER, ModelSets::MODEL_SET_CLASSIC,
-		{ 6,49,-7 }, { -54,360,13 }, SUPPORT_GRIP_MAGAZINE },
+		{ -14,92,-8 }, { -54,360,-295 }, SUPPORT_GRIP_FROM_BELOW },
 	{ WEAPONTYPE_SNIPERRIFLE, ModelSets::MODEL_SET_CLASSIC,
 		{ -15,71,-4 }, { -47,300,-332 }, SUPPORT_GRIP_FROM_BELOW },
 	{ WEAPONTYPE_LASERSCOPE, ModelSets::MODEL_SET_CLASSIC,
@@ -368,6 +370,8 @@ static const BuiltInSupportGripDefaults gBuiltInSupportGripDefaults[] = {
 		{ -18,79,-8 }, { 0,297,-354 }, SUPPORT_GRIP_FROM_BELOW },
 	// Tuned in the headset against the Modern rifle, whose handguard sits
 	// further forward and lower than the classic model.
+	{ WEAPONTYPE_RUGER, ModelSets::MODEL_SET_MODERN,
+		{ -11,98,-4 }, { -29,359,-360 }, SUPPORT_GRIP_FROM_BELOW },
 	{ WEAPONTYPE_M4, ModelSets::MODEL_SET_MODERN,
 		{ -12,70,-6 }, { -74,360,-332 }, SUPPORT_GRIP_FROM_BELOW },
 };
@@ -624,6 +628,41 @@ ReadCalibrationValue(const char *section, int hand, const char *name,
 	char key[64];
 	return (int)(int32)GetPrivateProfileIntA(section,
 		CalibrationKey(hand, name, key), fallback, kSettingsPath);
+}
+
+// The laser override lives beside the weapon's calibration, in the same
+// section, so it travels with everything else authored for that weapon.
+// -1 follows the global switch, 0 is off, 1 is on.
+static void
+WeaponLaserSection(int weaponType, char *section, int size)
+{
+	const bool modern = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_WEAPONS) == ModelSets::MODEL_SET_MODERN;
+	snprintf(section, size, modern ? "VRWeaponModern_%02d_%s" :
+		"VRWeapon_%02d_%s", weaponType, GetVrWeaponName(weaponType));
+}
+
+static int
+ReadWeaponLaserOverride(int weaponType)
+{
+	if(weaponType < 0)
+		return -1;
+	char section[96];
+	WeaponLaserSection(weaponType, section, sizeof(section));
+	const int stored = (int)(int32)GetPrivateProfileIntA(section,
+		"Laser", -1, kSettingsPath);
+	return stored < 0 ? -1 : (stored != 0 ? 1 : 0);
+}
+
+static void
+WriteWeaponLaserOverride(int weaponType, int value)
+{
+	if(weaponType < 0)
+		return;
+	char section[96], text[16];
+	WeaponLaserSection(weaponType, section, sizeof(section));
+	snprintf(text, sizeof(text), "%d", value);
+	WritePrivateProfileStringA(section, "Laser", text, kSettingsPath);
 }
 
 static bool
@@ -1783,6 +1822,28 @@ UpdateWeaponTriggerEdges(bool blocked, uint32 blockedHands,
 	}
 }
 
+// The holster update below runs only during gameplay with no menu up, and
+// the calibration page is a menu. The one thing that still has to happen
+// there is the free hand taking the foregrip: that socket is exactly what
+// the page edits, and it cannot be judged against a hand beside it.
+static void
+UpdateWeaponCalibrationSupportPreview(void)
+{
+	for(int primary = 0; primary < VR_HAND_COUNT; primary++){
+		const int support = 1-primary;
+		const int slot = gHeldSlot[primary];
+		const int weaponType =
+			slot >= 0 ? GetVrWeaponTypeForSlot(slot) : -1;
+		if(slot < 0 || gHeldSlot[support] >= 0 ||
+		   !IsTwoHanded(weaponType) || !gPoseValid[support]){
+			if(gSupportHand[primary] == support)
+				gSupportHand[primary] = -1;
+			continue;
+		}
+		gSupportHand[primary] = support;
+	}
+}
+
 static void
 UpdateHolsterInput(uint32 blockedHands)
 {
@@ -1827,13 +1888,6 @@ UpdateHolsterInput(uint32 blockedHands)
 		   IsAuxiliaryHandReserved(support) ||
 		   !IsTwoHanded(weaponType) || !gPoseValid[support])
 			continue;
-		// While the calibration page is open the free hand takes the
-		// foregrip on its own: the numbers being edited move that socket,
-		// and they cannot be judged against a hand that is not on it.
-		if(gWeaponCalibrationPreview){
-			gSupportHand[primary] = support;
-			continue;
-		}
 		if(gGrip[support] < 0.65f || gGripLatched[support])
 			continue;
 		CVector pivot, expected;
@@ -2422,6 +2476,8 @@ ApplyTouchInput(CControllerState *state)
 	if(gameplay && !menu &&
 	   (!FindPlayerVehicle() || IsImmersiveDrivingActive()))
 		UpdateHolsterInput(vehicleCapturedHands);
+	else if(gWeaponCalibrationPreview && gameplay)
+		UpdateWeaponCalibrationSupportPreview();
 	else if(!gameplay)
 		ResetInteraction();
 	UpdateMelee();
@@ -2496,6 +2552,34 @@ bool AreWeaponHolsterHighlightsEnabled()
 	return gHolsterHighlights || gWeaponCalibrationPreview;
 }
 bool IsTrackedWeaponLaserEnabled() { LoadSettings(); return gWeaponLaser; }
+
+// Per weapon, with the page-wide switch as the fallback. A laser earns its
+// place on a pistol and gets in the way on a rifle with iron sights, so the
+// choice belongs to the weapon rather than to the whole loadout.
+bool
+IsTrackedWeaponLaserEnabledForType(int weaponType)
+{
+	LoadSettings();
+	const int stored = ReadWeaponLaserOverride(weaponType);
+	return stored < 0 ? gWeaponLaser : stored != 0;
+}
+
+int
+GetQuestWeaponLaserOverride(int weaponType)
+{
+	LoadSettings();
+	return ReadWeaponLaserOverride(weaponType);
+}
+
+void
+CycleQuestWeaponLaserOverride(int weaponType, int direction)
+{
+	LoadSettings();
+	// Three states in a ring: follow the global switch, always on, off.
+	int stored = ReadWeaponLaserOverride(weaponType)+1;
+	stored = (stored+3+(direction < 0 ? -1 : 1)) % 3;
+	WriteWeaponLaserOverride(weaponType, stored-1);
+}
 bool IsTrackedScopeActive() { return gScopeHand >= 0; }
 bool IsTrackedScopeActiveForHand(int hand) { return gScopeHand == hand; }
 int GetTrackedScopeWeaponType() { return gScopeWeaponType; }
@@ -3590,6 +3674,13 @@ AdjustQuestCalibrationValue(int hand, int weaponType, int item,
 		return;
 	*value = clamp(*value+(direction < 0 ? -1 : 1),
 		minimum, maximum);
+	// The underhand grip starts palm down, which points the fingers at the
+	// floor instead of around the grip. Seed the roll the first time the
+	// style is picked; a wrist that has already been rolled keeps its own.
+	if(item == 18 && *value == SUPPORT_GRIP_FROM_BELOW &&
+	   calibration->supportRotationZ == 0)
+		calibration->supportRotationZ =
+			SUPPORT_GRIP_FROM_BELOW_ROLL_HALF_DEG;
 	if(item >= 12)
 		calibration->supportPoseVersion = SUPPORT_GRIP_POSE_VERSION;
 	SaveQuestCalibration(hand, weaponType, *calibration);
