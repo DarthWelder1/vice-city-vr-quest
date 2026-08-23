@@ -263,7 +263,7 @@ for relative in "models/generic/wheels.dff" "models/generic/wheels.txd"; do
   local_wheel="$MODERN/$relative"
   remote_wheel="$STAGING_REMOTE/$relative"
   local_hash="$(file_sha256 "$local_wheel")"
-  hash_output="$(adb_capture shell sha256sum "$remote_wheel"; echo "$CAPTURED_OUTPUT" | grep -oiE '\b[0-9a-f]{64}\b' | head -1 | tr '[:upper:]' '[:lower:]')"
+  hash_output="$(adb_capture shell sha256sum "$remote_wheel"; echo "$CAPTURED_OUTPUT" | grep -oiE '\b[0-9a-f]{64}\b' | head -1 | tr '[:lower:]' '[:upper:]')"
   if [ -z "$hash_output" ] || [ "$hash_output" != "$local_hash" ]; then
     die "Copied SHA256 mismatch for $relative. The previous Modern folder remains active."
   fi
