@@ -187,7 +187,7 @@ resolve_game_files_folder() {
   local candidate
   for candidate in "${candidates[@]}"; do
     if test_game_files_folder "$candidate"; then
-      echo "Using the port assets already on this PC: $candidate"
+      echo "Using the port assets already on this PC: $candidate" >&2
       echo "$(cd "$candidate" && pwd)"
       return 0
     fi
@@ -202,7 +202,7 @@ resolve_game_files_folder() {
   if [ -d "$revc_dir" ]; then
     die "$revc_dir exists but has no usable gamefiles folder. Remove it and retry, or pass --game-files-dir."
   fi
-  echo "Downloading the tested reVC source for its replacement assets..."
+  echo "Downloading the tested reVC source for its replacement assets..." >&2
   checked "reVC clone failed" "$git_exe" clone --no-checkout -b "$REVC_BRANCH" "$REVC_URL" "$revc_dir"
   checked "Could not select the tested reVC commit" "$git_exe" -c "safe.directory=$revc_dir" -C "$revc_dir" checkout --detach "$TESTED_REVC_COMMIT"
 

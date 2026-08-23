@@ -129,7 +129,8 @@ resolve_modern_folder() {
     if [ "$NON_INTERACTIVE" -eq 1 ]; then
       die "--modern-dir is required in non-interactive mode."
     fi
-    echo "Paste the generated modern folder path:"
+    # stdout is captured as the resolved path, so the prompt goes to stderr.
+    echo "Paste the generated modern folder path:" >&2
     read -r -p "Modern folder " requested
   fi
 

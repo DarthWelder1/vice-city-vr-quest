@@ -93,7 +93,8 @@ resolve_game_folder() {
     if [ "$NON_INTERACTIVE" -eq 1 ]; then
       die "--game-dir is required in non-interactive mode."
     fi
-    echo "Select the original GTA Vice City installation folder (paste a path):"
+    # stdout is captured as the resolved path, so the prompt goes to stderr.
+    echo "Select the original GTA Vice City installation folder (paste a path):" >&2
     read -r -p "GTA Vice City folder " requested
   fi
   [ -n "$requested" ] && [ -d "$requested" ] || die "The GTA Vice City folder does not exist: $requested"
@@ -142,13 +143,13 @@ file_sha256() {
 ensure_download() {
   local name="$1" url="$2" destination="$3" size="$4" sha256="$5" provided="$6"
   if [ -n "$provided" ]; then
-    echo "Verifying supplied $name archive..."
+    echo "Verifying supplied $name archive..." >&2
     test_file_identity "$provided" "$size" "$sha256" || die "The supplied $name archive does not match the tested size/SHA256: $provided"
     echo "$provided"
     return 0
   fi
   if test_file_identity "$destination" "$size" "$sha256"; then
-    echo "Reusing verified download: $destination"
+    echo "Reusing verified download: $destination" >&2
     echo "$destination"
     return 0
   fi
@@ -158,9 +159,9 @@ ensure_download() {
     rm -f "$partial"
   fi
   command -v curl >/dev/null || die "curl was not found; it is required to download the verified archives."
-  echo "Downloading $name ($((size / 1024 / 1024)) MB). Interrupted downloads resume automatically..."
+  echo "Downloading $name ($((size / 1024 / 1024)) MB). Interrupted downloads resume automatically..." >&2
   checked "$name download failed" curl --fail --location --retry 5 --retry-all-errors --continue-at - --output "$partial" "$url"
-  echo "Verifying $name SHA256..."
+  echo "Verifying $name SHA256..." >&2
   test_file_identity "$partial" "$size" "$sha256" || die "$name download completed but failed the pinned size/SHA256 check. Delete '$partial' and retry."
   mv -f "$partial" "$destination"
   echo "$destination"
@@ -171,14 +172,14 @@ ensure_extracted() {
   local name="$1" archive="$2" destination="$3" sha256="$4"
   local marker="$destination/.vcvr-source-sha256"
   if [ -f "$marker" ] && [ "$(cat "$marker" | tr -d '[:space:]')" = "$sha256" ]; then
-    echo "Reusing verified extraction: $destination"
+    echo "Reusing verified extraction: $destination" >&2
     echo "$destination"
     return 0
   fi
   rm -rf "$destination"
   mkdir -p "$destination"
   command -v tar >/dev/null || die "tar was not found; it is required to extract the verified archives."
-  echo "Extracting $name..."
+  echo "Extracting $name..." >&2
   checked "$name extraction failed" tar -xf "$archive" -C "$destination"
   printf '%s' "$sha256" > "$marker"
   echo "$destination"

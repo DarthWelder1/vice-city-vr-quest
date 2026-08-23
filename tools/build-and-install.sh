@@ -161,7 +161,7 @@ find_java_home() {
 
   if [ ! -x "$bin" ]; then
     if [ ! -f "$zip" ]; then
-      echo "JDK 21 was not found; downloading official Eclipse Temurin $JDK_VERSION..."
+      echo "JDK 21 was not found; downloading official Eclipse Temurin $JDK_VERSION..." >&2
       checked "Temurin JDK download failed" curl -fsSL --retry 5 --retry-all-errors -o "$zip" "$JDK_URL"
     fi
     local observed
@@ -197,7 +197,7 @@ ensure_android_command_line_tools() {
 
   if [ ! -x "$sdkmanager" ]; then
     if [ ! -f "$zip" ]; then
-      echo "Android SDK command-line tools are missing; downloading them from Google..."
+      echo "Android SDK command-line tools are missing; downloading them from Google..." >&2
       checked "Android command-line tools download failed" curl -fsSL --retry 5 --retry-all-errors -o "$zip" "$ANDROID_CMDLINE_TOOLS_URL"
     fi
     local observed
@@ -348,12 +348,16 @@ resolve_game_folder() {
     if [ "$NON_INTERACTIVE" -eq 1 ]; then
       die "--game-dir is required unless --skip-game-data or --build-only is used."
     fi
-    echo ""
-    echo "Enter your legally owned GTA Vice City PC installation folder."
+    # User-facing prompts go to stderr: this function's stdout is captured as
+    # its return value (the resolved path), so informational text must not
+    # pollute it. (PowerShell equivalent: Write-Host, which bypasses the
+    # output stream and only writes to the console.)
+    echo "" >&2
+    echo "Enter your legally owned GTA Vice City PC installation folder." >&2
     if [ "$required" -eq 1 ]; then
-      echo "The previous app was removed, so its Quest data may have been erased. This folder is required to restore the game data."
+      echo "The previous app was removed, so its Quest data may have been erased. This folder is required to restore the game data." >&2
     else
-      echo "Press Enter to skip copying data if it is already installed on the Quest."
+      echo "Press Enter to skip copying data if it is already installed on the Quest." >&2
     fi
     read -r -p "Vice City folder " requested
     if [ -z "$requested" ]; then
