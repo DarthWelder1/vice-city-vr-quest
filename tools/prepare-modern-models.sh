@@ -144,8 +144,18 @@ file_sha256() {
 # range returns an HTML interstitial ("too large to scan ... download
 # anyway?"). Bounded *partial* ranges, however, are served directly — that is
 # what the "Download anyway" button triggers. So fetch the file in bounded
-# chunks and stitch them together. Resumable: already-downloaded chunks are
-# skipped, and an incomplete trailing chunk is truncated back to a boundary.
+# chunks and stitch them together.
+#
+# A bounded range can still come back as an HTML page for two reasons, both
+# handled by retrying the same chunk with backoff:
+#   * the "too large to scan" interstitial (whole-file requests only — a
+#     bounded range normally never returns it), and
+#   * a transient per-IP "Quota exceeded / too many users have viewed or
+#     downloaded this file recently" rate-limit page, which can appear on any
+#     request after rapid pulls and clears on its own (Google says up to 24h).
+# A short pause between chunks keeps the pull gentle enough to avoid tripping
+# that rate limit in the first place. Resumable: already-downloaded chunks are
+# skipped and an incomplete trailing chunk is truncated back to a boundary.
 download_gdrive_chunked() {
   local name="$1" url="$2" partial="$3" size="$4"
   local chunk=104857600  # 100 MB per request (proven to stream real bytes)
@@ -158,24 +168,52 @@ download_gdrive_chunked() {
       truncate -s "$start" "$partial" 2>/dev/null || { head -c "$start" "$partial" > "$partial.tmp" && mv -f "$partial.tmp" "$partial"; }
     fi
   fi
-  echo "Downloading $name ($((size / 1024 / 1024)) MB) in 100 MB chunks. Google blocks whole-file GETs for files it can't virus-scan, so this fetches bounded ranges and stitches them. Interrupted downloads resume automatically..." >&2
+  echo "Downloading $name ($((size / 1024 / 1024)) MB) in 100 MB chunks. Google blocks whole-file GETs for files it can't virus-scan, so this fetches bounded ranges and stitches them. Interrupted downloads resume automatically; if Google rate-limits a chunk it waits and retries." >&2
   local tmp="$partial.chunk"
+  local max_attempts=8
+  local end attempt ok expect got backoff
   while [ "$start" -lt "$size" ]; do
-    local end=$(( start + chunk - 1 ))
+    end=$(( start + chunk - 1 ))
     [ "$end" -ge "$size" ] && end=$(( size - 1 ))
-    rm -f "$tmp"
-    checked "$name chunk ${start}-${end} failed" \
-      curl --fail --location --retry 5 --retry-all-errors \
-        -r "${start}-${end}" --output "$tmp" "$url"
-    # A bounded range must return real file bytes, not the HTML interstitial.
-    if [ "$(stat -c%s "$tmp")" -lt 100000 ] && [ "$(head -c 15 "$tmp" 2>/dev/null)" = "<!DOCTYPE html>" ]; then
+    expect=$(( end - start + 1 ))
+    attempt=1
+    ok=0
+    while [ "$attempt" -le "$max_attempts" ]; do
       rm -f "$tmp"
-      die "The $name link returned an HTML error page instead of file data. The shared file may be revoked or unavailable. Ask the pack author for a working link, or supply the archive with --hd-archive / --mods-archive."
-    fi
+      curl --fail --location --retry 3 --retry-all-errors \
+        -r "${start}-${end}" --output "$tmp" "$url" 2>/dev/null || true
+      got=0
+      [ -f "$tmp" ] && got="$(stat -c%s "$tmp")"
+      # An HTML interstitial ("too large to scan" or the transient "Quota
+      # exceeded / too many users" rate-limit page): back off, then retry.
+      if [ "$got" -gt 0 ] && [ "$got" -lt 100000 ] && [ "$(head -c 15 "$tmp" 2>/dev/null)" = "<!DOCTYPE html>" ]; then
+        rm -f "$tmp"
+        backoff=$(( 25 * attempt ))
+        [ "$backoff" -gt 200 ] && backoff=200
+        echo "  $name: Google rate-limited chunk ${start}-${end} (attempt $attempt/$max_attempts); waiting ${backoff}s..." >&2
+        sleep "$backoff"
+        attempt=$(( attempt + 1 ))
+        continue
+      fi
+      # A full chunk of real bytes: done.
+      if [ "$got" -eq "$expect" ]; then
+        ok=1
+        break
+      fi
+      # Anything else (missing/empty/partial file): transient network error.
+      rm -f "$tmp"
+      echo "  $name: incomplete chunk ${start}-${end}, got ${got}/${expect} bytes (attempt $attempt/$max_attempts); retrying in 5s..." >&2
+      sleep 5
+      attempt=$(( attempt + 1 ))
+    done
+    [ "$ok" -eq 1 ] || die "The $name chunk ${start}-${end} kept returning an HTML error page after $max_attempts attempts. Google is rate-limiting this IP (its page says 'too many users have viewed or downloaded this file recently'). Wait a while and re-run — the partial download resumes where it left off. Or supply the archive with --hd-archive / --mods-archive."
     cat "$tmp" >> "$partial"
     rm -f "$tmp"
     start=$(( start + chunk ))
     echo "  $name: $(( start / 1024 / 1024 )) MB / $(( size / 1024 / 1024 )) MB" >&2
+    # Be gentle between chunks so rapid back-to-back 100 MB pulls don't trip
+    # Google's per-IP "too many users" throttle.
+    [ "$start" -lt "$size" ] && sleep 3
   done
   [ "$(stat -c%s "$partial")" -eq "$size" ] || die "$name chunked download ended at $(stat -c%s "$partial") bytes, expected $size."
 }
