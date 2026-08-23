@@ -29,7 +29,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  #endif
  
  #if defined(FIX_BUGS)
-@@ -241,6 +254,334 @@
+@@ -241,6 +254,340 @@
  		RwTexDictionaryFindNamedTexture(txd->texDict, weaponModel->GetModelName()) : nil;
  }
  
@@ -282,7 +282,11 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +
 +	CRect rect(centreX-width*0.5f, centreY-height*0.5f,
 +		centreX+width*0.5f, centreY+height*0.5f);
-+	const CRGBA white(255, 255, 255, 255);
++	// The glance reveal fades a panel in, so the quad is drawn at whatever
++	// of it the player's own aim has brought up.
++	const int alpha = (int)(255.0f*
++		androidgame::VrWristPanelOpacity(VR_WRIST_PANEL_MAP));
++	const CRGBA white(255, 255, 255, alpha);
 +	CSprite2d::SetVertices(rect, white, white, white, white);
 +	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, map);
 +	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
@@ -344,7 +348,9 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +		return true;
 +
 +	CRect rect(left, top, right, bottom);
-+	const CRGBA white(255, 255, 255, 255);
++	const int alpha = (int)(255.0f*
++		androidgame::VrWristPanelOpacity(VR_WRIST_PANEL_STATUS));
++	const CRGBA white(255, 255, 255, alpha);
 +	CSprite2d::SetVertices(rect, white, white, white, white);
 +	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, panel);
 +	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);

@@ -238,7 +238,7 @@ diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
 diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 --- a/src/render/Hud.cpp
 +++ b/src/render/Hud.cpp
-@@ -34,17 +34,33 @@
+@@ -34,17 +34,34 @@
  bool VrGameplayHudEnabled(void);
  bool VrShouldUseTheaterMode(void);
  bool VrWristPanelEnabled(int panel);
@@ -248,6 +248,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +void VrWristAmmoColour(unsigned char *red, unsigned char *green,
 +                       unsigned char *blue);
 +int VrWristPanelHand(int panel);
++float VrWristPanelOpacity(int panel);
  void *BeginVrWristPanel(int panel, float centreX, float centreY, float width,
 -	float height);
 +	float height, int hand = -1);
@@ -413,7 +414,7 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
  		return false;
  
  	// The block the money, health, armour and wanted rows occupy, with a
-@@ -579,6 +698,98 @@
+@@ -579,6 +698,102 @@
  	androidgame::EndVrWristPanel();
  	return true;
  }
@@ -429,7 +430,9 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +		return;
 +
 +	CRect rect(0.0f, 0.0f, width, height);
-+	const CRGBA white(255, 255, 255, 255);
++	const int alpha = (int)(255.0f*
++		androidgame::VrWristPanelOpacity(VR_WRIST_PANEL_AMMO));
++	const CRGBA white(255, 255, 255, alpha);
 +	CSprite2d::SetVertices(rect, white, white, white, white);
 +	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, panel);
 +	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
@@ -495,7 +498,9 @@ diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 +		return true;
 +
 +	CRect rect(0.0f, 0.0f, width, height);
-+	const CRGBA white(255, 255, 255, 255);
++	const int alpha = (int)(255.0f*
++		androidgame::VrWristPanelOpacity(VR_WRIST_PANEL_CLOCK));
++	const CRGBA white(255, 255, 255, alpha);
 +	CSprite2d::SetVertices(rect, white, white, white, white);
 +	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, panel);
 +	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);

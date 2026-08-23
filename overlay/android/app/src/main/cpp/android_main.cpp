@@ -847,6 +847,63 @@ BuildWristPanelPlane(int panel, int hand, float plane[16], float centreX,
 	return true;
 }
 
+// A panel worn on the arm is a thing the player looks at, not a display
+// pinned to the world, and with the arm down it should be as absent as a
+// watch under a sleeve. Two questions decide it: whether the head is
+// turned towards the panel, and whether the arm has been brought near
+// enough to read. Both answer over a band rather than at a line, and the
+// arm crosses that band in its own time, so there is nothing to smooth
+// and nothing to pop.
+static const float kWristGazeFullCos = 0.94f;	// about 20 degrees out
+static const float kWristGazeGoneCos = 0.83f;	// about 34 degrees out
+// The last stretch of the player's chosen range is the fade, so a panel
+// held at arm's length dims rather than blinking off.
+static const float kWristGazeFadeMetres = 0.15f;
+static float gWristPanelOpacity[rw::vulkan::WRIST_PANEL_COUNT] = {
+	1.0f, 1.0f, 1.0f, 1.0f
+};
+
+static float
+WristPanelGazeOpacity(const float plane[16], float centreX,
+                      float centreY)
+{
+	if(!VrWristPanelGazeReveal())
+		return 1.0f;
+	// The panel is placed in play space, so the head has to be asked for in
+	// the world and brought across the same way the wrist was.
+	float worldEye[3], worldForward[3], eye[3], forward[3];
+	if(!VrGetViewBasis(worldEye, nil, nil, worldForward) ||
+	   !rw::vulkan::firstPersonWorldPositionToPlay(worldEye, eye) ||
+	   !rw::vulkan::firstPersonWorldVectorToPlay(worldForward, forward))
+		return 1.0f;
+	// The plane's translation is where screen (0,0) lands, so walking out
+	// along its two axes to the centre pixel arrives at the middle of the
+	// panel.
+	float toPanel[3], distance = 0.0f;
+	for(int axis = 0; axis < 3; axis++){
+		toPanel[axis] = plane[12+axis]+plane[axis]*centreX+
+			plane[4+axis]*centreY-eye[axis];
+		distance += toPanel[axis]*toPanel[axis];
+	}
+	distance = sqrtf(distance);
+	if(distance < 0.01f)
+		return 1.0f;
+	const float range = VrWristPanelGazeRange();
+	if(distance >= range)
+		return 0.0f;
+	float facing = 0.0f;
+	for(int axis = 0; axis < 3; axis++)
+		facing += toPanel[axis]/distance*forward[axis];
+	if(facing <= kWristGazeGoneCos)
+		return 0.0f;
+	const float aim = facing >= kWristGazeFullCos ? 1.0f :
+		(facing-kWristGazeGoneCos)/
+			(kWristGazeFullCos-kWristGazeGoneCos);
+	const float reach = distance <= range-kWristGazeFadeMetres ? 1.0f :
+		(range-distance)/kWristGazeFadeMetres;
+	return aim < reach ? aim : reach;
+}
+
 // Puts the interface plane on the wrist and hands back the finished panel to
 // bind, or null when there is nothing to draw yet. Every call also asks the
 // backend for the next frame's render: the request is one-shot, so a paused or
@@ -876,20 +933,34 @@ BeginVrWristPanel(int panel, float centreX, float centreY, float width,
 			&RenderWristPanelAmmo);
 		registered = true;
 	}
+	float plane[16];
+	const bool placed = gHudIm2DValid &&
+		BuildWristPanelPlane(panel, hand < 0 ?
+			(VrWristPanelHand(panel) ? 1 : 0) : hand,
+			plane, centreX, centreY, width);
+	gWristPanelOpacity[panel] = placed ?
+		WristPanelGazeOpacity(plane, centreX, centreY) : 1.0f;
+	// A panel the player has looked away from is not asked for either: the
+	// offscreen render is what a hidden map would otherwise still cost.
+	if(gWristPanelOpacity[panel] <= 0.0f)
+		return nil;
 	rw::vulkan::setWristPanelWanted(panel, true);
 
 	// Null on the first frame a panel is switched on: its texture only exists
 	// once a render has been through it.
 	rw::Raster *texture = rw::vulkan::getWristPanelRaster(panel);
-	float plane[16];
-	if(texture == nil || !gHudIm2DValid ||
-	   !BuildWristPanelPlane(panel, hand < 0 ?
-	     (VrWristPanelHand(panel) ? 1 : 0) : hand,
-	     plane, centreX, centreY, width))
+	if(texture == nil || !placed)
 		return nil;
 	rw::vulkan::setIm2DTransform(plane, gHudIm2DDistance, gHudIm2DEye);
 	rw::vulkan::setIm2DSafeAreaSuspended(true);
 	return texture;
+}
+
+float
+VrWristPanelOpacity(int panel)
+{
+	return panel >= 0 && panel < rw::vulkan::WRIST_PANEL_COUNT ?
+		gWristPanelOpacity[panel] : 1.0f;
 }
 
 void

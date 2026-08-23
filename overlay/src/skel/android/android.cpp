@@ -636,9 +636,13 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	// Tommy with tracked hands.  CRenderer and CPed both consume this flag, so
 	// decide it once here instead of letting their early Vulkan exits hide the
 	// DEFAULT occupant unconditionally.
+// Dying is the one moment on foot when the camera leaves the head and
+// looks back at Tommy. Hiding him then plays the shot over empty
+// pavement, so he is drawn from the blow that kills him.
 #ifdef GTA_VR_WEAPONS
 	gVrHidePlayerBody = !thirdPersonVehicle &&
-		(!gVrInVehicle || OculusVR::IsImmersiveDrivingActive());
+		(!gVrInVehicle || OculusVR::IsImmersiveDrivingActive()) &&
+		!(player != nil && player->DyingOrDead());
 #else
 	gVrHidePlayerBody = true;
 #endif

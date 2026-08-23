@@ -5,6 +5,7 @@
 #include "Frontend.h"
 #include "PlayerInfo.h"
 #include "PlayerPed.h"
+#include "World.h"
 #include "VRHandModel.h"
 #include "vulkan/rwvk.h"
 #ifdef GTA_VR_WEAPONS
@@ -94,6 +95,11 @@ void
 RenderTrackedHands(void)
 {
 	if(!::gVrFirstPersonActive)
+		return;
+	// A dead Tommy is drawn with his own arms, and the tracked pair would
+	// be left floating over the body he is lying in.
+	CPlayerPed *player = FindPlayerPed();
+	if(player == nil || player->DyingOrDead())
 		return;
 
 	const PadInput &input = GetPadInput();

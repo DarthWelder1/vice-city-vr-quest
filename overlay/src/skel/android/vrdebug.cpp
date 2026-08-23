@@ -253,6 +253,14 @@ static bool gWristPanelOn[WRIST_PANEL_COUNT] = { false, false, false, false };
 static bool gWristPanelUnderside[WRIST_PANEL_COUNT] = { true, true, false, false };
 // The map on the left, the readout and the watch on the right.
 static int gWristPanelHand[WRIST_PANEL_COUNT] = { 0, 1, 1, 1 };
+// One switch for all four: they are one interface worn in pieces, and
+// half of it fading is not a HUD. It comes with IMMERSIVE, which is the
+// preset that puts the readouts on the arms in the first place -- an arm
+// at rest carrying a lit map is the thing that preset is trying to avoid.
+static bool gWristPanelGaze = true;
+// The reach of that glance: nearer than this and a panel is worth
+// showing, beyond it the arm is not being read.
+static int gWristPanelGazeRangeCm = 60;
 // Driving normally hands the interface back to the head-locked plane. Immersive
 // driving keeps the arms on the wheel, so the panels can stay on them there.
 static bool gWristPanelsInVehicle;
@@ -406,6 +414,10 @@ enum eVrHudMenuItem {
 	VR_HUD_PANEL_HAND,
 	VR_HUD_PANEL_SIDE,
 	VR_HUD_PANEL_CALIBRATE,
+	// The reveal belongs to the worn set rather than to the panel being
+	// edited above, so it sits below the selector's own rows.
+	VR_HUD_PANEL_GAZE,
+	VR_HUD_PANEL_GAZE_RANGE,
 	VR_HUD_WRIST_IN_VEHICLE,
 	VR_HUD_WEAPON_PANEL,
 	VR_HUD_CLOCK,
@@ -809,6 +821,10 @@ LoadVrSettings(void)
 		"WristClockUnderside", 0, ".\\vr_settings.ini") != 0;
 	gWristPanelHand[WRIST_PANEL_CLOCK] = GetPrivateProfileIntA("VR",
 		"WristClockHand", 1, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gWristPanelGaze = GetPrivateProfileIntA("VR",
+		"WristPanelGazeReveal", 1, ".\\vr_settings.ini") != 0;
+	gWristPanelGazeRangeCm = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WristPanelGazeRangeCm", 60, ".\\vr_settings.ini"), 20, 200);
 	gWristPanelsInVehicle = GetPrivateProfileIntA("VR",
 		"WristPanelsInVehicle", 1, ".\\vr_settings.ini") != 0;
 	static const char *const fieldNames[7] = {
@@ -1065,6 +1081,9 @@ SaveWristPanels(void)
 		".\\vr_settings.ini");
 	WritePrivateProfileStringA("VR", "WristAmmoHand",
 		gWristPanelHand[WRIST_PANEL_AMMO] ? "1" : "0", ".\\vr_settings.ini");
+	WritePrivateProfileStringA("VR", "WristPanelGazeReveal",
+		gWristPanelGaze ? "1" : "0", ".\\vr_settings.ini");
+	SaveVrInteger("WristPanelGazeRangeCm", gWristPanelGazeRangeCm);
 	WritePrivateProfileStringA("VR", "WristPanelsInVehicle",
 		gWristPanelsInVehicle ? "1" : "0", ".\\vr_settings.ini");
 	static const char *const names[7] = {
@@ -1131,6 +1150,7 @@ ApplyHudPreset(int preset)
 	gWristPanelOn[WRIST_PANEL_STATUS] = immersive;
 	gWristPanelOn[WRIST_PANEL_CLOCK] = immersive;
 	gWristPanelsInVehicle = immersive;
+	gWristPanelGaze = immersive;
 	gHudWeaponPanel = !immersive;
 	gHudClock = !immersive;
 	SaveWristPanels();
@@ -1448,7 +1468,12 @@ IsMenuItemVisible(int page, int item)
 		case VR_HUD_PANEL_SHOW:
 		case VR_HUD_PANEL_HAND:
 		case VR_HUD_PANEL_SIDE:
+		case VR_HUD_PANEL_GAZE:
 		case VR_HUD_PANEL_CALIBRATE:
+			return preset != VR_HUD_PRESET_CLASSIC;
+		case VR_HUD_PANEL_GAZE_RANGE:
+			// Nothing to set a range for while everything is always up.
+			return preset != VR_HUD_PRESET_CLASSIC && gWristPanelGaze;
 		case VR_HUD_WRIST_IN_VEHICLE:
 			return preset != VR_HUD_PRESET_CLASSIC;
 		}
@@ -1489,13 +1514,13 @@ IsMenuItemVisible(int page, int item)
 		case VR_VEHICLE_MODEL_WHEEL_VISIBLE:
 		case VR_VEHICLE_WHEEL_HAND_PULL_BACK:
 			return carDriven;
-		case VR_VEHICLE_HANDLE_HIGHLIGHTS:
 		case VR_VEHICLE_BIKE_LOCK_HORIZON:
 		case VR_VEHICLE_BIKE_THROTTLE:
 		case VR_VEHICLE_BIKE_VISUAL_LEAN:
 		case VR_VEHICLE_BIKE_VIEW_TILT:
 		case VR_VEHICLE_BIKE_THROW_RIDER:
 			return bikeDriven;
+		case VR_VEHICLE_HANDLE_HIGHLIGHTS:
 		case VR_VEHICLE_MOTION_HAND:
 		case VR_VEHICLE_CALIBRATION:
 			return carDriven || bikeDriven;
@@ -2057,6 +2082,15 @@ VrDebugUpdate(const PadInput &in)
 			case VR_HUD_PANEL_SIDE:
 				gWristPanelUnderside[gVrWristPanelEdit] =
 					!gWristPanelUnderside[gVrWristPanelEdit];
+				SaveWristPanels();
+				break;
+			case VR_HUD_PANEL_GAZE:
+				gWristPanelGaze = !gWristPanelGaze;
+				SaveWristPanels();
+				break;
+			case VR_HUD_PANEL_GAZE_RANGE:
+				gWristPanelGazeRangeCm = clamp(
+					gWristPanelGazeRangeCm+direction, 20, 200);
 				SaveWristPanels();
 				break;
 			case VR_HUD_PANEL_CALIBRATE:
@@ -2939,6 +2973,11 @@ DrawQuestHudPage(void)
 		gWristPanelUnderside[panel] ? "UNDER THE WRIST" : "ON TOP");
 	snprintf(rows[VR_HUD_PANEL_CALIBRATE], sizeof(rows[0]),
 		"PLACE AND SIZE %s  < OPEN >", WristPanelName(panel));
+	snprintf(rows[VR_HUD_PANEL_GAZE], sizeof(rows[0]),
+		"SHOW PANELS  < %s >",
+		gWristPanelGaze ? "WHEN LOOKED AT" : "ALWAYS");
+	snprintf(rows[VR_HUD_PANEL_GAZE_RANGE], sizeof(rows[0]),
+		"LOOK RANGE  < %d CM >", gWristPanelGazeRangeCm);
 	snprintf(rows[VR_HUD_WRIST_IN_VEHICLE], sizeof(rows[0]),
 		"WRIST PANELS WHILE DRIVING  < %s >",
 		gWristPanelsInVehicle ? "IMMERSIVE ONLY" : "OFF");
@@ -3108,7 +3147,7 @@ DrawQuestVehiclePage(void)
 		"WHEEL HAND PULL BACK  < %+d MM >",
 		OculusVR::GetQuestWheelHandPullBackMm());
 	snprintf(rows[VR_VEHICLE_HANDLE_HIGHLIGHTS], sizeof(rows[0]),
-		"VEHICLE GRIP HIGHLIGHTS  < %s >",
+		"GRIP HIGHLIGHTS  < %s >",
 		OculusVR::AreQuestVehicleHandleHighlightsEnabled() ?
 			"ON" : "OFF");
 	snprintf(rows[VR_VEHICLE_BIKE_LOCK_HORIZON], sizeof(rows[0]),
@@ -3872,6 +3911,24 @@ VrWristPanelUnderside(int panel)
 	if(panel < 0 || panel >= WRIST_PANEL_COUNT)
 		return false;
 	return gWristPanelUnderside[panel];
+}
+
+bool
+VrWristPanelGazeReveal(void)
+{
+	LoadVrSettings();
+	// A panel being placed has to stay up while its numbers are read off
+	// the menu, which is not where the arm is.
+	if(gVrMenuVisible)
+		return false;
+	return gWristPanelGaze;
+}
+
+float
+VrWristPanelGazeRange(void)
+{
+	LoadVrSettings();
+	return (float)gWristPanelGazeRangeCm*0.01f;
 }
 
 int

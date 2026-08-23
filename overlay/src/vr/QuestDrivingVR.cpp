@@ -143,7 +143,6 @@ static int gMotionSteeringHand = 1;
 // How far the gripping hand is pulled off the wheel plane, towards the
 // driver, so the rim does not end up inside its wrist.
 static int gWheelHandPullBackMm;
-static bool gHandleHighlightsEnabled = true;
 static bool gBikeHorizonLocked = true;
 // Third-person vehicle view: the ordinary chase camera in stereo, with the
 // default controls. It is not a seating position, so no seat offset applies.
@@ -176,6 +175,12 @@ VehicleKindFor(CVehicle *vehicle)
 // dashboard already draws one, says nothing about a boat, where the helm
 // is the only thing to hold.
 static bool gImmersiveCarWheelVisible[2] = { true, true };
+// The marker teaches the grip, and every immersive vehicle has one to
+// teach, so each kind carries its own switch. On until a player who has
+// learned that kind turns it off; a rider who knows the bars may still
+// want the helm marked.
+static bool gHandleHighlights[VR_VEHICLE_KIND_COUNT] =
+	{ true, true, true };
 static bool gCalibrationPreview;
 
 static HandleCalibration
@@ -378,8 +383,19 @@ LoadDrivingSettings()
 	gMotionSteeringHand = clamp((int)(int32)GetPrivateProfileIntA(
 		"VR", "MotionSteeringHand", 1, kSettingsPath), 0,
 		VR_HAND_COUNT-1);
-	gHandleHighlightsEnabled = GetPrivateProfileIntA(
-		"VR", "BikeHandleHighlights", 1, kSettingsPath) != 0;
+	{
+		static const char *const key[VR_VEHICLE_KIND_COUNT] = {
+			"CarHandleHighlights", "BikeHandleHighlights",
+			"BoatHandleHighlights"
+		};
+		// The bike key came first and stood for every vehicle, so it is
+		// the fallback for all three.
+		const int legacy = GetPrivateProfileIntA("VR",
+			"BikeHandleHighlights", 1, kSettingsPath) != 0 ? 1 : 0;
+		for(int kind = 0; kind < VR_VEHICLE_KIND_COUNT; kind++)
+			gHandleHighlights[kind] = GetPrivateProfileIntA("VR",
+				key[kind], legacy, kSettingsPath) != 0;
+	}
 	gBikeHorizonLocked = GetPrivateProfileIntA(
 		"VR", "BikeLockHorizon", 1, kSettingsPath) != 0;
 	{
@@ -2724,7 +2740,8 @@ ShouldRenderImmersiveBikeHandleMarker(int hand)
 		return false;
 	if(gCalibrationPreview)
 		return true;
-	return gHandleHighlightsEnabled && !gBikeHandleGrabbed[hand];
+	return gHandleHighlights[VR_VEHICLE_KIND_BIKE] &&
+		!gBikeHandleGrabbed[hand];
 }
 
 bool
@@ -2753,7 +2770,8 @@ ShouldRenderImmersiveSteeringHandleMarker(int hand)
 	if(IsImmersiveCarActive()){
 		if(gCalibrationPreview)
 			return true;
-		return gHandleHighlightsEnabled && !gCarWheelGrabbed[hand];
+		return gHandleHighlights[VehicleKindFor(GetActivePlayerCar())] &&
+			!gCarWheelGrabbed[hand];
 	}
 	return ShouldRenderImmersiveBikeHandleMarker(hand);
 }
@@ -3195,7 +3213,7 @@ bool
 AreQuestVehicleHandleHighlightsEnabled()
 {
 	LoadDrivingSettings();
-	return gHandleHighlightsEnabled;
+	return gHandleHighlights[gVehicleKindEdit];
 }
 
 int
@@ -3236,9 +3254,13 @@ void
 ToggleQuestVehicleHandleHighlights()
 {
 	LoadDrivingSettings();
-	gHandleHighlightsEnabled = !gHandleHighlightsEnabled;
-	SaveSetting("BikeHandleHighlights",
-		gHandleHighlightsEnabled);
+	const int kind = gVehicleKindEdit;
+	static const char *const key[VR_VEHICLE_KIND_COUNT] = {
+		"CarHandleHighlights", "BikeHandleHighlights",
+		"BoatHandleHighlights"
+	};
+	gHandleHighlights[kind] = !gHandleHighlights[kind];
+	SaveSetting(key[kind], gHandleHighlights[kind]);
 }
 
 bool

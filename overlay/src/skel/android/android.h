@@ -170,6 +170,14 @@ bool VrWristPanelUnderside(int panel);
 // HUD menu. The values belong to the side of the wrist in use, not to a hand:
 // only the left hand is ever calibrated and the right one mirrors it.
 int VrWristPanelHand(int panel);
+// True when the worn panels are only shown while the player is looking at
+// them, so an arm at rest carries nothing. One answer for the whole set.
+bool VrWristPanelGazeReveal(void);
+// The reveal range, in metres.
+float VrWristPanelGazeRange(void);
+// How much of the panel the glance has brought up, 0 to 1. The quad is
+// drawn at this alpha so the panel fades in rather than appearing.
+float VrWristPanelOpacity(int panel);
 // Whether the panels stay on the arms behind a wheel. Only immersive driving
 // keeps the hands where a panel can be read, so that is the one case it covers.
 bool VrWristPanelsInVehicle(void);
