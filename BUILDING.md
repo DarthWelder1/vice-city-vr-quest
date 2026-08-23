@@ -15,6 +15,40 @@ command-line tools, Platform 35, Build-Tools 34.0.0, Platform-Tools, NDK
 27.2.12479018, CMake 3.22.1 and Gradle 8.13. The user must accept Google's SDK
 licenses when prompted.
 
+## Easiest Linux method
+
+1. Connect the Quest, enable USB debugging, and accept the authorization prompt
+   inside the headset.
+2. Run **`./BUILD_AND_INSTALL.sh`** in this repository.
+
+The wizard needs `git`, `curl`, `unzip` and `tar` on `PATH` (on CachyOS/Arch:
+`sudo pacman -S git curl unzip`). It then discovers or downloads JDK 21
+(pinned official Eclipse Temurin 21.0.11+10, SHA256-verified), the Android
+command-line tools (pinned, SHA256-verified) and Gradle 8.13 (pinned,
+SHA256-verified), and installs Platform 35, Build-Tools 34.0.0, Platform-Tools,
+NDK 27.2.12479018 and CMake 3.22.1 through `sdkmanager`. A system JDK 21
+(`JAVA_HOME`) or Android SDK (`ANDROID_HOME`/`ANDROID_SDK_ROOT`) is used when
+present. The user must accept Google's SDK licenses when prompted.
+
+The Linux entry points mirror the Windows ones:
+
+| Windows | Linux |
+|---|---|
+| `BUILD_AND_INSTALL.bat` | `BUILD_AND_INSTALL.sh` |
+| `INSTALL_MODERN_MODELS.bat` | `INSTALL_MODERN_MODELS.sh` |
+| `REPAIR_GAME_FILES.bat` | `REPAIR_GAME_FILES.sh` |
+
+The Modern-model builder needs one extra step on Linux: the texture compressor
+is built from source once, next to the other model-set tools:
+
+```sh
+cd tools/modelsets
+g++ -O2 -o txdcompress txdcompress.cpp
+```
+
+(`txdcompress` is gitignored; `txdcompress.exe` is the committed Windows build.)
+
+
 Do not launch `tools\build-and-install.ps1` directly. The `.bat` wrapper keeps
 the window open and always prints the location of the persistent diagnostic
 log: `%TEMP%\ViceCityVR-Build-And-Install.log`. If the build fails, attach that
@@ -37,15 +71,28 @@ If somebody downloaded only `BUILD_AND_INSTALL.bat`, the BAT downloads and
 extracts the complete public source kit automatically before starting the
 wizard. Extracting the repository ZIP manually is still supported.
 
+On Linux, run `./BUILD_AND_INSTALL.sh` instead. It mirrors the BAT: it keeps
+the terminal open on error, always prints the location of the persistent
+diagnostic log (`$TMPDIR/ViceCityVR-Build-And-Install.log`, usually
+`/tmp/ViceCityVR-Build-And-Install.log`), and downloads the complete public
+source kit if only the script itself was downloaded. Do not launch
+`tools/build-and-install.sh` directly: the wrapper is the supported entry
+point.
+
 Advanced command-line example:
 
 ```powershell
 .\BUILD_AND_INSTALL.bat -GameDir "C:\Games\Grand Theft Auto Vice City"
 ```
 
-Use `-BuildOnly` to stop after producing the APK, or `-SkipGameData` when the
-Quest already contains the required data. The manual steps below remain the
-reference and troubleshooting path.
+```sh
+./BUILD_AND_INSTALL.sh --game-dir "$HOME/Games/Grand Theft Auto Vice City"
+```
+
+Use `-BuildOnly` / `--build-only` to stop after producing the APK, or
+`-SkipGameData` / `--skip-game-data` when the Quest already contains the
+required data. The manual steps below remain the reference and troubleshooting
+path.
 
 ## 1. Install the toolchain
 
@@ -193,7 +240,8 @@ adb push C:\src\vice-city-vr-build\gamefiles\models $data
 ```
 
 An installation made before the wizard did this can be repaired without
-rebuilding: double-click `REPAIR_GAME_FILES.bat`. It copies only those files and
+rebuilding: double-click `REPAIR_GAME_FILES.bat` (Windows) or run
+`./REPAIR_GAME_FILES.sh` (Linux). It copies only those files and
 leaves saves, settings and models alone.
 
 The VR hand meshes are original MIT-licensed port assets, not GTA data and not
@@ -212,9 +260,12 @@ The final directory must directly contain `BigHandLeft.uxrh`,
 
 Optional third-party Modern models are installed separately after the APK and
 base game data. Connect and authorize the Quest, then double-click
-`INSTALL_MODERN_MODELS.bat` and select the legal original GTA Vice City PC
+`INSTALL_MODERN_MODELS.bat` (Windows) or run `./INSTALL_MODERN_MODELS.sh`
+(Linux) and select the legal original GTA Vice City PC
 folder. The one-button wizard downloads and verifies the two tested external
 packs, builds the personal overlay, and installs it; no APK rebuild is required.
+On Linux, build `tools/modelsets/txdcompress` from source first (see the Linux
+method above).
 The vegetation pack is not used and palms remain Classic. See the exact inputs,
 space requirements and manual fallback in
 [README.md](README.md#install-the-optional-modern-models-after-the-apk) and the

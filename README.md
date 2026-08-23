@@ -3,6 +3,7 @@
 > **NO APK IS PROVIDED. THIS IS A SOURCE-BUILD RELEASE.**
 >
 > On Windows, connect the Quest and double-click **`BUILD_AND_INSTALL.bat`**.
+> On Linux, connect the Quest and run **`./BUILD_AND_INSTALL.sh`**.
 > The wizard obtains portable Git, JDK 21, the Android command-line SDK,
 > the exact reVC source, assembles the port, builds your personal APK, installs
 > it without clearing existing data, and can copy only the required folders
@@ -14,12 +15,15 @@
 > that replacing it can erase saves/game data and uninstalls it only after an
 > explicit `Y` confirmation. It validates the supplied Vice City PC folder
 > before removal so the required game data can be restored afterward.
-> You may also download only **`BUILD_AND_INSTALL.bat`**. If the rest of the
-> source kit is not beside it, the BAT downloads and extracts the complete
+> You may also download only **`BUILD_AND_INSTALL.bat`** (Windows) or
+> **`BUILD_AND_INSTALL.sh`** (Linux). If the rest of the
+> source kit is not beside it, the wrapper downloads and extracts the complete
 > public repository automatically.
 >
-> Run the `.bat`, not the internal PowerShell file. The window remains open on
-> errors and writes `%TEMP%\ViceCityVR-Build-And-Install.log`; send that log
+> Run the wrapper (`.bat` on Windows, `.sh` on Linux), not the internal
+> wizard file. The window remains open on
+> errors and writes `%TEMP%\ViceCityVR-Build-And-Install.log` (Windows) or
+> `$TMPDIR/ViceCityVR-Build-And-Install.log` (Linux); send that log
 > when asking for help.
 
 
@@ -68,13 +72,15 @@ Complete prerequisites and copy-paste commands are in
 [BUILDING.md](BUILDING.md).
 
 For most Windows users, the recommended route is the guided
-[`BUILD_AND_INSTALL.bat`](BUILD_AND_INSTALL.bat) wizard instead of entering
+[`BUILD_AND_INSTALL.bat`](BUILD_AND_INSTALL.bat) wizard (Linux:
+[`BUILD_AND_INSTALL.sh`](BUILD_AND_INSTALL.sh)) instead of entering
 those commands manually.
 
 If the OPTIONS menus show entries like `FET_GFX missing` or `FED_AAS missing`
 instead of labels, the installation predates the wizard copying the port's
 replacement text and frontend files.
-[`REPAIR_GAME_FILES.bat`](REPAIR_GAME_FILES.bat) installs just those onto an
+[`REPAIR_GAME_FILES.bat`](REPAIR_GAME_FILES.bat) (Windows) or
+[`REPAIR_GAME_FILES.sh`](REPAIR_GAME_FILES.sh) (Linux) installs just those onto an
 existing headset; saves, settings and models are left alone.
 
 The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
@@ -113,9 +119,11 @@ is documented in [overlay/docs/QUEST_MODELSETS.md](overlay/docs/QUEST_MODELSETS.
 ## Install the optional Modern models after the APK
 
 No APK rebuild is needed. Connect and authorize the Quest, then double-click
-**`INSTALL_MODERN_MODELS.bat`**. Select the folder containing a legal original
+**`INSTALL_MODERN_MODELS.bat`** (Windows) or run **`./INSTALL_MODERN_MODELS.sh`**
+(Linux). Select the folder containing a legal original
 GTA Vice City PC installation when asked. That is the only asset input the
-player must supply.
+player must supply. On Linux, build `tools/modelsets/txdcompress` from source
+first: `g++ -O2 -o txdcompress txdcompress.cpp`.
 
 The wizard automatically downloads and verifies the two external packs used by
 the tested build, extracts them, builds the per-user `modelsets\modern` overlay,
@@ -161,7 +169,9 @@ $modern = "C:\Games\Vice City VR\modelsets\modern"
 ```
 
 For troubleshooting, an already generated folder can still be transferred by
-running `tools\install-modern-models.ps1 -ModernDir "C:\path\to\modern"`.
+running `tools\install-modern-models.ps1 -ModernDir "C:\path\to\modern"`
+(Windows) or `tools/install-modern-models.sh --modern-dir /path/to/modern`
+(Linux).
 The final Quest path must be exactly
 `gamedata/modelsets/modern`, never `modern/modern`. Fully restart the game after
 copying. The default/recommended Quest mix is Modern world textures and
