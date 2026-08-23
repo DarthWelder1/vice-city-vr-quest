@@ -161,7 +161,7 @@ find_git() {
 resolve_game_files_folder() {
   if [ -n "$GAME_FILES_DIR" ]; then
     local requested
-    requested="$(cd "$(dirname "$GAME_FILES_DIR")" 2>/dev/null && pwd)/$(basename "$GAME_FILES_DIR")"
+    requested="$(realpath -m -- "$GAME_FILES_DIR" 2>/dev/null || printf '%s' "$GAME_FILES_DIR")"
     local candidate
     for candidate in "$requested" "$requested/gamefiles"; do
       if test_game_files_folder "$candidate"; then
@@ -173,7 +173,7 @@ resolve_game_files_folder() {
   fi
 
   local work
-  work="$(cd "$(dirname "$WORK_DIR")" 2>/dev/null && pwd)/$(basename "$WORK_DIR")"
+  work="$(realpath -m -- "$WORK_DIR" 2>/dev/null || printf '%s' "$WORK_DIR")"
   mkdir -p "$WORK_DIR"
   work="$(cd "$WORK_DIR" && pwd)"
 

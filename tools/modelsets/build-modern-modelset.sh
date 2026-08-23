@@ -150,8 +150,8 @@ require_minimum_files() {
 # Paths-Overlap: true if either path is inside the other.
 paths_overlap() {
   local left right
-  left="$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")/"
-  right="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")/"
+  left="$(realpath -m -- "$1" 2>/dev/null || printf '%s' "$1")/"
+  right="$(realpath -m -- "$2" 2>/dev/null || printf '%s' "$2")/"
   case "$left" in "$right"*) return 0 ;; esac
   case "$right" in "$left"*) return 0 ;; esac
   return 1
@@ -166,7 +166,7 @@ MODS="$(find_marker "$ATMOSPHERE_PACK" "Vehicles/gta3.img" "Mods / Atmosphere")"
 if [ -z "$OUT" ]; then
   OUT="$GAME_DIR/modelsets/modern"
 fi
-OUT="$(cd "$(dirname "$OUT")" 2>/dev/null && pwd)/$(basename "$OUT")"
+OUT="$(realpath -m -- "$OUT" 2>/dev/null || printf '%s' "$OUT")"
 
 require_file "$GAME_DIR/models/gta3.img" "Original game models/gta3.img"
 require_file "$GAME_DIR/models/gta3.dir" "Original game models/gta3.dir"

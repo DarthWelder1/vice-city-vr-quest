@@ -135,7 +135,7 @@ resolve_modern_folder() {
   fi
 
   local root
-  root="$(cd "$(dirname "$requested")" 2>/dev/null && pwd)/$(basename "$requested")"
+  root="$(realpath -m -- "$requested" 2>/dev/null || printf '%s' "$requested")"
   local candidates=("$root" "$root/modern" "$root/modelsets/modern")
   local candidate
   for candidate in "${candidates[@]}"; do

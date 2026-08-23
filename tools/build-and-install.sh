@@ -405,7 +405,7 @@ echo "JDK: $RESOLVED_JAVA_HOME"
 echo "Android SDK: $RESOLVED_SDK"
 
 step 2 "Preparing the short local build directory"
-RESOLVED_WORK="$(cd "$(dirname "$WORK_DIR")" 2>/dev/null && pwd)/$(basename "$WORK_DIR")"
+RESOLVED_WORK="$(realpath -m -- "$WORK_DIR" 2>/dev/null || printf '%s' "$WORK_DIR")"
 mkdir -p "$WORK_DIR"
 RESOLVED_WORK="$(cd "$WORK_DIR" && pwd)"
 if [ "${#RESOLVED_WORK}" -gt 80 ]; then

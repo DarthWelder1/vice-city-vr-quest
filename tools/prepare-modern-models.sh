@@ -260,9 +260,23 @@ ensure_extracted() {
   fi
   rm -rf "$destination"
   mkdir -p "$destination"
-  command -v tar >/dev/null || die "tar was not found; it is required to extract the verified archives."
-  echo "Extracting $name..." >&2
-  checked "$name extraction failed" tar -xf "$archive" -C "$destination"
+  # The packs are ZIP. Windows' tar.exe is bsdtar (libarchive), which reads ZIP;
+  # Linux' default `tar` is GNU tar, which cannot. Use bsdtar (the same
+  # libarchive engine as Windows) when present, else fall back to unzip.
+  local extractor
+  if command -v bsdtar >/dev/null 2>&1; then
+    extractor="bsdtar"
+  elif command -v unzip >/dev/null 2>&1; then
+    extractor="unzip"
+  else
+    die "Neither bsdtar nor unzip was found; one is required to extract the verified ZIP archives (e.g. 'sudo apt install libarchive-tools unzip')."
+  fi
+  echo "Extracting $name with $extractor..." >&2
+  if [ "$extractor" = "bsdtar" ]; then
+    checked "$name extraction failed" bsdtar -xf "$archive" -C "$destination"
+  else
+    checked "$name extraction failed" unzip -q -o "$archive" -d "$destination"
+  fi
   printf '%s' "$sha256" > "$marker"
   echo "$destination"
 }
@@ -308,7 +322,7 @@ WORK="$(cd "$WORK_DIR" && pwd)"
 if [ -z "$OUTPUT_DIR" ]; then
   OUTPUT_DIR="$GAME/modelsets/modern"
 fi
-OUTPUT="$(cd "$(dirname "$OUTPUT_DIR")" 2>/dev/null && pwd)/$(basename "$OUTPUT_DIR")"
+OUTPUT="$(realpath -m -- "$OUTPUT_DIR" 2>/dev/null || printf '%s' "$OUTPUT_DIR")"
 EXPECTED_BUILDER_VERSION="$(get_expected_builder_version)"
 
 if test_completed_overlay "$OUTPUT" "$EXPECTED_BUILDER_VERSION"; then
