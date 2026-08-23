@@ -260,7 +260,7 @@ ensure_sdk_packages() {
   echo "Missing Android SDK components:"
   echo "$missing" | sed 's/^/  /'
   local sdkmanager
-  sdkmanager="$(ensure_android_command_line_tools "$sdk_root")"
+  sdkmanager="$(ensure_android_command_line_tools "$sdk_root")" || die "Android command-line tools bootstrap failed; stopping."
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
     die "Required Android SDK components are missing; automatic installation needs an interactive license confirmation."
   fi

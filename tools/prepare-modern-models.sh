@@ -161,6 +161,16 @@ ensure_download() {
   command -v curl >/dev/null || die "curl was not found; it is required to download the verified archives."
   echo "Downloading $name ($((size / 1024 / 1024)) MB). Interrupted downloads resume automatically..." >&2
   checked "$name download failed" curl --fail --location --retry 5 --retry-all-errors --continue-at - --output "$partial" "$url"
+  # Google Drive serves a small HTML error page with HTTP 200 when a shared
+  # file is no longer available (quota exceeded, virus scan, link revoked).
+  # Detect it explicitly so the user gets the real reason, not just a hash
+  # mismatch on a 2 KB file.
+  if [ -f "$partial" ] && [ "$(stat -c%s "$partial")" -lt 100000 ] && [ "$(head -c 15 "$partial" 2>/dev/null)" = "<!DOCTYPE html>" ]; then
+    local errtext
+    errtext="$(grep -oiE "quota exceeded|virus scan|scanned|Sorry[^<]{0,80}" "$partial" 2>/dev/null | head -1 || true)"
+    rm -f "$partial"
+    die "The $name link is not serving the file. Google Drive returned an error page${errtext:+ ($errtext)}. The shared file has likely been revoked, hit a quota limit, or is stuck in a virus scan. Ask the pack author for a working link, or supply the archive with --hd-archive / --mods-archive."
+  fi
   echo "Verifying $name SHA256..." >&2
   test_file_identity "$partial" "$size" "$sha256" || die "$name download completed but failed the pinned size/SHA256 check. Delete '$partial' and retry."
   mv -f "$partial" "$destination"
@@ -255,11 +265,15 @@ else
   DOWNLOADS="$WORK/downloads"
   SOURCES="$WORK/sources"
   mkdir -p "$DOWNLOADS" "$SOURCES"
-  HD_ZIP="$(ensure_download "GTA VC HD + Weapons" "$HD_URL" "$DOWNLOADS/GTA VC HD + Weapons.zip" "$HD_SIZE" "$HD_SHA256" "$HD_ARCHIVE")"
-  MODS_ZIP="$(ensure_download "Mods / Atmosphere" "$MODS_URL" "$DOWNLOADS/Mods.zip" "$MODS_SIZE" "$MODS_SHA256" "$MODS_ARCHIVE")"
+  # A die() inside these functions runs in a subshell (the command
+  # substitution), so its exit only kills the subshell. Catch the non-zero
+  # exit here so the parent stops instead of cascading into extraction and
+  # install with a garbage path.
+  HD_ZIP="$(ensure_download "GTA VC HD + Weapons" "$HD_URL" "$DOWNLOADS/GTA VC HD + Weapons.zip" "$HD_SIZE" "$HD_SHA256" "$HD_ARCHIVE")" || die "GTA VC HD + Weapons download failed; stopping before extraction and install."
+  MODS_ZIP="$(ensure_download "Mods / Atmosphere" "$MODS_URL" "$DOWNLOADS/Mods.zip" "$MODS_SIZE" "$MODS_SHA256" "$MODS_ARCHIVE")" || die "Mods / Atmosphere download failed; stopping before extraction and install."
 
-  HD_SOURCE="$(ensure_extracted "GTA VC HD + Weapons" "$HD_ZIP" "$SOURCES/hd-pack" "$HD_SHA256")"
-  MODS_SOURCE="$(ensure_extracted "Mods / Atmosphere" "$MODS_ZIP" "$SOURCES/mods-pack" "$MODS_SHA256")"
+  HD_SOURCE="$(ensure_extracted "GTA VC HD + Weapons" "$HD_ZIP" "$SOURCES/hd-pack" "$HD_SHA256")" || die "GTA VC HD + Weapons extraction failed; stopping before the build."
+  MODS_SOURCE="$(ensure_extracted "Mods / Atmosphere" "$MODS_ZIP" "$SOURCES/mods-pack" "$MODS_SHA256")" || die "Mods / Atmosphere extraction failed; stopping before the build."
 
   echo "Building the optimized Quest Modern overlay. This can take several minutes..."
   bash "$BUILDER" \
