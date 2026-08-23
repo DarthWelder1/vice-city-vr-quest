@@ -139,6 +139,47 @@ file_sha256() {
   sha256sum "$1" | awk '{print toupper($1)}'
 }
 
+# Google Drive refuses to serve files it cannot virus-scan (very large files)
+# as a whole: a full GET, an open-ended range, or even a whole-file bounded
+# range returns an HTML interstitial ("too large to scan ... download
+# anyway?"). Bounded *partial* ranges, however, are served directly — that is
+# what the "Download anyway" button triggers. So fetch the file in bounded
+# chunks and stitch them together. Resumable: already-downloaded chunks are
+# skipped, and an incomplete trailing chunk is truncated back to a boundary.
+download_gdrive_chunked() {
+  local name="$1" url="$2" partial="$3" size="$4"
+  local chunk=104857600  # 100 MB per request (proven to stream real bytes)
+  local start=0
+  if [ -f "$partial" ]; then
+    start="$(stat -c%s "$partial")"
+    start=$(( (start / chunk) * chunk ))
+    if [ "$start" -lt "$(stat -c%s "$partial")" ]; then
+      # Drop the incomplete trailing chunk so we never append duplicate bytes.
+      truncate -s "$start" "$partial" 2>/dev/null || { head -c "$start" "$partial" > "$partial.tmp" && mv -f "$partial.tmp" "$partial"; }
+    fi
+  fi
+  echo "Downloading $name ($((size / 1024 / 1024)) MB) in 100 MB chunks. Google blocks whole-file GETs for files it can't virus-scan, so this fetches bounded ranges and stitches them. Interrupted downloads resume automatically..." >&2
+  local tmp="$partial.chunk"
+  while [ "$start" -lt "$size" ]; do
+    local end=$(( start + chunk - 1 ))
+    [ "$end" -ge "$size" ] && end=$(( size - 1 ))
+    rm -f "$tmp"
+    checked "$name chunk ${start}-${end} failed" \
+      curl --fail --location --retry 5 --retry-all-errors \
+        -r "${start}-${end}" --output "$tmp" "$url"
+    # A bounded range must return real file bytes, not the HTML interstitial.
+    if [ "$(stat -c%s "$tmp")" -lt 100000 ] && [ "$(head -c 15 "$tmp" 2>/dev/null)" = "<!DOCTYPE html>" ]; then
+      rm -f "$tmp"
+      die "The $name link returned an HTML error page instead of file data. The shared file may be revoked or unavailable. Ask the pack author for a working link, or supply the archive with --hd-archive / --mods-archive."
+    fi
+    cat "$tmp" >> "$partial"
+    rm -f "$tmp"
+    start=$(( start + chunk ))
+    echo "  $name: $(( start / 1024 / 1024 )) MB / $(( size / 1024 / 1024 )) MB" >&2
+  done
+  [ "$(stat -c%s "$partial")" -eq "$size" ] || die "$name chunked download ended at $(stat -c%s "$partial") bytes, expected $size."
+}
+
 # Download (resumable) and verify a pack; print the final path.
 ensure_download() {
   local name="$1" url="$2" destination="$3" size="$4" sha256="$5" provided="$6"
@@ -159,18 +200,11 @@ ensure_download() {
     rm -f "$partial"
   fi
   command -v curl >/dev/null || die "curl was not found; it is required to download the verified archives."
-  echo "Downloading $name ($((size / 1024 / 1024)) MB). Interrupted downloads resume automatically..." >&2
-  checked "$name download failed" curl --fail --location --retry 5 --retry-all-errors --continue-at - --output "$partial" "$url"
-  # Google Drive serves a small HTML error page with HTTP 200 when a shared
-  # file is no longer available (quota exceeded, virus scan, link revoked).
-  # Detect it explicitly so the user gets the real reason, not just a hash
-  # mismatch on a 2 KB file.
-  if [ -f "$partial" ] && [ "$(stat -c%s "$partial")" -lt 100000 ] && [ "$(head -c 15 "$partial" 2>/dev/null)" = "<!DOCTYPE html>" ]; then
-    local errtext
-    errtext="$(grep -oiE "quota exceeded|virus scan|scanned|Sorry[^<]{0,80}" "$partial" 2>/dev/null | head -1 || true)"
-    rm -f "$partial"
-    die "The $name link is not serving the file. Google Drive returned an error page${errtext:+ ($errtext)}. The shared file has likely been revoked, hit a quota limit, or is stuck in a virus scan. Ask the pack author for a working link, or supply the archive with --hd-archive / --mods-archive."
-  fi
+  # Fetch in bounded chunks (see download_gdrive_chunked): Google will not
+  # serve a too-large-to-scan file as a whole, but it serves bounded ranges.
+  # Resumes from any existing partial; a stale HTML interstitial partial is
+  # truncated away automatically.
+  download_gdrive_chunked "$name" "$url" "$partial" "$size"
   echo "Verifying $name SHA256..." >&2
   test_file_identity "$partial" "$size" "$sha256" || die "$name download completed but failed the pinned size/SHA256 check. Delete '$partial' and retry."
   mv -f "$partial" "$destination"
