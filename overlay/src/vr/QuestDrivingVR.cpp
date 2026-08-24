@@ -2472,10 +2472,21 @@ UpdateQuestDrivingInput(CControllerState *state, bool blocked)
 		state->LeftShoulder1 = 0;
 		state->RightShoulder1 = 0;
 	}else{
-		if(captured & 1u)
-			state->LeftShoulder1 = 0;
-		if(captured & 2u)
-			state->RightShoulder1 = 0;
+		// A hand on the bars is steering and a hand holding a sidearm is
+		// holding a sidearm; neither is the player reaching for R1. Only
+		// the grabbed hand used to be cleared, so a drawn weapon left its
+		// grip on R1 -- the handbrake in the shipped pad modes -- and the
+		// rider pulled the throttle against a locked wheel.
+		const bool bike = IsVrBikeActive();
+		for(int hand = 0; hand < VR_HAND_COUNT; hand++){
+			if((captured & (1u << hand)) == 0 &&
+			   !(bike && IsQuestDrivingHandUnavailable(hand)))
+				continue;
+			if(hand == 0)
+				state->LeftShoulder1 = 0;
+			else
+				state->RightShoulder1 = 0;
+		}
 	}
 	MapHornToPad(state);
 	// Apply this after physical-grip cleanup: grabbed steering hands must not
