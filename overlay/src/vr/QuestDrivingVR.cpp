@@ -268,6 +268,19 @@ static float gCarWheelDistance[VR_HAND_COUNT] = {
 static float gCarWheelGrabReferenceAngle[VR_HAND_COUNT];
 static float gCarWheelContinuousAngle[VR_HAND_COUNT];
 static bool gCarWheelAngleValid[VR_HAND_COUNT];
+// One hand reads the wheel by where it sits around the rim, so the
+// answer is only as good as the spoke from the boss to the hand is
+// long. A hand that drifts inwards leaves atan2 turning tracking noise
+// into a full lock, so below this the wheel holds and waits for the
+// hand to come back out to the rim.
+static const float kCarWheelMinSpoke = 0.06f;
+// No wrist turns a wheel this far between two frames. A step this big
+// is a dropped frame or a branch the unwrap guessed wrong, and taking
+// it was what threw the wheel across to the opposite lock.
+static const float kCarWheelMaxStep = 0.7853982f;	// 45 degrees
+// How far the virtual wheel turns between its two locks.
+static const float kCarWheelMaxAngle = 1.3962634f;	// 80 degrees
+static bool gCarWheelSpokeUsable[VR_HAND_COUNT];
 static float gCarWheelTwoHandReferenceAngle;
 static float gCarWheelTwoHandContinuousAngle;
 static bool gCarWheelTwoHandAngleValid;
@@ -1708,6 +1721,7 @@ ResetCarInteraction()
 		gCarWheelGrabReferenceAngle[hand] = 0.0f;
 		gCarWheelContinuousAngle[hand] = 0.0f;
 		gCarWheelAngleValid[hand] = false;
+		gCarWheelSpokeUsable[hand] = false;
 		gCarHornContact[hand] = false;
 		gCarHornArmed[hand] = false;
 		gCarHornPreviousDistance[hand] = 1000.0f;
@@ -1821,6 +1835,7 @@ UpdateImmersiveCarInput(const float *grips, uint32 blockedHands)
 		   (unavailable || grips[hand] <= 0.30f)){
 			gCarWheelGrabbed[hand] = false;
 			gCarWheelAngleValid[hand] = false;
+			gCarWheelSpokeUsable[hand] = false;
 		}
 		if(!gCarWheelGrabbed[hand] && !unavailable &&
 		   grips[hand] >= 0.65f && !gCarWheelGripDown[hand] &&
@@ -1858,6 +1873,7 @@ UpdateImmersiveCarInput(const float *grips, uint32 blockedHands)
 		gCarWheelContinuousAngle[hand] =
 			gImmersiveCarPhysicalAngle;
 		gCarWheelAngleValid[hand] = true;
+		gCarWheelSpokeUsable[hand] = true;
 	}
 
 	float steeringAngle = 0.0f;
@@ -1890,13 +1906,41 @@ UpdateImmersiveCarInput(const float *grips, uint32 blockedHands)
 		for(int hand = 0; hand < VR_HAND_COUNT; hand++){
 			if(!gCarWheelGrabbed[hand])
 				continue;
-			float angle = WrapAngle(
-				PlanarAngle(positions[hand]-center,
-					carRight, carUp)-
-				gCarWheelGrabReferenceAngle[hand]);
-			if(gCarWheelAngleValid[hand])
-				angle = UnwrapAngle(angle,
-					gCarWheelContinuousAngle[hand]);
+			const CVector spoke = positions[hand]-center;
+			const float spokeRight = DotProduct(spoke, carRight);
+			const float spokeUp = DotProduct(spoke, carUp);
+			const float raw = PlanarAngle(spoke, carRight, carUp);
+			float angle = gCarWheelContinuousAngle[hand];
+			const bool usable =
+				spokeRight*spokeRight+spokeUp*spokeUp >=
+				kCarWheelMinSpoke*kCarWheelMinSpoke;
+			bool reseat = !gCarWheelAngleValid[hand];
+			if(usable && gCarWheelAngleValid[hand]){
+				// Coming back out to the rim, or recovering from a step
+				// that cannot have been made: take the reading as the new
+				// reference for where the wheel already is, so the hand
+				// resumes from here instead of dragging the wheel with it.
+				const float measured = UnwrapAngle(WrapAngle(raw-
+					gCarWheelGrabReferenceAngle[hand]), angle);
+				if(!gCarWheelSpokeUsable[hand] ||
+				   Abs(measured-angle) > kCarWheelMaxStep)
+					reseat = true;
+				else
+					angle = measured;
+			}else if(!usable)
+				reseat = false;
+			// Past the lock the wheel cannot turn any further, so let the
+			// hand slip around it rather than winding up an angle that has
+			// to be unwound before the wheel answers again.
+			const float locked =
+				clamp(angle, -kCarWheelMaxAngle, kCarWheelMaxAngle);
+			if(reseat || locked != angle){
+				angle = locked;
+				if(usable)
+					gCarWheelGrabReferenceAngle[hand] =
+						WrapAngle(raw-angle);
+			}
+			gCarWheelSpokeUsable[hand] = usable;
 			gCarWheelContinuousAngle[hand] = angle;
 			gCarWheelAngleValid[hand] = true;
 			steeringAngle = angle;
@@ -1904,7 +1948,7 @@ UpdateImmersiveCarInput(const float *grips, uint32 blockedHands)
 		}
 	}
 
-	const float maxSteering = DEGTORAD(80.0f);
+	const float maxSteering = kCarWheelMaxAngle;
 	gImmersiveCarPhysicalAngle =
 		clamp(steeringAngle, -maxSteering, maxSteering);
 	float steering =

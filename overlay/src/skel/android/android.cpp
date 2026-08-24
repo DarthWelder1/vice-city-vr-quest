@@ -1168,6 +1168,15 @@ psInitialize(void)
 
 	CFileMgr::Initialise();
 	InitialiseLanguage();
+	// Every other skeleton reads the saved options here (win.cpp and
+	// glfw.cpp both call it from psInitialize); this one never did, so the
+	// game started on the constructor defaults and the first SaveSettings
+	// of the session wrote them back over the player's file. Language and
+	// subtitles came back every launch for that reason. It runs after
+	// InitialiseLanguage on purpose: that sets American unconditionally,
+	// and LoadSettings reloads the text set when the saved language is a
+	// different one.
+	FrontEndMenuManager.LoadSettings();
 	return TRUE;
 }
 
