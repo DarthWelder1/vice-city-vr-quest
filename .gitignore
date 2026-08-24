@@ -38,6 +38,13 @@ cmake_install.cmake
 local.properties
 release-signing.properties
 
+# agent planning / handoff files (never committed)
+PLAN.md
+RECOVERY.md
+
+# Linux build of the model-set texture compressor (built from txdcompress.cpp)
+tools/modelsets/txdcompress
+
 # local diagnostics, agent state and editor/session debris
 .codex*/
 .claude/
