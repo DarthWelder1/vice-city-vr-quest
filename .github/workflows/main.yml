@@ -1,0 +1,57 @@
+name: Build Vice City VR APK
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 1. Checkout du code source actuel (vice-city-vr-quest)
+      uses: actions/checkout@v4
+
+    - name: Configuration de Java JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+        cache: gradle
+
+    - name: Configuration du SDK Android et NDK
+      uses: android-actions/setup-android@v4
+      with:
+        cmdline-tools-version: 12266719
+        accept-android-sdk-licenses: true
+        packages: 'tools platform-tools platforms;android-35 build-tools;34.0.0 ndk;27.2.12479018 cmake;3.22.1'
+
+    - name: Force Accept Android SDK Licenses
+      run: yes | sdkmanager --licenses || true
+
+    - name: 2. Obtenir la source requise reVC
+      run: |
+        git clone https://github.com/mrxenginner/reVC.git ${{ github.workspace }}/reVC
+        cd ${{ github.workspace }}/reVC
+        git checkout 026cd10f3fdbd92c089830e5067c4457c53c1b51
+        
+    - name: 3. Assembler l'arbre de build privÃ©
+      run: |
+        chmod +x ./tools/assemble.sh
+        # Removed ../ to keep the build inside the GitHub workspace
+        ./tools/assemble.sh ${{ github.workspace }}/reVC ${{ github.workspace }}/vice-city-vr-build
+
+    - name: 4. Compiler l'APK de Debug et le dÃ©placer
+      run: 
+           cd ${{ github.workspace }}/vice-city-vr-build/android
+           gradle wrapper
+           ./gradlew :app:assembleDebug
+           
+    - name: 5. Sauvegarder l'APK gÃ©nÃ©rÃ©
+      uses: actions/upload-artifact@v4
+      with:
+        name: ViceCityVR-APK
+        path: path: ${{ github.workspace }}/vice-city-vr-build/android/app/build/outputs/apk/debug/app-debug.apk
